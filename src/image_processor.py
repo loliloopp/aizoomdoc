@@ -96,24 +96,22 @@ class ImageProcessor:
                 self._image_cache[img_id] = cache_path
                 self._image_sizes[img_id] = (w, h)
                 
-                # Делаем ПРЕВЬЮ (масштабирование в PNG, затем конвертируем в JPG для отправки в LLM)
-                scale = 1.0
+                # Создаем ПРЕВЬЮ только если изображение больше max_side
                 if max(h, w) > max_side:
+                    # Изображение большое - создаем уменьшенный preview
                     scale = max_side / max(h, w)
                     new_w, new_h = int(w * scale), int(h * scale)
                     img_preview = cv2.resize(img_bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
-                    desc = f"Preview (Original: {w}x{h}, Scaled to {new_w}x{new_h})"
+                    scale_percent = int(scale * 100)
+                    desc = f"⚠️ SCALED PREVIEW: Original {w}x{h}px → Scaled to {new_w}x{new_h}px ({scale_percent}%). Use ZOOM for details."
+                    
+                    # Сохраняем preview в PNG
+                    preview_path = self.temp_dir / f"{img_id}_preview.png"
+                    cv2.imwrite(str(preview_path), img_preview)
                 else:
-                    img_preview = img_bgr
-                    desc = f"Full Image ({w}x{h})"
-                
-                # Сначала сохраняем масштабированное изображение в PNG (для качества)
-                preview_path_png = self.temp_dir / f"{img_id}_preview.png"
-                cv2.imwrite(str(preview_path_png), img_preview)
-                
-                # Затем конвертируем в JPG для отправки в LLM (JPG меньше по размеру)
-                preview_path = self.temp_dir / f"{img_id}_preview.jpg"
-                cv2.imwrite(str(preview_path), img_preview, [cv2.IMWRITE_JPEG_QUALITY, 90])
+                    # Изображение маленькое - используем оригинал напрямую, preview не создаем
+                    preview_path = cache_path  # Используем full.png
+                    desc = f"✓ FULL RESOLUTION IMAGE: {w}x{h}px (no scaling applied)"
                 
                 return ViewportCrop(
                     page_number=0, # Неактуально для внешних ссылок

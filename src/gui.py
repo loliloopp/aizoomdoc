@@ -12,7 +12,8 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTextEdit, QLineEdit, QPushButton, QLabel, QComboBox, QSplitter,
     QListWidget, QListWidgetItem, QFrame, QScrollArea, QProgressBar,
-    QFileDialog, QMenuBar, QMenu, QDialog, QDialogButtonBox, QMessageBox
+    QFileDialog, QMenuBar, QMenu, QDialog, QDialogButtonBox, QMessageBox,
+    QGroupBox
 )
 from PyQt6.QtCore import Qt, QUrl
 from PyQt6.QtGui import QFont, QPixmap, QAction, QDragEnterEvent, QDropEvent
@@ -48,20 +49,17 @@ class SettingsDialog(QDialog):
     """Диалог настроек."""
     def __init__(self, parent=None):
         super().__init__(parent)
-        print("[DEBUG] Инициализация SettingsDialog")
+        print("[DEBUG] Инициализация SettingsDialog (Simplified)")
         self.setWindowTitle("Настройки")
-        self.resize(700, 400)
+        self.setMinimumWidth(600)
         
-        main_layout = QVBoxLayout(self)
+        layout = QVBoxLayout(self)
         
-        # Создаем скроллируемую область
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll_widget = QWidget()
-        layout = QVBoxLayout(scroll_widget)
+        # 1. Группа "Папка с данными"
+        gb_data = QGroupBox("Данные")
+        gb_layout = QVBoxLayout(gb_data)
         
-        # Папка с данными
-        layout.addWidget(QLabel("Папка с данными (создаются chats/, images/):"))
+        gb_layout.addWidget(QLabel("Папка проекта (создаются chats/, images/):"))
         
         path_layout = QHBoxLayout()
         self.path_edit = QLineEdit()
@@ -73,38 +71,59 @@ class SettingsDialog(QDialog):
         
         path_layout.addWidget(self.path_edit)
         path_layout.addWidget(btn_browse)
-        layout.addLayout(path_layout)
+        gb_layout.addLayout(path_layout)
         
-        # Промт для LLM
-        print("[DEBUG] Добавляю раздел Промта")
-        layout.addWidget(QLabel("Системный промт для LLM:"))
+        layout.addWidget(gb_data)
         
-        prompt_layout = QHBoxLayout()
-        self.prompt_file_label = QLineEdit()
-        self.prompt_file_label.setReadOnly(True)
+        # 2. Группа "Промты AI"
+        gb_prompts = QGroupBox("AI Ассистент - Системные Промты")
+        prompts_layout_main = QVBoxLayout(gb_prompts)
+        
+        # Вычисляем data_root
         data_root = Path(self.path_edit.text()) if self.path_edit.text() else Path.cwd() / "data"
-        prompt_file = data_root / "llm_system_prompt.txt"
-        self.prompt_file_label.setText(str(prompt_file))
-        print(f"[DEBUG] Путь к промту: {prompt_file}")
         
-        btn_edit_prompt = QPushButton("Редактировать...")
-        btn_edit_prompt.clicked.connect(self.edit_prompt)
+        # 2.1. Промт выбора картинок (ЭТАП 1)
+        prompts_layout_main.addWidget(QLabel("📌 ЭТАП 1: Выбор изображений (selection_prompt.txt):"))
         
-        prompt_layout.addWidget(self.prompt_file_label)
-        prompt_layout.addWidget(btn_edit_prompt)
-        layout.addLayout(prompt_layout)
-        print("[DEBUG] Раздел Промта добавлен")
+        selection_file_layout = QHBoxLayout()
+        self.selection_prompt_label = QLineEdit()
+        self.selection_prompt_label.setReadOnly(True)
+        self.selection_prompt_label.setText(str(data_root / "selection_prompt.txt"))
         
+        btn_edit_selection = QPushButton("Редактировать...")
+        btn_edit_selection.clicked.connect(self.edit_selection_prompt)
+        
+        selection_file_layout.addWidget(self.selection_prompt_label)
+        selection_file_layout.addWidget(btn_edit_selection)
+        prompts_layout_main.addLayout(selection_file_layout)
+        
+        prompts_layout_main.addSpacing(10)
+        
+        # 2.2. Промт анализа (ЭТАП 2)
+        prompts_layout_main.addWidget(QLabel("📌 ЭТАП 2: Анализ документов (llm_system_prompt.txt):"))
+        
+        analysis_file_layout = QHBoxLayout()
+        self.analysis_prompt_label = QLineEdit()
+        self.analysis_prompt_label.setReadOnly(True)
+        self.analysis_prompt_label.setText(str(data_root / "llm_system_prompt.txt"))
+        
+        btn_edit_analysis = QPushButton("Редактировать...")
+        btn_edit_analysis.clicked.connect(self.edit_analysis_prompt)
+        
+        analysis_file_layout.addWidget(self.analysis_prompt_label)
+        analysis_file_layout.addWidget(btn_edit_analysis)
+        prompts_layout_main.addLayout(analysis_file_layout)
+        
+        layout.addWidget(gb_prompts)
+        
+        # Кнопки
         layout.addStretch()
-        
-        scroll.setWidget(scroll_widget)
-        main_layout.addWidget(scroll)
-        
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
-        main_layout.addWidget(buttons)
-        print("[DEBUG] SettingsDialog инициализирован успешно")
+        layout.addWidget(buttons)
+        
+        print("[DEBUG] Диалог настроек готов")
     
     def browse_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Выберите папку", self.path_edit.text())
@@ -115,39 +134,115 @@ class SettingsDialog(QDialog):
             prompt_file = data_root / "llm_system_prompt.txt"
             self.prompt_file_label.setText(str(prompt_file))
     
-    def edit_prompt(self):
-        """Открывает текущий промт в текстовом редакторе."""
-        prompt_file = Path(self.prompt_file_label.text())
+    def edit_selection_prompt(self):
+        """Редактирование промта для выбора изображений (ЭТАП 1)"""
+        prompt_file = Path(self.selection_prompt_label.text())
         
         # Если файл не существует, создаем с содержимым по умолчанию
         if not prompt_file.exists():
             prompt_file.parent.mkdir(parents=True, exist_ok=True)
-            default_content = """Ты — эксперт-инженер. Твоя задача — анализировать документацию.
+            default_content = """Ты — ассистент по анализу технической документации.
+Твоя задача — найти в тексте ИЗОБРАЖЕНИЯ, необходимые для ответа на запрос пользователя.
 
-ИНСТРУКЦИЯ ПО РАБОТЕ С ИЗОБРАЖЕНИЯМИ:
-1. Тебе передают текстовые описания и ИЗОБРАЖЕНИЯ (превью).
-2. Каждое изображение имеет ID (Image ID) и информацию об оригинальном размере.
-3. То, что ты видишь — это уменьшенная версия (обычно до 2000px).
-4. Если тебе нужно рассмотреть детали, используй инструмент ZOOM.
+ВАЖНО ПРО СТРУКТУРУ ДОКУМЕНТА:
+1. Документ содержит блоки описания изображений, которые выглядят так:
+   ```
+   *Изображение:*
+   { ... JSON метаданные ... }
+   ![Изображение](https://... .pdf)  <-- ЭТА ССЫЛКА ПРАВИЛЬНАЯ (находится ПОСЛЕ метаданных)
+   ```
+2. Иногда перед блоком *Изображение:* может быть ошибочная ссылка. ИГНОРИРУЙ ЕЕ.
+3. Бери только ту ссылку, которая идет СРАЗУ ПОСЛЕ блока метаданных (JSON).
 
-ФОРМАТ ЗАПРОСА ZOOM (JSON):
+ИНСТРУКЦИЯ:
+1. Прочитай запрос пользователя.
+2. Найди в тексте блоки с `*Изображение:*`, которые релевантны запросу.
+   - Используй `ocr_text` и `content_summary` внутри JSON для поиска.
+3. Извлечь URL изображения, который находится ПОД JSON блоком.
+4. Верни JSON:
 ```json
 {
-  "tool": "zoom",
-  "image_id": "uuid-строка-из-описания",
-  "coords_px": [1000, 2000, 1500, 2500],
-  "reason": "Хочу прочитать мелкий текст в центре"
+  "reasoning": "Нужен план 1 этажа для проверки коллекторов (найден в блоке *Изображение:* с content_summary 'План 1 этажа')",
+  "needs_images": true,
+  "image_urls": ["https://... .pdf"]
 }
 ```
-
-ОТВЕТ:
-Если информации достаточно, отвечай обычным текстом. Ссылайся на источники."""
+Если картинок нет или они не нужны - верни `needs_images: false`."""
             with open(prompt_file, "w", encoding="utf-8") as f:
                 f.write(default_content)
         
         # Открываем файл в диалоге редактирования
         dialog = PromptEditDialog(self, prompt_file)
-        dialog.exec()
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            QMessageBox.information(self, "Сохранено", f"Промт выбора изображений сохранён в:\n{prompt_file}")
+    
+    def edit_analysis_prompt(self):
+        """Редактирование промта для анализа (ЭТАП 2)"""
+        prompt_file = Path(self.analysis_prompt_label.text())
+        
+        # Если файл не существует, создаем с содержимым по умолчанию
+        if not prompt_file.exists():
+            prompt_file.parent.mkdir(parents=True, exist_ok=True)
+            default_content = """Ты — эксперт-инженер по анализу технической документации (чертежи, схемы, планы).
+
+КРИТИЧЕСКИ ВАЖНО:
+- Технические чертежи содержат МЕЛКИЕ детали: размеры, маркировки, надписи, диаметры труб, обозначения элементов.
+- На preview-изображениях эти детали НЕ ЧИТАЮТСЯ.
+- Для ДОТОШНОГО анализа ты ДОЛЖЕН использовать ZOOM для каждой важной зоны чертежа.
+
+СТРАТЕГИЯ АНАЛИЗА:
+1. Если видишь ⚠️ SCALED PREVIEW - это уменьшенное изображение:
+   - Сначала оцени общую структуру
+   - Затем ОБЯЗАТЕЛЬНО запроси ZOOM для КАЖДОЙ зоны с важными деталями:
+     * Узлы и соединения
+     * Таблицы с размерами/диаметрами
+     * Маркировки элементов
+     * Надписи и обозначения
+     * Спецификации
+
+2. Если видишь ✓ FULL RESOLUTION - полноразмерное изображение:
+   - Можно анализировать без ZOOM (если детали видны)
+   - Но если есть таблицы или мелкий текст - все равно используй ZOOM
+
+ФОРМАТ ЗАПРОСА ZOOM:
+Ты можешь указать координаты в ДВУХ форматах (выбирай удобный):
+
+**1. Пиксельные координаты (coords_px):**
+```json
+{
+  "tool": "zoom",
+  "image_id": "uuid-изображения",
+  "coords_px": [x1, y1, x2, y2],
+  "reason": "Читаю диаметры труб в таблице"
+}
+```
+Где x1,y1 - левый верхний угол, x2,y2 - правый нижний угол в пикселях ОРИГИНАЛА.
+
+**2. Нормализованные координаты (coords_norm) [0.0 - 1.0]:**
+```json
+{
+  "tool": "zoom",
+  "image_id": "uuid-изображения",
+  "coords_norm": [0.2, 0.3, 0.5, 0.6],
+  "reason": "Проверяю узел в центре чертежа"
+}
+```
+Где 0.0 - левый/верхний край, 1.0 - правый/нижний край.
+
+ПРИМЕРЫ КОГДА НУЖЕН ZOOM:
+- "Вижу таблицу с размерами, но текст размыт" → ZOOM на таблицу
+- "Есть узел соединения, нужно проверить диаметры" → ZOOM на узел
+- "Маркировка элемента нечитаема" → ZOOM на маркировку
+- "Спецификация в углу чертежа" → ZOOM на спецификацию
+
+НЕ ЛЕНИСЬ использовать ZOOM - это твой главный инструмент для точного анализа!"""
+            with open(prompt_file, "w", encoding="utf-8") as f:
+                f.write(default_content)
+        
+        # Открываем файл в диалоге редактирования
+        dialog = PromptEditDialog(self, prompt_file)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            QMessageBox.information(self, "Сохранено", f"Промт анализа сохранён в:\n{prompt_file}")
     
     def get_data_root(self):
         return self.path_edit.text()
@@ -290,9 +385,9 @@ class MainWindow(QMainWindow):
         menubar = self.menuBar()
         settings_menu = menubar.addMenu("Настройки")
         
-        action_change_folder = QAction("Изменить папку данных", self)
-        action_change_folder.triggered.connect(self.open_settings)
-        settings_menu.addAction(action_change_folder)
+        action_settings = QAction("Открыть настройки...", self)
+        action_settings.triggered.connect(self.open_settings)
+        settings_menu.addAction(action_settings)
         
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -309,6 +404,12 @@ class MainWindow(QMainWindow):
         self.btn_new_chat.setStyleSheet("background-color: #3498db; color: white; border: none; padding: 10px; font-weight: bold;")
         self.btn_new_chat.clicked.connect(self.new_chat)
         left_layout.addWidget(self.btn_new_chat)
+        
+        # Кнопка настроек
+        self.btn_settings = QPushButton("⚙️ Настройки")
+        self.btn_settings.setStyleSheet("background-color: #95a5a6; color: white; border: none; padding: 8px; margin-top: 5px;")
+        self.btn_settings.clicked.connect(self.open_settings)
+        left_layout.addWidget(self.btn_settings)
         
         left_layout.addWidget(QLabel("ИСТОРИЯ ЧАТОВ:"))
         self.list_history = QListWidget()

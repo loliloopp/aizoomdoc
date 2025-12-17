@@ -67,7 +67,7 @@ def run_agent_loop(data_root: Path, user_query: str, model: str = None) -> str:
             
             zoom_crop = image_processor.process_zoom_request(
                 zoom_req,
-                output_path=data_root / "viewports" / f"zoom_step_{step}.jpg"
+                output_path=data_root / "viewports" / f"zoom_step_{step}.png"
             )
             
             if zoom_crop:

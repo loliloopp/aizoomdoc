@@ -16,29 +16,58 @@ from .models import ViewportCrop, ZoomRequest, ImageSelection
 logger = logging.getLogger(__name__)
 
 # Промт для этапа 1: Выбор картинок
-SELECTION_PROMPT = """Ты — ассистент по анализу документации.
-Твоя задача — прочитать текст и запрос пользователя, и определить, какие ИЗОБРАЖЕНИЯ (ссылки) из текста нужны для ответа.
+SELECTION_PROMPT = """Ты — ассистент по анализу технической документации.
+Твоя задача — найти в тексте ИЗОБРАЖЕНИЯ, необходимые для ответа на запрос пользователя.
 
-СТРУКТУРА ДОКУМЕНТА:
-Блоки с изображениями выглядят так:
-```
-*Изображение:*
-(Описание изображения)
-![Изображение](https://... .pdf)
-```
+ВАЖНО ПРО СТРУКТУРУ ДОКУМЕНТА:
+1. Документ содержит блоки описания изображений, которые выглядят так:
+   ```
+   *Изображение:*
+   { ... JSON метаданные ... }
+   ![Изображение](https://... .pdf)  <-- ЭТА ССЫЛКА ПРАВИЛЬНАЯ (находится ПОСЛЕ метаданных)
+   ```
+2. Иногда перед блоком *Изображение:* может быть ошибочная ссылка. ИГНОРИРУЙ ЕЕ.
+3. Бери только ту ссылку, которая идет СРАЗУ ПОСЛЕ блока метаданных (JSON).
 
 ИНСТРУКЦИЯ:
-1. Найди в тексте блоки, релевантные запросу.
-2. Извлечь URL изображений (из `![...](URL)`).
-3. Верни JSON:
+1. Прочитай запрос пользователя.
+2. Найди в тексте блоки с `*Изображение:*`, которые релевантны запросу.
+   - Используй `ocr_text` и `content_summary` внутри JSON для поиска.
+3. Извлечь URL изображения, который находится ПОД JSON блоком.
+4. Верни JSON:
 ```json
 {
-  "reasoning": "Для ответа про вентилятор П1 нужно изображение со схемы на листе 5",
+  "reasoning": "Нужен план 1 этажа для проверки коллекторов (найден в блоке *Изображение:* с content_summary 'План 1 этажа')",
   "needs_images": true,
   "image_urls": ["https://... .pdf"]
 }
 ```
+Если картинок нет или они не нужны - верни `needs_images: false`.
 """
+
+def load_selection_prompt(data_root: Optional[Path] = None) -> str:
+    """
+    Загружает промт для выбора картинок из файла.
+    Если файл не найден, возвращает промт по умолчанию.
+    """
+    default_prompt = SELECTION_PROMPT
+    
+    if data_root is None:
+        data_root = Path.cwd() / "data"
+    
+    prompt_file = Path(data_root) / "selection_prompt.txt"
+    
+    if prompt_file.exists():
+        try:
+            with open(prompt_file, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+                if content:
+                    logger.info(f"Загружен пользовательский промт выбора из {prompt_file}")
+                    return content
+        except Exception as e:
+            logger.warning(f"Ошибка чтения файла промта выбора: {e}. Используется промт по умолчанию.")
+    
+    return default_prompt
 
 def load_analysis_prompt(data_root: Optional[Path] = None) -> str:
     """
@@ -108,9 +137,12 @@ class LLMClient:
         print(f"[SELECT_IMAGES] Начинаю выбор картинок для запроса: {query[:50]}")
         print(f"[SELECT_IMAGES] Размер контекста: {len(text_context)} символов")
         
+        # Загружаем промт из файла (или используем дефолтный)
+        selection_prompt = load_selection_prompt(self.data_root)
+        
         # Передаем весь документ целиком, не обрезаем!
         messages = [
-            {"role": "system", "content": SELECTION_PROMPT},
+            {"role": "system", "content": selection_prompt},
             {"role": "user", "content": f"ЗАПРОС: {query}\n\nДОКУМЕНТ:\n{text_context}"}
         ]
         

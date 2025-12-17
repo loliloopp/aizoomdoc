@@ -185,7 +185,7 @@ class AgentWorker(QThread):
                     
                     zoom_crop = image_processor.process_zoom_request(
                         zoom_req,
-                        output_path=self.images_dir / f"zoom_step_{step}.jpg"
+                        output_path=self.images_dir / f"zoom_step_{step}.png"
                     )
                     
                     if zoom_crop:
