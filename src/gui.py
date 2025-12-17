@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (
     QTextEdit, QLineEdit, QPushButton, QLabel, QComboBox, QSplitter,
     QListWidget, QListWidgetItem, QFrame, QScrollArea, QProgressBar,
     QFileDialog, QMenuBar, QMenu, QDialog, QDialogButtonBox, QMessageBox,
-    QGroupBox
+    QGroupBox, QSizePolicy
 )
 from PyQt6.QtCore import Qt, QUrl
 from PyQt6.QtGui import QFont, QPixmap, QAction, QDragEnterEvent, QDropEvent
@@ -313,64 +313,200 @@ class DragDropLineEdit(QLineEdit):
 
 
 class ChatMessageWidget(QFrame):
-    def __init__(self, role: str, text: str, parent=None):
+    def __init__(self, role: str, text: str, parent=None, is_dark_theme=True):
         super().__init__(parent)
         self.setFrameShape(QFrame.Shape.NoFrame)
-        self.layout = QVBoxLayout(self)
-        self.layout.setContentsMargins(10, 5, 10, 5)
+        self.role = role
+        self.is_dark_theme = is_dark_theme
         
-        self.lbl_header = QLabel(self)
-        font = QFont()
-        font.setBold(True)
-        self.lbl_header.setFont(font)
+        # Основной контейнер с ограниченной шириной (как в ChatGPT)
+        main_layout = QHBoxLayout(self)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        
+        # Создаем центральный контейнер с максимальной шириной
+        self.content_widget = QWidget()
+        content_layout = QHBoxLayout(self.content_widget)
+        content_layout.setContentsMargins(24, 16, 24, 16)
+        
+        # Иконка/аватар
+        icon_label = QLabel()
+        icon_label.setFixedSize(32, 32)
+        icon_label.setAlignment(Qt.AlignmentFlag.AlignTop)
         
         if role == "user":
-            self.lbl_header.setText("ВЫ:")
-            self.lbl_header.setStyleSheet("color: #2980b9;")
+            icon_label.setText("👤")
+            icon_label.setStyleSheet("""
+                background-color: #19C37D;
+                border-radius: 16px;
+                color: white;
+                font-size: 18px;
+                padding: 6px;
+            """)
         else:
-            self.lbl_header.setText("АГЕНТ:")
-            self.lbl_header.setStyleSheet("color: #27ae60;")
-            
-        self.layout.addWidget(self.lbl_header)
+            icon_label.setText("🤖")
+            icon_label.setStyleSheet("""
+                background-color: #10A37F;
+                border-radius: 16px;
+                color: white;
+                font-size: 18px;
+                padding: 6px;
+            """)
         
-        self.lbl_text = QLabel(text, self)
+        content_layout.addWidget(icon_label)
+        content_layout.addSpacing(16)
+        
+        # Текст сообщения
+        text_widget = QWidget()
+        text_layout = QVBoxLayout(text_widget)
+        text_layout.setContentsMargins(0, 0, 0, 0)
+        text_layout.setSpacing(4)
+        
+        self.lbl_text = QLabel(text)
         self.lbl_text.setWordWrap(True)
         self.lbl_text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.layout.addWidget(self.lbl_text)
         
-        self.setStyleSheet("""
-            ChatMessageWidget {
-                background-color: #ffffff;
-                border-radius: 5px;
-                border: 1px solid #e0e0e0;
-            }
-        """)
+        text_layout.addWidget(self.lbl_text)
+        content_layout.addWidget(text_widget, 1)
+        
+        main_layout.addWidget(self.content_widget)
+        
+        self.apply_theme(is_dark_theme)
+    
+    def apply_theme(self, is_dark_theme):
+        """Применяет тему к виджету сообщения."""
+        self.is_dark_theme = is_dark_theme
+        
+        if is_dark_theme:
+            if self.role == "user":
+                self.content_widget.setStyleSheet("background-color: #2d2d2d;")
+                self.lbl_text.setStyleSheet("""
+                    color: #ececec;
+                    font-size: 14px;
+                    line-height: 1.6;
+                """)
+            else:
+                self.content_widget.setStyleSheet("background-color: #1e1e1e;")
+                self.lbl_text.setStyleSheet("""
+                    color: #ececec;
+                    font-size: 14px;
+                    line-height: 1.6;
+                """)
+            
+            self.setStyleSheet("""
+                ChatMessageWidget {
+                    border: none;
+                    border-bottom: 1px solid #3d3d3d;
+                }
+            """)
+        else:
+            if self.role == "user":
+                self.content_widget.setStyleSheet("background-color: #f7f7f8;")
+                self.lbl_text.setStyleSheet("""
+                    color: #2d333a;
+                    font-size: 14px;
+                    line-height: 1.6;
+                """)
+            else:
+                self.content_widget.setStyleSheet("background-color: #ffffff;")
+                self.lbl_text.setStyleSheet("""
+                    color: #2d333a;
+                    font-size: 14px;
+                    line-height: 1.6;
+                """)
+            
+            self.setStyleSheet("""
+                ChatMessageWidget {
+                    border: none;
+                    border-bottom: 1px solid #ececf1;
+                }
+            """)
 
 class ImageMessageWidget(QFrame):
-    def __init__(self, image_path: str, description: str, parent=None):
+    def __init__(self, image_path: str, description: str, parent=None, is_dark_theme=True):
         super().__init__(parent)
-        self.layout = QVBoxLayout(self)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.is_dark_theme = is_dark_theme
         
-        self.lbl_desc = QLabel(f"🖼 {description}", self)
-        self.lbl_desc.setStyleSheet("color: #7f8c8d; font-size: 11px;")
-        self.layout.addWidget(self.lbl_desc)
+        # Основной контейнер
+        main_layout = QHBoxLayout(self)
+        main_layout.setContentsMargins(0, 0, 0, 0)
         
-        self.lbl_image = QLabel(self)
+        # Центральный контейнер
+        self.content_widget = QWidget()
+        content_layout = QVBoxLayout(self.content_widget)
+        content_layout.setContentsMargins(24, 12, 24, 12)
+        content_layout.setSpacing(8)
+        
+        # Описание
+        self.lbl_desc = QLabel(f"🖼 {description}")
+        content_layout.addWidget(self.lbl_desc)
+        
+        # Изображение
+        self.lbl_image = QLabel()
         pixmap = QPixmap(image_path)
         
         if pixmap.width() > 600:
             pixmap = pixmap.scaledToWidth(600, Qt.TransformationMode.SmoothTransformation)
             
         self.lbl_image.setPixmap(pixmap)
-        self.layout.addWidget(self.lbl_image)
+        content_layout.addWidget(self.lbl_image)
         
-        self.setStyleSheet("border: 1px solid #ddd; background: #f9f9f9; margin: 5px;")
+        main_layout.addWidget(self.content_widget)
+        
+        self.apply_theme(is_dark_theme)
+    
+    def apply_theme(self, is_dark_theme):
+        """Применяет тему к виджету изображения."""
+        self.is_dark_theme = is_dark_theme
+        
+        if is_dark_theme:
+            self.lbl_desc.setStyleSheet("""
+                color: #8e8ea0;
+                font-size: 12px;
+            """)
+            
+            self.lbl_image.setStyleSheet("""
+                border: 1px solid #4d4d4f;
+                border-radius: 8px;
+                background: #2d2d2d;
+                padding: 4px;
+            """)
+            
+            self.content_widget.setStyleSheet("background-color: #1e1e1e;")
+            
+            self.setStyleSheet("""
+                ImageMessageWidget {
+                    border: none;
+                    border-bottom: 1px solid #3d3d3d;
+                }
+            """)
+        else:
+            self.lbl_desc.setStyleSheet("""
+                color: #6e6e80;
+                font-size: 12px;
+            """)
+            
+            self.lbl_image.setStyleSheet("""
+                border: 1px solid #e5e5e5;
+                border-radius: 8px;
+                background: white;
+                padding: 4px;
+            """)
+            
+            self.content_widget.setStyleSheet("background-color: #ffffff;")
+            
+            self.setStyleSheet("""
+                ImageMessageWidget {
+                    border: none;
+                    border-bottom: 1px solid #ececf1;
+                }
+            """)
 
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("AIZoomDoc v2.0")
+        self.setWindowTitle("AIZoomDoc")
         self.resize(1400, 900)
         
         # Загружаем конфиг
@@ -378,12 +514,15 @@ class MainWindow(QMainWindow):
         self.data_root = Path(self.app_config.get("data_root", Path.cwd() / "data"))
         self.data_root.mkdir(parents=True, exist_ok=True)
         
+        # Инициализация темной темы (по умолчанию)
+        self.is_dark_theme = self.app_config.get("dark_theme", True)
+        
         self.current_worker = None
         self.selected_md_files = []
         
         # Меню
-        menubar = self.menuBar()
-        settings_menu = menubar.addMenu("Настройки")
+        self.menubar = self.menuBar()
+        settings_menu = self.menubar.addMenu("Настройки")
         
         action_settings = QAction("Открыть настройки...", self)
         action_settings.triggered.connect(self.open_settings)
@@ -391,122 +530,185 @@ class MainWindow(QMainWindow):
         
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
-        main_layout = QHBoxLayout(central_widget)
+        main_layout = QVBoxLayout(central_widget)
         main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
         
-        # ЛЕВАЯ ПАНЕЛЬ
-        left_panel = QFrame()
-        left_panel.setFixedWidth(280)
-        left_panel.setStyleSheet("background-color: #f0f0f0; border-right: 1px solid #ccc;")
-        left_layout = QVBoxLayout(left_panel)
+        # Верхняя панель с переключателем темы
+        self.top_bar = QFrame()
+        self.top_bar.setFixedHeight(50)
+        top_bar_layout = QHBoxLayout(self.top_bar)
+        top_bar_layout.setContentsMargins(16, 8, 16, 8)
         
-        self.btn_new_chat = QPushButton("Новый чат")
-        self.btn_new_chat.setStyleSheet("background-color: #3498db; color: white; border: none; padding: 10px; font-weight: bold;")
+        top_bar_layout.addStretch()
+        
+        # Переключатель темы
+        self.theme_toggle = QPushButton("🌙" if self.is_dark_theme else "☀️")
+        self.theme_toggle.setFixedSize(40, 34)
+        self.theme_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.theme_toggle.setToolTip("Переключить тему")
+        self.theme_toggle.clicked.connect(self.toggle_theme)
+        top_bar_layout.addWidget(self.theme_toggle)
+        
+        main_layout.addWidget(self.top_bar)
+        
+        # Контейнер для основного содержимого
+        content_widget = QWidget()
+        content_layout = QHBoxLayout(content_widget)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        
+        # ЛЕВАЯ ПАНЕЛЬ (стиль ChatGPT)
+        self.left_panel = QFrame()
+        self.left_panel.setFixedWidth(260)
+        left_layout = QVBoxLayout(self.left_panel)
+        left_layout.setSpacing(8)
+        left_layout.setContentsMargins(12, 12, 12, 12)
+        
+        # Кнопка "Новый чат" в стиле ChatGPT
+        self.btn_new_chat = QPushButton("+ Новый чат")
         self.btn_new_chat.clicked.connect(self.new_chat)
         left_layout.addWidget(self.btn_new_chat)
         
-        # Кнопка настроек
-        self.btn_settings = QPushButton("⚙️ Настройки")
-        self.btn_settings.setStyleSheet("background-color: #95a5a6; color: white; border: none; padding: 8px; margin-top: 5px;")
-        self.btn_settings.clicked.connect(self.open_settings)
-        left_layout.addWidget(self.btn_settings)
+        left_layout.addSpacing(12)
         
-        left_layout.addWidget(QLabel("ИСТОРИЯ ЧАТОВ:"))
+        # Заголовок истории
+        self.history_label = QLabel("Недавние чаты")
+        left_layout.addWidget(self.history_label)
+        
+        # Список истории
         self.list_history = QListWidget()
-        self.list_history.setStyleSheet("border: none; background: transparent;")
         self.list_history.itemClicked.connect(self.load_chat_history)
         left_layout.addWidget(self.list_history)
         
         # ЦЕНТР
-        center_panel = QFrame()
-        center_layout = QVBoxLayout(center_panel)
+        self.center_panel = QFrame()
+        center_layout = QVBoxLayout(self.center_panel)
+        center_layout.setContentsMargins(0, 0, 0, 0)
+        center_layout.setSpacing(0)
         
+        # Область чата
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
-        self.scroll_area.setStyleSheet("background-color: white; border: none;")
         
         self.chat_container = QWidget()
         self.chat_layout = QVBoxLayout(self.chat_container)
+        self.chat_layout.setContentsMargins(0, 0, 0, 0)
+        self.chat_layout.setSpacing(0)
         self.chat_layout.addStretch()
         
         self.scroll_area.setWidget(self.chat_container)
         center_layout.addWidget(self.scroll_area)
         
-        # Панель выбора файлов
-        files_frame = QFrame()
-        files_frame.setStyleSheet("background-color: #ffeaa7; border: 1px solid #fdcb6e; padding: 5px;")
-        files_layout = QHBoxLayout(files_frame)
+        # Панель ввода в стиле ChatGPT
+        self.input_container = QWidget()
+        input_container_layout = QVBoxLayout(self.input_container)
+        input_container_layout.setContentsMargins(0, 12, 0, 24)
         
-        self.lbl_selected_files = QLabel("Файлы: нет")
-        self.lbl_selected_files.setStyleSheet("color: #2d3436; font-size: 10px;")
+        # Центрируем панель ввода с отступами 5% с каждой стороны
+        input_center_layout = QHBoxLayout()
+        input_center_layout.setSpacing(0)
+        input_center_layout.setContentsMargins(0, 0, 0, 0)
         
-        btn_browse_files = QPushButton("Обзор MD...")
-        btn_browse_files.setFixedWidth(120)
-        btn_browse_files.clicked.connect(self.browse_md_files)
+        # Левый отступ (5%)
+        left_spacer = QWidget()
+        left_spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        input_center_layout.addWidget(left_spacer, 1)
         
-        btn_clear_files = QPushButton("Очистить")
-        btn_clear_files.setFixedWidth(80)
-        btn_clear_files.clicked.connect(self.clear_md_files)
+        self.input_frame = QFrame()
         
-        files_layout.addWidget(self.lbl_selected_files, 1)
-        files_layout.addWidget(btn_browse_files)
-        files_layout.addWidget(btn_clear_files)
+        input_layout = QHBoxLayout(self.input_frame)
+        input_layout.setContentsMargins(16, 12, 4, 12)
+        input_layout.setSpacing(8)
         
-        center_layout.addWidget(files_frame)
+        # Кнопка добавления файлов
+        self.btn_attach = QPushButton("+")
+        self.btn_attach.setFixedSize(36, 36)
+        self.btn_attach.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_attach.setToolTip("Прикрепить файлы")
+        self.btn_attach.clicked.connect(self.on_attach_clicked)
+        input_layout.addWidget(self.btn_attach)
         
-        # Поле ввода (с Drag & Drop)
-        input_frame = QFrame()
-        input_frame.setStyleSheet("background-color: #ecf0f1; border-top: 1px solid #ccc;")
-        input_frame.setFixedHeight(80)
-        input_layout = QHBoxLayout(input_frame)
-        
+        # Поле ввода
         self.txt_input = DragDropLineEdit()
-        self.txt_input.setPlaceholderText("Введите запрос (или перетащите .md файл сюда)...")
+        self.txt_input.setPlaceholderText("Введите сообщение...")
         self.txt_input.returnPressed.connect(self.start_agent)
+        input_layout.addWidget(self.txt_input, 1)
         
-        self.btn_send = QPushButton("Отправить")
+        # Индикатор файлов (кликабельный)
+        self.lbl_file_count = QLabel("")
+        self.lbl_file_count.setVisible(False)
+        self.lbl_file_count.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.lbl_file_count.mousePressEvent = lambda e: self.show_files_menu()
+        input_layout.addWidget(self.lbl_file_count)
+        
+        # Кнопка отправки
+        self.btn_send = QPushButton("↑")
+        self.btn_send.setFixedSize(36, 36)
+        self.btn_send.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_send.clicked.connect(self.start_agent)
-        
-        input_layout.addWidget(self.txt_input)
         input_layout.addWidget(self.btn_send)
-        center_layout.addWidget(input_frame)
         
-        # ПРАВАЯ ПАНЕЛЬ
-        right_panel = QFrame()
-        right_panel.setFixedWidth(300)
-        right_panel.setStyleSheet("background: #f8f9fa;")
-        right_layout = QVBoxLayout(right_panel)
+        # Центральная часть (90%)
+        input_center_layout.addWidget(self.input_frame, 18)
+        
+        # Правый отступ (5%)
+        right_spacer = QWidget()
+        right_spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        input_center_layout.addWidget(right_spacer, 1)
+        
+        input_container_layout.addLayout(input_center_layout)
+        center_layout.addWidget(self.input_container)
+        
+        # ПРАВАЯ ПАНЕЛЬ (стиль ChatGPT)
+        self.right_panel = QFrame()
+        self.right_panel.setFixedWidth(320)
+        right_layout = QVBoxLayout(self.right_panel)
+        right_layout.setSpacing(16)
+        right_layout.setContentsMargins(20, 20, 20, 20)
+        
+        # Выбор модели
+        self.model_label = QLabel("Модель")
+        right_layout.addWidget(self.model_label)
         
         self.combo_models = QComboBox()
         for name, mid in MODELS.items():
             self.combo_models.addItem(name, mid)
-        right_layout.addWidget(QLabel("Модель:"))
+        # Устанавливаем Gemini 3 Pro по умолчанию
+        self.combo_models.setCurrentIndex(1)
         right_layout.addWidget(self.combo_models)
         
-        right_layout.addSpacing(10)
+        right_layout.addSpacing(8)
         
+        # Путь к данным
         self.lbl_data_root = QLabel(f"📁 {self.data_root}")
         self.lbl_data_root.setWordWrap(True)
-        self.lbl_data_root.setStyleSheet("font-size: 10px; color: #555;")
         right_layout.addWidget(self.lbl_data_root)
+        
+        # Логи
+        self.logs_label = QLabel("Логи выполнения")
+        right_layout.addWidget(self.logs_label)
         
         self.log_view = QTextEdit()
         self.log_view.setReadOnly(True)
-        self.log_view.setStyleSheet("font-family: Consolas; font-size: 10px; background: #2c3e50; color: #ecf0f1;")
-        right_layout.addWidget(QLabel("Логи:"))
         right_layout.addWidget(self.log_view)
         
+        # Прогресс бар
         self.progress = QProgressBar()
         self.progress.setVisible(False)
         self.progress.setRange(0, 0)
         right_layout.addWidget(self.progress)
         
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.addWidget(left_panel)
-        splitter.addWidget(center_panel)
-        splitter.addWidget(right_panel)
+        splitter.addWidget(self.left_panel)
+        splitter.addWidget(self.center_panel)
+        splitter.addWidget(self.right_panel)
         splitter.setStretchFactor(1, 1)
-        main_layout.addWidget(splitter)
+        content_layout.addWidget(splitter)
+        
+        main_layout.addWidget(content_widget)
+        
+        # Применяем тему
+        self.apply_theme()
         
         self.refresh_history_list()
 
@@ -523,6 +725,40 @@ class MainWindow(QMainWindow):
                 self.refresh_history_list()
                 QMessageBox.information(self, "Настройки", f"Папка обновлена:\n{self.data_root}")
 
+    def on_attach_clicked(self):
+        """Обработчик клика по кнопке прикрепления файлов."""
+        if self.selected_md_files:
+            # Если файлы уже прикреплены, показываем меню
+            menu = QMenu(self)
+            menu.setStyleSheet("""
+                QMenu {
+                    background-color: white;
+                    border: 1px solid #d1d5db;
+                    border-radius: 8px;
+                    padding: 4px;
+                }
+                QMenu::item {
+                    padding: 8px 20px;
+                    border-radius: 4px;
+                }
+                QMenu::item:selected {
+                    background-color: #f3f4f6;
+                }
+            """)
+            
+            action_add = menu.addAction("➕ Добавить еще файлы")
+            action_clear = menu.addAction("🗑️ Очистить все файлы")
+            
+            action = menu.exec(self.btn_attach.mapToGlobal(self.btn_attach.rect().bottomLeft()))
+            
+            if action == action_add:
+                self.browse_md_files()
+            elif action == action_clear:
+                self.clear_md_files()
+        else:
+            # Если файлов нет, сразу открываем диалог
+            self.browse_md_files()
+    
     def browse_md_files(self):
         files, _ = QFileDialog.getOpenFileNames(
             self, 
@@ -531,25 +767,94 @@ class MainWindow(QMainWindow):
             "Markdown Files (*.md)"
         )
         if files:
-            self.selected_md_files = files
-            self.lbl_selected_files.setText(f"Файлы: {len(files)} шт.")
-            self.log(f"Выбрано файлов: {len(files)}")
+            # Добавляем новые файлы к существующим
+            for f in files:
+                if f not in self.selected_md_files:
+                    self.selected_md_files.append(f)
+            self.update_file_indicator()
+            self.log(f"Всего файлов: {len(self.selected_md_files)}")
 
     def clear_md_files(self):
         self.selected_md_files = []
-        self.lbl_selected_files.setText("Файлы: нет")
+        self.update_file_indicator()
+    
+    def update_file_indicator(self):
+        """Обновляет индикатор количества прикрепленных файлов."""
+        if self.selected_md_files:
+            count = len(self.selected_md_files)
+            self.lbl_file_count.setText(f"📎 {count}")
+            self.lbl_file_count.setVisible(True)
+            self.lbl_file_count.setToolTip("Нажмите, чтобы посмотреть список файлов")
+        else:
+            self.lbl_file_count.setVisible(False)
+    
+    def show_files_menu(self):
+        """Показывает меню со списком прикрепленных файлов."""
+        if not self.selected_md_files:
+            return
+        
+        menu = QMenu(self)
+        menu.setStyleSheet("""
+            QMenu {
+                background-color: white;
+                border: 1px solid #d1d5db;
+                border-radius: 8px;
+                padding: 8px;
+                min-width: 300px;
+            }
+            QMenu::item {
+                padding: 8px 12px;
+                border-radius: 4px;
+                color: #2d333a;
+            }
+            QMenu::item:selected {
+                background-color: #f3f4f6;
+            }
+            QMenu::separator {
+                height: 1px;
+                background: #e5e5e5;
+                margin: 4px 0;
+            }
+        """)
+        
+        # Заголовок
+        title_action = menu.addAction(f"📎 Прикрепленные файлы ({len(self.selected_md_files)})")
+        title_action.setEnabled(False)
+        menu.addSeparator()
+        
+        # Список файлов
+        for idx, file_path in enumerate(self.selected_md_files):
+            file_name = Path(file_path).name
+            action = menu.addAction(f"  {file_name}")
+            # Сохраняем индекс для удаления
+            action.setData(idx)
+        
+        menu.addSeparator()
+        clear_action = menu.addAction("🗑️ Очистить все")
+        
+        action = menu.exec(self.lbl_file_count.mapToGlobal(self.lbl_file_count.rect().bottomLeft()))
+        
+        if action == clear_action:
+            self.clear_md_files()
+        elif action and action.data() is not None:
+            # Удаляем конкретный файл
+            idx = action.data()
+            if 0 <= idx < len(self.selected_md_files):
+                removed_file = self.selected_md_files.pop(idx)
+                self.update_file_indicator()
+                self.log(f"Удален файл: {Path(removed_file).name}")
 
     def log(self, text):
         self.log_view.append(f"{datetime.now().strftime('%H:%M:%S')} {text}")
 
     def add_chat_message(self, role, text):
-        w = ChatMessageWidget(role, text)
+        w = ChatMessageWidget(role, text, is_dark_theme=self.is_dark_theme)
         self.chat_layout.insertWidget(self.chat_layout.count()-1, w)
         QApplication.processEvents()
         self.scroll_area.verticalScrollBar().setValue(self.scroll_area.verticalScrollBar().maximum())
 
     def add_chat_image(self, path, desc):
-        w = ImageMessageWidget(path, desc)
+        w = ImageMessageWidget(path, desc, is_dark_theme=self.is_dark_theme)
         self.chat_layout.insertWidget(self.chat_layout.count()-1, w)
         QApplication.processEvents()
         self.scroll_area.verticalScrollBar().setValue(self.scroll_area.verticalScrollBar().maximum())
@@ -560,6 +865,7 @@ class MainWindow(QMainWindow):
             if item.widget(): item.widget().deleteLater()
         self.txt_input.setEnabled(True)
         self.btn_send.setEnabled(True)
+        self.btn_attach.setEnabled(True)
         self.clear_md_files()
 
     def refresh_history_list(self):
@@ -576,8 +882,11 @@ class MainWindow(QMainWindow):
                     with open(hist_file, "r", encoding="utf-8") as f:
                         data = json.load(f)
                         query = data.get("query", "Без названия")
-                        item = QListWidgetItem(f"{d.name[:15]}... - {query[:20]}")
+                        # Ограничиваем длину запроса для отображения
+                        display_query = query[:45] + "..." if len(query) > 45 else query
+                        item = QListWidgetItem(f"💬 {display_query}")
                         item.setData(Qt.ItemDataRole.UserRole, str(hist_file))
+                        item.setToolTip(query)  # Полный текст в подсказке
                         self.list_history.addItem(item)
                 except: pass
 
@@ -608,6 +917,7 @@ class MainWindow(QMainWindow):
         self.txt_input.clear()
         self.txt_input.setEnabled(False)
         self.btn_send.setEnabled(False)
+        self.btn_attach.setEnabled(False)
         self.progress.setVisible(True)
         
         mid = self.combo_models.currentData()
@@ -629,8 +939,588 @@ class MainWindow(QMainWindow):
     def on_finished(self):
         self.txt_input.setEnabled(True)
         self.btn_send.setEnabled(True)
+        self.btn_attach.setEnabled(True)
         self.progress.setVisible(False)
         self.log("Готово.")
+    
+    def toggle_theme(self):
+        """Переключает тему интерфейса."""
+        self.is_dark_theme = not self.is_dark_theme
+        self.theme_toggle.setText("🌙" if self.is_dark_theme else "☀️")
+        self.app_config["dark_theme"] = self.is_dark_theme
+        save_config_file(self.app_config)
+        self.apply_theme()
+    
+    def apply_theme(self):
+        """Применяет текущую тему к интерфейсу."""
+        if self.is_dark_theme:
+            # ТЕМНАЯ ТЕМА
+            # Общие стили
+            self.setStyleSheet("""
+                QMainWindow {
+                    background-color: #1e1e1e;
+                }
+                QMenuBar {
+                    background-color: #2d2d2d;
+                    color: #ececec;
+                    border-bottom: 1px solid #3d3d3d;
+                }
+                QMenuBar::item {
+                    background-color: transparent;
+                    color: #ececec;
+                    padding: 4px 8px;
+                }
+                QMenuBar::item:selected {
+                    background-color: #3d3d3d;
+                }
+                QMenu {
+                    background-color: #2d2d2d;
+                    color: #ececec;
+                    border: 1px solid #3d3d3d;
+                }
+                QMenu::item:selected {
+                    background-color: #3d3d3d;
+                }
+                QScrollBar:vertical {
+                    border: none;
+                    background: transparent;
+                    width: 8px;
+                    margin: 0;
+                }
+                QScrollBar::handle:vertical {
+                    background: #4d4d4f;
+                    border-radius: 4px;
+                    min-height: 20px;
+                }
+                QScrollBar::handle:vertical:hover {
+                    background: #6e6e70;
+                }
+                QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                    border: none;
+                    background: none;
+                }
+            """)
+            
+            # Верхняя панель
+            self.top_bar.setStyleSheet("""
+                QFrame {
+                    background-color: #2d2d2d;
+                    border-bottom: 1px solid #3d3d3d;
+                }
+            """)
+            
+            self.theme_toggle.setStyleSheet("""
+                QPushButton {
+                    background-color: #3d3d3d;
+                    color: white;
+                    border: 1px solid #4d4d4f;
+                    border-radius: 6px;
+                    font-size: 16px;
+                }
+                QPushButton:hover {
+                    background-color: #4d4d4f;
+                }
+            """)
+            
+            # Левая панель
+            self.left_panel.setStyleSheet("""
+                QFrame {
+                    background-color: #171717;
+                    border-right: 1px solid #2d2d2d;
+                }
+            """)
+            
+            self.btn_new_chat.setStyleSheet("""
+                QPushButton {
+                    background-color: transparent;
+                    color: #ececec;
+                    border: 1px solid #4d4d4f;
+                    border-radius: 8px;
+                    padding: 10px;
+                    font-size: 13px;
+                    text-align: left;
+                    font-weight: 500;
+                }
+                QPushButton:hover {
+                    background-color: #2d2d2d;
+                }
+                QPushButton:pressed {
+                    background-color: #3d3d3d;
+                }
+            """)
+            
+            self.history_label.setStyleSheet("""
+                color: #8e8ea0;
+                font-size: 11px;
+                font-weight: 500;
+                padding-left: 8px;
+            """)
+            
+            self.list_history.setStyleSheet("""
+                QListWidget {
+                    border: none;
+                    background: transparent;
+                    outline: none;
+                }
+                QListWidget::item {
+                    color: #ececec;
+                    padding: 8px;
+                    border-radius: 6px;
+                    margin: 1px 0;
+                    font-size: 12px;
+                }
+                QListWidget::item:hover {
+                    background-color: #2d2d2d;
+                }
+                QListWidget::item:selected {
+                    background-color: #3d3d3d;
+                }
+            """)
+            
+            # Центральная панель
+            self.center_panel.setStyleSheet("""
+                QFrame {
+                    background-color: #2d2d2d;
+                }
+            """)
+            
+            self.scroll_area.setStyleSheet("""
+                QScrollArea {
+                    background-color: #2d2d2d;
+                    border: none;
+                }
+            """)
+            
+            self.chat_container.setStyleSheet("""
+                QWidget {
+                    background-color: #2d2d2d;
+                }
+            """)
+            
+            self.input_container.setStyleSheet("background-color: #2d2d2d;")
+            
+            self.input_frame.setStyleSheet("""
+                QFrame {
+                    background-color: #3d3d3d;
+                    border-radius: 24px;
+                    border: 1px solid #4d4d4f;
+                }
+            """)
+            
+            self.btn_attach.setStyleSheet("""
+                QPushButton {
+                    background-color: transparent;
+                    color: #8e8ea0;
+                    border: none;
+                    border-radius: 18px;
+                    font-size: 24px;
+                    font-weight: bold;
+                }
+                QPushButton:hover {
+                    background-color: #4d4d4f;
+                    color: #ececec;
+                }
+            """)
+            
+            self.txt_input.setStyleSheet("""
+                QLineEdit {
+                    background-color: transparent;
+                    border: none;
+                    color: #ececec;
+                    font-size: 14px;
+                    padding: 8px;
+                }
+            """)
+            
+            self.lbl_file_count.setStyleSheet("""
+                color: #10A37F;
+                font-size: 12px;
+                padding: 4px 8px;
+                background-color: rgba(16, 163, 127, 0.2);
+                border-radius: 12px;
+            """)
+            
+            self.btn_send.setStyleSheet("""
+                QPushButton {
+                    background-color: #10A37F;
+                    color: white;
+                    border: none;
+                    border-radius: 18px;
+                    font-size: 20px;
+                    font-weight: bold;
+                }
+                QPushButton:hover {
+                    background-color: #0d8c6d;
+                }
+                QPushButton:disabled {
+                    background-color: #4d4d4f;
+                }
+            """)
+            
+            # Правая панель
+            self.right_panel.setStyleSheet("""
+                QFrame {
+                    background-color: #1e1e1e;
+                    border-left: 1px solid #2d2d2d;
+                }
+            """)
+            
+            self.model_label.setStyleSheet("""
+                color: #ececec;
+                font-size: 13px;
+                font-weight: 600;
+            """)
+            
+            self.combo_models.setStyleSheet("""
+                QComboBox {
+                    background-color: #3d3d3d;
+                    border: 1px solid #4d4d4f;
+                    border-radius: 8px;
+                    padding: 10px;
+                    color: #ececec;
+                    font-size: 13px;
+                }
+                QComboBox:hover {
+                    border-color: #10A37F;
+                }
+                QComboBox::drop-down {
+                    border: none;
+                    padding-right: 10px;
+                }
+                QComboBox QAbstractItemView {
+                    background-color: #3d3d3d;
+                    color: #ececec;
+                    selection-background-color: #4d4d4f;
+                }
+            """)
+            
+            self.lbl_data_root.setStyleSheet("""
+                color: #8e8ea0;
+                font-size: 11px;
+                padding: 8px;
+                background-color: #2d2d2d;
+                border-radius: 6px;
+            """)
+            
+            self.logs_label.setStyleSheet("""
+                color: #ececec;
+                font-size: 13px;
+                font-weight: 600;
+                margin-top: 8px;
+            """)
+            
+            self.log_view.setStyleSheet("""
+                QTextEdit {
+                    font-family: 'Consolas', 'Monaco', monospace;
+                    font-size: 11px;
+                    background-color: #0d0d0d;
+                    color: #d4d4d4;
+                    border: 1px solid #2d2d2d;
+                    border-radius: 8px;
+                    padding: 12px;
+                }
+            """)
+            
+            self.progress.setStyleSheet("""
+                QProgressBar {
+                    border: none;
+                    border-radius: 4px;
+                    background-color: #2d2d2d;
+                    height: 4px;
+                }
+                QProgressBar::chunk {
+                    background-color: #10A37F;
+                    border-radius: 4px;
+                }
+            """)
+        else:
+            # СВЕТЛАЯ ТЕМА
+            # Общие стили
+            self.setStyleSheet("""
+                QMainWindow {
+                    background-color: #ffffff;
+                }
+                QMenuBar {
+                    background-color: #f7f7f8;
+                    color: #2d333a;
+                    border-bottom: 1px solid #e5e5e5;
+                }
+                QMenuBar::item {
+                    background-color: transparent;
+                    color: #2d333a;
+                    padding: 4px 8px;
+                }
+                QMenuBar::item:selected {
+                    background-color: #e5e5e5;
+                }
+                QMenu {
+                    background-color: white;
+                    color: #2d333a;
+                    border: 1px solid #d1d5db;
+                }
+                QMenu::item:selected {
+                    background-color: #f3f4f6;
+                }
+                QScrollBar:vertical {
+                    border: none;
+                    background: transparent;
+                    width: 8px;
+                    margin: 0;
+                }
+                QScrollBar::handle:vertical {
+                    background: #d1d5db;
+                    border-radius: 4px;
+                    min-height: 20px;
+                }
+                QScrollBar::handle:vertical:hover {
+                    background: #9ca3af;
+                }
+                QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                    border: none;
+                    background: none;
+                }
+            """)
+            
+            # Верхняя панель
+            self.top_bar.setStyleSheet("""
+                QFrame {
+                    background-color: #f7f7f8;
+                    border-bottom: 1px solid #e5e5e5;
+                }
+            """)
+            
+            self.theme_toggle.setStyleSheet("""
+                QPushButton {
+                    background-color: #ffffff;
+                    color: #2d333a;
+                    border: 1px solid #d1d5db;
+                    border-radius: 6px;
+                    font-size: 16px;
+                }
+                QPushButton:hover {
+                    background-color: #f3f4f6;
+                }
+            """)
+            
+            # Левая панель
+            self.left_panel.setStyleSheet("""
+                QFrame {
+                    background-color: #f7f7f8;
+                    border-right: 1px solid #e5e5e5;
+                }
+            """)
+            
+            self.btn_new_chat.setStyleSheet("""
+                QPushButton {
+                    background-color: transparent;
+                    color: #2d333a;
+                    border: 1px solid #d1d5db;
+                    border-radius: 8px;
+                    padding: 10px;
+                    font-size: 13px;
+                    text-align: left;
+                    font-weight: 500;
+                }
+                QPushButton:hover {
+                    background-color: #e5e5e5;
+                }
+                QPushButton:pressed {
+                    background-color: #d1d5db;
+                }
+            """)
+            
+            self.history_label.setStyleSheet("""
+                color: #6e6e80;
+                font-size: 11px;
+                font-weight: 500;
+                padding-left: 8px;
+            """)
+            
+            self.list_history.setStyleSheet("""
+                QListWidget {
+                    border: none;
+                    background: transparent;
+                    outline: none;
+                }
+                QListWidget::item {
+                    color: #2d333a;
+                    padding: 8px;
+                    border-radius: 6px;
+                    margin: 1px 0;
+                    font-size: 12px;
+                }
+                QListWidget::item:hover {
+                    background-color: #e5e5e5;
+                }
+                QListWidget::item:selected {
+                    background-color: #d1d5db;
+                }
+            """)
+            
+            # Центральная панель
+            self.center_panel.setStyleSheet("""
+                QFrame {
+                    background-color: #ffffff;
+                }
+            """)
+            
+            self.scroll_area.setStyleSheet("""
+                QScrollArea {
+                    background-color: #ffffff;
+                    border: none;
+                }
+            """)
+            
+            self.chat_container.setStyleSheet("""
+                QWidget {
+                    background-color: #ffffff;
+                }
+            """)
+            
+            self.input_container.setStyleSheet("background-color: #ffffff;")
+            
+            self.input_frame.setStyleSheet("""
+                QFrame {
+                    background-color: #f4f4f4;
+                    border-radius: 24px;
+                    border: 1px solid #e5e5e5;
+                }
+            """)
+            
+            self.btn_attach.setStyleSheet("""
+                QPushButton {
+                    background-color: transparent;
+                    color: #8e8ea0;
+                    border: none;
+                    border-radius: 18px;
+                    font-size: 24px;
+                    font-weight: bold;
+                }
+                QPushButton:hover {
+                    background-color: #e5e5e5;
+                    color: #2d333a;
+                }
+            """)
+            
+            self.txt_input.setStyleSheet("""
+                QLineEdit {
+                    background-color: transparent;
+                    border: none;
+                    color: #2d333a;
+                    font-size: 14px;
+                    padding: 8px;
+                }
+            """)
+            
+            self.lbl_file_count.setStyleSheet("""
+                color: #10A37F;
+                font-size: 12px;
+                padding: 4px 8px;
+                background-color: #d1f4e8;
+                border-radius: 12px;
+            """)
+            
+            self.btn_send.setStyleSheet("""
+                QPushButton {
+                    background-color: #10A37F;
+                    color: white;
+                    border: none;
+                    border-radius: 18px;
+                    font-size: 20px;
+                    font-weight: bold;
+                }
+                QPushButton:hover {
+                    background-color: #0d8c6d;
+                }
+                QPushButton:disabled {
+                    background-color: #d0d0d0;
+                }
+            """)
+            
+            # Правая панель
+            self.right_panel.setStyleSheet("""
+                QFrame {
+                    background-color: #f7f7f8;
+                    border-left: 1px solid #ececf1;
+                }
+            """)
+            
+            self.model_label.setStyleSheet("""
+                color: #2d333a;
+                font-size: 13px;
+                font-weight: 600;
+            """)
+            
+            self.combo_models.setStyleSheet("""
+                QComboBox {
+                    background-color: white;
+                    border: 1px solid #d1d5db;
+                    border-radius: 8px;
+                    padding: 10px;
+                    color: #2d333a;
+                    font-size: 13px;
+                }
+                QComboBox:hover {
+                    border-color: #10A37F;
+                }
+                QComboBox::drop-down {
+                    border: none;
+                    padding-right: 10px;
+                }
+                QComboBox QAbstractItemView {
+                    background-color: white;
+                    color: #2d333a;
+                    selection-background-color: #f3f4f6;
+                }
+            """)
+            
+            self.lbl_data_root.setStyleSheet("""
+                color: #6e6e80;
+                font-size: 11px;
+                padding: 8px;
+                background-color: #ececf1;
+                border-radius: 6px;
+            """)
+            
+            self.logs_label.setStyleSheet("""
+                color: #2d333a;
+                font-size: 13px;
+                font-weight: 600;
+                margin-top: 8px;
+            """)
+            
+            self.log_view.setStyleSheet("""
+                QTextEdit {
+                    font-family: 'Consolas', 'Monaco', monospace;
+                    font-size: 11px;
+                    background-color: #1e1e1e;
+                    color: #d4d4d4;
+                    border: 1px solid #2d2d2d;
+                    border-radius: 8px;
+                    padding: 12px;
+                }
+            """)
+            
+            self.progress.setStyleSheet("""
+                QProgressBar {
+                    border: none;
+                    border-radius: 4px;
+                    background-color: #ececf1;
+                    height: 4px;
+                }
+                QProgressBar::chunk {
+                    background-color: #10A37F;
+                    border-radius: 4px;
+                }
+            """)
+        
+        # Обновляем тему для всех существующих сообщений в чате
+        for i in range(self.chat_layout.count()):
+            item = self.chat_layout.itemAt(i)
+            if item and item.widget():
+                widget = item.widget()
+                if isinstance(widget, ChatMessageWidget) or isinstance(widget, ImageMessageWidget):
+                    widget.apply_theme(self.is_dark_theme)
 
 def main():
     app = QApplication(sys.argv)
