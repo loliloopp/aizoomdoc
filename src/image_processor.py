@@ -1,295 +1,197 @@
 """
-Обработка изображений: динамический контекстный кроп (viewport strategy)
-с опциональной визуальной подсветкой блоков.
+Обработка изображений: ресайз, кроп, загрузка PDF с S3 и подготовка для LLM.
 """
 
 import logging
-import math
+import io
+import tempfile
+import uuid
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 
 import cv2
 import numpy as np
-from PIL import Image
+import requests
+import fitz  # PyMuPDF
 
 from .config import config
-from .models import Block, Page, ViewportCrop
+from .models import Page, ViewportCrop, ZoomRequest
 
 logger = logging.getLogger(__name__)
 
 
 class ImageProcessor:
-    """Обработчик изображений с поддержкой динамического viewport-кропа."""
+    """Обработчик изображений (локальных и удаленных PDF)."""
     
     def __init__(self, images_root: Path):
-        """
-        Инициализирует процессор изображений.
-        
-        Args:
-            images_root: Корневая папка с изображениями страниц
-        """
         self.images_root = images_root
-    
+        self.temp_dir = Path(tempfile.gettempdir()) / "aizoomdoc_cache"
+        self.temp_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Кэш оригиналов изображений (пути к временным файлам)
+        # Key: image_id (или url hash), Value: Path to full resolution image
+        self._image_cache: Dict[str, Path] = {} 
+        # Размеры оригиналов {image_id: (width, height)}
+        self._image_sizes: Dict[str, Tuple[int, int]] = {}
+
     def get_page_image_path(self, page_number: int) -> Path:
-        """
-        Получает путь к полноразмерному изображению страницы.
-        
-        Args:
-            page_number: Номер страницы
-        
-        Returns:
-            Путь к изображению (предполагается формат page_XXX_full.jpg)
-        """
-        # Формат имени файла: page_003_full.jpg
+        """Получает путь к локальному изображению страницы."""
         filename = f"page_{page_number:03d}_full.jpg"
         return self.images_root / filename
-    
-    def load_page_image(self, page_number: int) -> Optional[np.ndarray]:
-        """
-        Загружает полноразмерное изображение страницы.
-        
-        Args:
-            page_number: Номер страницы
-        
-        Returns:
-            Изображение как numpy array (BGR) или None если не найдено
-        """
-        image_path = self.get_page_image_path(page_number)
-        
-        if not image_path.exists():
-            logger.warning(f"Изображение страницы не найдено: {image_path}")
+
+    def load_local_page(self, page_number: int) -> Optional[np.ndarray]:
+        """Загружает оригинал локальной страницы."""
+        path = self.get_page_image_path(page_number)
+        if not path.exists():
             return None
-        
-        logger.debug(f"Загрузка изображения страницы {page_number} из {image_path}")
-        image = cv2.imread(str(image_path))
-        
-        if image is None:
-            logger.error(f"Не удалось загрузить изображение: {image_path}")
-            return None
-        
-        return image
-    
-    def create_viewport_crop(
-        self,
-        page: Page,
-        blocks: List[Block],
-        viewport_size: int = None,
-        padding: int = None,
-        highlight: bool = True,
-        output_path: Optional[Path] = None
-    ) -> Optional[ViewportCrop]:
+        return cv2.imread(str(path))
+
+    def download_and_process_pdf(self, url: str, max_side: int = 2000) -> Optional[ViewportCrop]:
         """
-        Создаёт viewport-кроп вокруг одного или нескольких блоков.
-        
-        Args:
-            page: Страница, содержащая блоки
-            blocks: Список блоков для включения в viewport
-            viewport_size: Размер viewport (если None, используется из config)
-            padding: Паддинг вокруг блоков (если None, используется из config)
-            highlight: Рисовать ли подсветку вокруг целевых блоков
-            output_path: Путь для сохранения кропа (если None, не сохраняется)
-        
-        Returns:
-            ViewportCrop объект или None при ошибке
+        1. Скачивает PDF по ссылке.
+        2. Рендерит первую страницу в полном разрешении.
+        3. Сохраняет оригинал в кэш.
+        4. Создает превью (max_side) для отправки в LLM.
+        5. Возвращает ViewportCrop с путем к превью и метаданными.
         """
-        if not blocks:
-            logger.warning("Список блоков пуст, невозможно создать viewport")
-            return None
-        
-        viewport_size = viewport_size or config.VIEWPORT_SIZE
-        padding = padding or config.VIEWPORT_PADDING
-        
-        # Загружаем изображение страницы
-        image = self.load_page_image(page.page_number)
-        if image is None:
-            return None
-        
-        page_height, page_width = image.shape[:2]
-        
-        # Вычисляем bounding box для всех блоков
-        min_x = min(block.x1 for block in blocks)
-        min_y = min(block.y1 for block in blocks)
-        max_x = max(block.x2 for block in blocks)
-        max_y = max(block.y2 for block in blocks)
-        
-        # Вычисляем центр всех блоков
-        center_x = (min_x + max_x) / 2
-        center_y = (min_y + max_y) / 2
-        
-        # Определяем размер viewport с учётом паддинга
-        blocks_width = max_x - min_x
-        blocks_height = max_y - min_y
-        
-        # Viewport должен быть достаточно большим для блоков + паддинг
-        required_width = blocks_width + 2 * padding
-        required_height = blocks_height + 2 * padding
-        
-        # Используем максимум из требуемого размера и viewport_size
-        viewport_width = max(viewport_size, int(required_width))
-        viewport_height = max(viewport_size, int(required_height))
-        
-        # Вычисляем координаты viewport
-        x1 = int(center_x - viewport_width / 2)
-        y1 = int(center_y - viewport_height / 2)
-        x2 = x1 + viewport_width
-        y2 = y1 + viewport_height
-        
-        # Обрезаем по границам страницы
-        x1 = max(0, x1)
-        y1 = max(0, y1)
-        x2 = min(page_width, x2)
-        y2 = min(page_height, y2)
-        
-        # Извлекаем кроп
-        crop = image[y1:y2, x1:x2].copy()
-        
-        # Рисуем подсветку целевых блоков
-        if highlight:
-            for block in blocks:
-                # Координаты блока относительно кропа
-                rel_x1 = block.x1 - x1
-                rel_y1 = block.y1 - y1
-                rel_x2 = block.x2 - x1
-                rel_y2 = block.y2 - y1
+        try:
+            logger.info(f"Скачивание PDF: {url}")
+            response = requests.get(url, timeout=30)
+            response.raise_for_status()
+            
+            pdf_data = response.content
+            
+            # Открываем PDF
+            with fitz.open(stream=pdf_data, filetype="pdf") as doc:
+                if doc.page_count == 0:
+                    logger.warning("PDF пустой")
+                    return None
+                    
+                page = doc[0] # Берем первую страницу кропа
                 
-                # Рисуем прямоугольник
-                cv2.rectangle(
-                    crop,
-                    (rel_x1, rel_y1),
-                    (rel_x2, rel_y2),
-                    config.HIGHLIGHT_COLOR_RGB[::-1],  # BGR для OpenCV
-                    config.HIGHLIGHT_THICKNESS
+                # Рендерим в высоком качестве (zoom=2 для четкости, если вектор)
+                # Но если там растр, то лучше брать нативное разрешение.
+                # Для универсальности берем dpi=150-200
+                pix = page.get_pixmap(dpi=200) 
+                
+                # Конвертируем в numpy (OpenCV format)
+                # Pixmap.samples - это байты RGB
+                img_array = np.frombuffer(pix.samples, dtype=np.uint8)
+                img_array = img_array.reshape(pix.height, pix.width, pix.n)
+                
+                # PyMuPDF дает RGB, OpenCV ждет BGR
+                if pix.n >= 3:
+                    img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+                else:
+                    img_bgr = cv2.cvtColor(img_array, cv2.COLOR_GRAY2BGR)
+                
+                h, w = img_bgr.shape[:2]
+                
+                # Генерируем ID для кэша
+                img_id = str(uuid.uuid5(uuid.NAMESPACE_URL, url))
+                
+                # Сохраняем ОРИГИНАЛ в кэш
+                cache_path = self.temp_dir / f"{img_id}_full.png"
+                cv2.imwrite(str(cache_path), img_bgr)
+                self._image_cache[img_id] = cache_path
+                self._image_sizes[img_id] = (w, h)
+                
+                # Делаем ПРЕВЬЮ (масштабирование в PNG, затем конвертируем в JPG для отправки в LLM)
+                scale = 1.0
+                if max(h, w) > max_side:
+                    scale = max_side / max(h, w)
+                    new_w, new_h = int(w * scale), int(h * scale)
+                    img_preview = cv2.resize(img_bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                    desc = f"Preview (Original: {w}x{h}, Scaled to {new_w}x{new_h})"
+                else:
+                    img_preview = img_bgr
+                    desc = f"Full Image ({w}x{h})"
+                
+                # Сначала сохраняем масштабированное изображение в PNG (для качества)
+                preview_path_png = self.temp_dir / f"{img_id}_preview.png"
+                cv2.imwrite(str(preview_path_png), img_preview)
+                
+                # Затем конвертируем в JPG для отправки в LLM (JPG меньше по размеру)
+                preview_path = self.temp_dir / f"{img_id}_preview.jpg"
+                cv2.imwrite(str(preview_path), img_preview, [cv2.IMWRITE_JPEG_QUALITY, 90])
+                
+                return ViewportCrop(
+                    page_number=0, # Неактуально для внешних ссылок
+                    crop_coords=(0, 0, w, h),
+                    image_path=str(preview_path),
+                    description=desc,
+                    target_blocks=[img_id] # Используем поле target_blocks для хранения ID
                 )
+                
+        except Exception as e:
+            logger.error(f"Ошибка обработки PDF {url}: {e}")
+            return None
+
+    def process_zoom_request(self, request: ZoomRequest, output_path: Optional[Path] = None) -> Optional[ViewportCrop]:
+        """
+        Вырезает зум из кэшированного оригинала (по ID).
+        """
+        # ID картинки передается через поле 'page_number' в ZoomRequest? 
+        # Нет, page_number - это int. Нам нужно передать ID картинки.
+        # В ZoomRequest нам нужно добавить поле `image_id` (строка).
         
-        # Сохраняем если указан путь
+        # Если image_id нет в запросе (старый формат), пробуем найти по page_number (если это локальная страница)
+        # Но для внешней ссылки LLM должна вернуть image_id, который мы ей сообщим.
+        
+        # ВРЕМЕННОЕ РЕШЕНИЕ:
+        # Мы будем говорить LLM: "Image ID: <uuid>". И просить вернуть этот ID в ZoomRequest.
+        
+        img_id = getattr(request, "image_id", None)
+        
+        img = None
+        if img_id and img_id in self._image_cache:
+            # Загружаем из кэша
+            path = self._image_cache[img_id]
+            img = cv2.imread(str(path))
+        elif isinstance(request.page_number, int):
+             # Локальная страница
+             img = self.load_local_page(request.page_number)
+             
+        if img is None:
+            logger.error(f"Не найдено изображение для зума: ID={img_id}, Page={request.page_number}")
+            return None
+            
+        h_full, w_full = img.shape[:2]
+        
+        # Координаты
+        if request.coords_px:
+            x1, y1, x2, y2 = request.coords_px
+        elif request.coords_norm:
+            nx1, ny1, nx2, ny2 = request.coords_norm
+            x1 = int(nx1 * w_full)
+            y1 = int(ny1 * h_full)
+            x2 = int(nx2 * w_full)
+            y2 = int(ny2 * h_full)
+        else:
+            return None
+            
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w_full, x2), min(h_full, y2)
+        
+        if x2 <= x1 or y2 <= y1:
+            return None
+            
+        crop = img[y1:y2, x1:x2]
+        
+        # Ресайз кропа если огромный
+        h_c, w_c = crop.shape[:2]
+        if max(h_c, w_c) > 2000:
+            scale = 2000 / max(h_c, w_c)
+            crop = cv2.resize(crop, (int(w_c*scale), int(h_c*scale)))
+            
         if output_path:
             output_path.parent.mkdir(parents=True, exist_ok=True)
             cv2.imwrite(str(output_path), crop)
-            logger.debug(f"Viewport сохранён: {output_path}")
-        
-        # Создаём описание
-        block_ids = [block.id for block in blocks]
-        description = (
-            f"Страница {page.page_number}, viewport вокруг блоков: "
-            f"{', '.join(block_ids[:3])}"
-        )
-        if len(block_ids) > 3:
-            description += f" и ещё {len(block_ids) - 3}"
-        
-        viewport = ViewportCrop(
-            page_number=page.page_number,
+            
+        return ViewportCrop(
+            page_number=request.page_number,
             crop_coords=(x1, y1, x2, y2),
-            target_blocks=block_ids,
-            image_path=str(output_path) if output_path else None,
-            description=description
+            image_path=str(output_path),
+            description=f"Zoom {x1},{y1}-{x2},{y2}",
+            is_zoom_request=True
         )
-        
-        logger.info(
-            f"Создан viewport для страницы {page.page_number}: "
-            f"coords={viewport.crop_coords}, блоков={len(blocks)}"
-        )
-        
-        return viewport
-    
-    def cluster_blocks(
-        self,
-        blocks: List[Block],
-        distance_threshold: int = None
-    ) -> List[List[Block]]:
-        """
-        Группирует близкие блоки в кластеры для создания общих viewport.
-        
-        Args:
-            blocks: Список блоков для кластеризации
-            distance_threshold: Порог расстояния в пикселях
-        
-        Returns:
-            Список кластеров (каждый кластер - список блоков)
-        """
-        if not blocks:
-            return []
-        
-        distance_threshold = distance_threshold or config.CLUSTERING_DISTANCE_THRESHOLD
-        
-        # Простая жадная кластеризация
-        clusters: List[List[Block]] = []
-        used = set()
-        
-        for i, block in enumerate(blocks):
-            if i in used:
-                continue
-            
-            cluster = [block]
-            used.add(i)
-            
-            # Ищем близкие блоки
-            for j, other_block in enumerate(blocks):
-                if j in used:
-                    continue
-                
-                # Вычисляем расстояние между центрами
-                dist = math.sqrt(
-                    (block.center_x - other_block.center_x) ** 2 +
-                    (block.center_y - other_block.center_y) ** 2
-                )
-                
-                if dist <= distance_threshold:
-                    cluster.append(other_block)
-                    used.add(j)
-            
-            clusters.append(cluster)
-        
-        logger.debug(
-            f"Кластеризация: {len(blocks)} блоков -> {len(clusters)} кластеров"
-        )
-        
-        return clusters
-    
-    def create_viewports_for_blocks(
-        self,
-        page: Page,
-        blocks: List[Block],
-        output_dir: Optional[Path] = None,
-        cluster: bool = True
-    ) -> List[ViewportCrop]:
-        """
-        Создаёт viewport-кропы для списка блоков с опциональной кластеризацией.
-        
-        Args:
-            page: Страница
-            blocks: Список блоков
-            output_dir: Директория для сохранения кропов
-            cluster: Группировать ли близкие блоки
-        
-        Returns:
-            Список ViewportCrop объектов
-        """
-        if not blocks:
-            return []
-        
-        viewports = []
-        
-        if cluster:
-            # Группируем близкие блоки
-            clusters = self.cluster_blocks(blocks)
-        else:
-            # Каждый блок - отдельный viewport
-            clusters = [[block] for block in blocks]
-        
-        for idx, block_cluster in enumerate(clusters):
-            output_path = None
-            if output_dir:
-                filename = f"viewport_page{page.page_number:03d}_{idx:02d}.jpg"
-                output_path = output_dir / filename
-            
-            viewport = self.create_viewport_crop(
-                page=page,
-                blocks=block_cluster,
-                output_path=output_path
-            )
-            
-            if viewport:
-                viewports.append(viewport)
-        
-        return viewports
-

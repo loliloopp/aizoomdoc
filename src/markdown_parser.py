@@ -1,5 +1,5 @@
 """
-Парсинг result.md с извлечением текстовых блоков и якорей BLOCK_ID.
+Модуль для парсинга result.md и извлечения информации.
 """
 
 import logging
@@ -7,203 +7,159 @@ import re
 from pathlib import Path
 from typing import List, Optional
 
-from .models import MarkdownBlock
+from .models import MarkdownBlock, ExternalLink
 
 logger = logging.getLogger(__name__)
 
 
 class MarkdownParser:
-    """Парсер Markdown-файлов с поддержкой HTML-комментариев BLOCK_ID."""
+    """Парсер Markdown файлов с результатами OCR."""
     
-    # Регулярные выражения для парсинга
-    BLOCK_ID_START_RE = re.compile(r"<!--\s*BLOCK_ID:\s*([a-f0-9\-]+)\s*-->")
-    BLOCK_ID_END_RE = re.compile(r"<!--\s*END_BLOCK\s*-->")
-    HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$")
-    
-    def __init__(self, markdown_path: Path):
+    def __init__(self, file_path):
         """
-        Инициализирует парсер.
-        
         Args:
-            markdown_path: Путь к файлу result.md
+            file_path: str или Path - путь к .md файлу
         """
-        self.markdown_path = markdown_path
-        self.content: str = ""
-        self.blocks: List[MarkdownBlock] = []
-        self._load()
-        self._parse()
-    
-    def _load(self) -> None:
-        """Загружает содержимое Markdown-файла."""
-        if not self.markdown_path.exists():
-            raise FileNotFoundError(
-                f"Markdown-файл не найден: {self.markdown_path}"
-            )
+        self.file_path = Path(file_path) if isinstance(file_path, str) else file_path
+        self._blocks_cache: Optional[List[MarkdownBlock]] = None
         
-        logger.info(f"Загрузка Markdown из {self.markdown_path}")
+    def parse(self) -> List[MarkdownBlock]:
+        """
+        Парсит файл и возвращает список блоков.
+        Кэширует результат.
+        """
+        if self._blocks_cache is not None:
+            return self._blocks_cache
+            
+        if not self.file_path.exists():
+            logger.error(f"Файл не найден: {self.file_path}")
+            return []
+            
+        with open(self.file_path, "r", encoding="utf-8") as f:
+            content = f.read()
+            
+        blocks: List[MarkdownBlock] = []
+        current_section_stack: List[str] = []
         
-        with open(self.markdown_path, "r", encoding="utf-8") as f:
-            self.content = f.read()
-    
-    def _parse(self) -> None:
-        """Парсит Markdown, извлекая блоки и их связи с BLOCK_ID."""
-        lines = self.content.split("\n")
+        header_pattern = re.compile(r"^(#+)\s+(.+)$")
+        block_id_start = re.compile(r"<!--\s*BLOCK_ID:\s*([a-f0-9-]+)\s*-->")
+        block_id_end = re.compile(r"<!--\s*END_BLOCK\s*-->")
+        link_pattern = re.compile(r"(!?)\[([^\]]*)\]\((https?://[^)]+)\)") 
         
-        current_section_context: List[str] = []
-        current_block_lines: List[str] = []
-        current_block_id: Optional[str] = None
-        in_block = False
+        lines = content.split("\n")
+        current_text = []
+        current_block_id = None
         
         for line in lines:
-            # Проверяем заголовки для отслеживания контекста секций
-            heading_match = self.HEADING_RE.match(line)
-            if heading_match:
-                level = len(heading_match.group(1))
-                title = heading_match.group(2).strip()
-                
-                # Обновляем контекст заголовков
-                current_section_context = current_section_context[:level-1] + [title]
-                
-                # Если мы не внутри BLOCK_ID, добавляем заголовок как обычный текст
-                if not in_block and current_block_lines:
-                    self._add_block(current_block_lines, None, current_section_context[:])
-                    current_block_lines = []
+            line = line.strip()
             
-            # Проверяем начало BLOCK_ID
-            block_start_match = self.BLOCK_ID_START_RE.match(line)
-            if block_start_match:
-                # Сохраняем накопленный обычный текст
-                if current_block_lines:
-                    self._add_block(current_block_lines, None, current_section_context[:])
-                    current_block_lines = []
+            header_match = header_pattern.match(line)
+            if header_match:
+                if current_text:
+                    self._add_block(blocks, current_text, current_block_id, current_section_stack, link_pattern)
+                    current_text = []
+                    current_block_id = None
                 
-                # Начинаем новый блок с ID
-                current_block_id = block_start_match.group(1)
-                in_block = True
+                level = len(header_match.group(1))
+                title = header_match.group(2).strip()
+                
+                if len(current_section_stack) >= level:
+                    current_section_stack = current_section_stack[:level-1]
+                while len(current_section_stack) < level - 1:
+                     current_section_stack.append("...")
+                current_section_stack.append(title)
+                continue
+                
+            id_match = block_id_start.match(line)
+            if id_match:
+                if current_text:
+                    self._add_block(blocks, current_text, current_block_id, current_section_stack, link_pattern)
+                    current_text = []
+                current_block_id = id_match.group(1)
+                continue
+                
+            if block_id_end.match(line):
+                if current_text:
+                    self._add_block(blocks, current_text, current_block_id, current_section_stack, link_pattern)
+                    current_text = []
+                    current_block_id = None
                 continue
             
-            # Проверяем конец BLOCK_ID
-            block_end_match = self.BLOCK_ID_END_RE.match(line)
-            if block_end_match:
-                # Сохраняем блок с ID
-                if current_block_lines:
-                    self._add_block(
-                        current_block_lines,
-                        current_block_id,
-                        current_section_context[:]
-                    )
-                    current_block_lines = []
-                
-                current_block_id = None
-                in_block = False
-                continue
+            if line:
+                current_text.append(line)
+        
+        if current_text:
+            self._add_block(blocks, current_text, current_block_id, current_section_stack, link_pattern)
             
-            # Накапливаем строки
-            if line.strip():  # Игнорируем пустые строки
-                current_block_lines.append(line)
-            elif current_block_lines:
-                # Пустая строка завершает блок (если не внутри BLOCK_ID)
-                if not in_block:
-                    self._add_block(current_block_lines, None, current_section_context[:])
-                    current_block_lines = []
-                else:
-                    current_block_lines.append(line)  # Сохраняем пустые строки внутри блока
-        
-        # Сохраняем последний накопленный блок
-        if current_block_lines:
-            self._add_block(current_block_lines, current_block_id, current_section_context[:])
-        
-        logger.info(f"Извлечено {len(self.blocks)} текстовых блоков из Markdown")
-    
-    def _add_block(
-        self,
-        lines: List[str],
-        block_id: Optional[str],
-        section_context: List[str]
-    ) -> None:
-        """Добавляет блок в список."""
-        text = "\n".join(lines).strip()
-        if not text:
-            return
-        
-        block = MarkdownBlock(
-            text=text,
-            block_id=block_id,
-            section_context=section_context
-        )
-        self.blocks.append(block)
-    
-    def get_all_blocks(self) -> List[MarkdownBlock]:
-        """Возвращает все блоки."""
-        return self.blocks
-    
-    def get_blocks_by_keyword(
-        self,
-        keyword: str,
-        case_sensitive: bool = False
-    ) -> List[MarkdownBlock]:
-        """
-        Находит блоки, содержащие указанное ключевое слово.
-        
-        Args:
-            keyword: Ключевое слово для поиска
-            case_sensitive: Учитывать регистр
-        
-        Returns:
-            Список блоков, содержащих ключевое слово
-        """
-        if not case_sensitive:
-            keyword = keyword.lower()
-        
-        results = []
-        for block in self.blocks:
-            text = block.text if case_sensitive else block.text.lower()
-            context = " ".join(block.section_context)
-            if not case_sensitive:
-                context = context.lower()
-            
-            if keyword in text or keyword in context:
-                results.append(block)
-        
-        logger.debug(f"Найдено {len(results)} блоков с ключевым словом '{keyword}'")
-        return results
-    
-    def get_blocks_in_section(self, section_keyword: str) -> List[MarkdownBlock]:
-        """
-        Находит все блоки в секциях, содержащих указанное ключевое слово.
-        
-        Args:
-            section_keyword: Ключевое слово для поиска в заголовках секций
-        
-        Returns:
-            Список блоков из релевантных секций
-        """
-        keyword_lower = section_keyword.lower()
-        results = []
-        
-        for block in self.blocks:
-            for section in block.section_context:
-                if keyword_lower in section.lower():
-                    results.append(block)
-                    break
-        
-        logger.debug(
-            f"Найдено {len(results)} блоков в секциях с '{section_keyword}'"
-        )
-        return results
-    
-    def get_block_by_id(self, block_id: str) -> Optional[MarkdownBlock]:
-        """
-        Находит блок по его BLOCK_ID.
-        
-        Args:
-            block_id: ID блока
-        
-        Returns:
-            Блок или None если не найден
-        """
-        for block in self.blocks:
-            if block.block_id == block_id:
-                return block
-        return None
+        self._blocks_cache = blocks
+        return blocks
 
+    def _add_block(self, blocks, text_lines, block_id, sections, link_pattern):
+        full_text = "\n".join(text_lines)
+        links = []
+        
+        # Специальная логика для блоков с "*Изображение:*"
+        # Если блок содержит "*Изображение:*", ищем только ссылки ПОСЛЕ этого маркера
+        if "*Изображение:*" in full_text:
+            # Найдем позицию маркера
+            marker_pos = full_text.find("*Изображение:*")
+            if marker_pos != -1:
+                # Берем только текст после маркера
+                text_after_marker = full_text[marker_pos:]
+                # Ищем ссылки только после маркера
+                for match in link_pattern.finditer(text_after_marker):
+                    is_image = match.group(1) == "!"
+                    alt_text = match.group(2)
+                    url = match.group(3)
+                    links.append(ExternalLink(
+                        url=url,
+                        description=f"{'Image: ' if is_image else 'Link: '}{alt_text}",
+                        block_id=block_id
+                    ))
+                # Если не нашли ссылки после маркера, не добавляем никаких ссылок
+            else:
+                # Если маркер не найден (не должно быть), ищем все ссылки как обычно
+                for match in link_pattern.finditer(full_text):
+                    is_image = match.group(1) == "!"
+                    alt_text = match.group(2)
+                    url = match.group(3)
+                    links.append(ExternalLink(
+                        url=url,
+                        description=f"{'Image: ' if is_image else 'Link: '}{alt_text}",
+                        block_id=block_id
+                    ))
+        else:
+            # Обычные блоки - ищем все ссылки
+            for match in link_pattern.finditer(full_text):
+                is_image = match.group(1) == "!"
+                alt_text = match.group(2)
+                url = match.group(3)
+                links.append(ExternalLink(
+                    url=url,
+                    description=f"{'Image: ' if is_image else 'Link: '}{alt_text}",
+                    block_id=block_id
+                ))
+        
+        blocks.append(MarkdownBlock(
+            text=full_text,
+            block_id=block_id,
+            section_context=list(sections),
+            external_links=links
+        ))
+
+    def get_blocks_by_keyword(self, keyword: str) -> List[MarkdownBlock]:
+        """Ищет блоки, содержащие ключевое слово (case-insensitive)."""
+        blocks = self.parse()
+        keyword_lower = keyword.lower()
+        return [b for b in blocks if keyword_lower in b.text.lower()]
+
+    def get_blocks_in_section(self, section_keyword: str) -> List[MarkdownBlock]:
+        """Ищет блоки, находящиеся в секции с заданным ключевым словом."""
+        blocks = self.parse()
+        section_keyword_lower = section_keyword.lower()
+        results = []
+        for block in blocks:
+            # Проверяем любой уровень заголовков
+            if any(section_keyword_lower in section.lower() for section in block.section_context):
+                results.append(block)
+        return results

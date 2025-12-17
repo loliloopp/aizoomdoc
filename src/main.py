@@ -1,6 +1,5 @@
 """
-Главный модуль приложения.
-CLI интерфейс для анализа строительной документации.
+Главный модуль (Агент).
 """
 
 import argparse
@@ -11,202 +10,87 @@ from pathlib import Path
 from .config import config
 from .llm_client import LLMClient
 from .search_engine import SearchEngine
+from .image_processor import ImageProcessor
+from .models import ZoomRequest
 
-# Настройка логирования
 logging.basicConfig(
     level=getattr(logging, config.LOG_LEVEL),
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler("aizoomdoc.log", encoding="utf-8")
-    ]
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
-
 logger = logging.getLogger(__name__)
 
 
-def query_single_stage(
-    data_root: Path,
-    user_query: str,
-    model: str = None
-) -> str:
-    """
-    Обрабатывает запрос для одной стадии проектирования.
-    
-    Args:
-        data_root: Корневая папка с данными
-        user_query: Запрос пользователя
-        model: Имя модели LLM (опционально)
-    
-    Returns:
-        Ответ от LLM
-    """
-    logger.info(f"=== Обработка запроса для одной стадии ===")
-    logger.info(f"Данные: {data_root}")
-    logger.info(f"Запрос: {user_query}")
-    
-    # Проверяем наличие необходимых файлов
-    markdown_path, annotation_path = config.get_document_paths(data_root)
-    
-    if not markdown_path.exists():
-        raise FileNotFoundError(f"Файл не найден: {markdown_path}")
-    if not annotation_path.exists():
-        raise FileNotFoundError(f"Файл не найден: {annotation_path}")
-    
-    # Инициализируем компоненты
+def run_agent_loop(data_root: Path, user_query: str, model: str = None) -> str:
     search_engine = SearchEngine(data_root)
-    llm_client = LLMClient(model=model)
+    image_processor = ImageProcessor(data_root)
+    llm_client = LLMClient(model=model, data_root=data_root)
     
-    # Выполняем поиск
-    logger.info("Выполнение поиска...")
+    logger.info("1. Поиск в документах...")
     search_result = search_engine.find_ventilation_equipment(user_query)
     
-    if search_result.is_empty():
-        logger.warning("Поиск не дал результатов")
-        return "К сожалению, по вашему запросу не найдено релевантной информации в документах."
+    # Сбор внешних ссылок
+    external_images = []
     
-    # Отправляем запрос к LLM
-    logger.info("Отправка запроса к LLM...")
-    answer = llm_client.query(user_query, search_result)
+    logger.info("2. Загрузка и обработка PDF-кропов с S3...")
+    processed_urls = set()
     
-    return answer
-
-
-def query_comparison(
-    stage_p_root: Path,
-    stage_r_root: Path,
-    user_query: str,
-    model: str = None
-) -> str:
-    """
-    Обрабатывает запрос для сравнения двух стадий.
+    for block in search_result.text_blocks:
+        for link in block.external_links:
+            if link.url.endswith(".pdf") and link.url not in processed_urls:
+                processed_urls.add(link.url)
+                logger.info(f"Processing: {link.url}")
+                crop_info = image_processor.download_and_process_pdf(link.url)
+                if crop_info:
+                    external_images.append(crop_info)
     
-    Args:
-        stage_p_root: Корневая папка стадии П
-        stage_r_root: Корневая папка стадии Р
-        user_query: Запрос пользователя
-        model: Имя модели LLM (опционально)
+    # Формируем контекст
+    context_text = f"ЗАПРОС ПОЛЬЗОВАТЕЛЯ: {user_query}\n\nНАЙДЕННЫЙ ТЕКСТ:\n"
+    for block in search_result.text_blocks:
+        context_text += f"---\n{block.text}\n"
+        
+    llm_client.add_user_message(context_text, images=external_images)
     
-    Returns:
-        Ответ от LLM
-    """
-    logger.info(f"=== Обработка запроса сравнения двух стадий ===")
-    logger.info(f"Стадия П: {stage_p_root}")
-    logger.info(f"Стадия Р: {stage_r_root}")
-    logger.info(f"Запрос: {user_query}")
+    # Loop
+    step = 0
+    max_steps = 5
     
-    # Инициализируем компоненты для обеих стадий
-    search_engine_p = SearchEngine(stage_p_root)
-    search_engine_r = SearchEngine(stage_r_root)
-    llm_client = LLMClient(model=model)
-    
-    # Выполняем поиск в обеих стадиях
-    logger.info("Поиск в стадии П...")
-    result_p = search_engine_p.find_ventilation_equipment(user_query)
-    
-    logger.info("Поиск в стадии Р...")
-    result_r = search_engine_r.find_ventilation_equipment(user_query)
-    
-    if result_p.is_empty() and result_r.is_empty():
-        logger.warning("Поиск не дал результатов ни в одной из стадий")
-        return "К сожалению, по вашему запросу не найдено релевантной информации в документах обеих стадий."
-    
-    # Отправляем запрос сравнения к LLM
-    logger.info("Отправка запроса сравнения к LLM...")
-    answer = llm_client.query_comparison(user_query, result_p, result_r)
-    
-    return answer
-
+    while step < max_steps:
+        step += 1
+        logger.info(f"--- Шаг {step} ---")
+        
+        response = llm_client.get_response()
+        zoom_req = llm_client.parse_zoom_request(response)
+        
+        if zoom_req:
+            logger.info(f"Zoom Request: {zoom_req.reason} (ImageID: {zoom_req.image_id})")
+            
+            zoom_crop = image_processor.process_zoom_request(
+                zoom_req,
+                output_path=data_root / "viewports" / f"zoom_step_{step}.jpg"
+            )
+            
+            if zoom_crop:
+                llm_client.add_user_message("Вот увеличенный фрагмент.", images=[zoom_crop])
+            else:
+                llm_client.add_user_message("Ошибка Zoom: невозможно выполнить для этого ID или координат.")
+        else:
+            return response
+            
+    return "Превышен лимит шагов."
 
 def main():
-    """Главная функция CLI."""
-    parser = argparse.ArgumentParser(
-        description="AIZoomDoc - Анализ строительной документации с помощью LLM"
-    )
-    
-    parser.add_argument(
-        "query",
-        type=str,
-        help="Запрос пользователя"
-    )
-    
-    parser.add_argument(
-        "--data-root",
-        type=Path,
-        help="Путь к корневой папке с данными (для запроса по одной стадии)"
-    )
-    
-    parser.add_argument(
-        "--stage-p",
-        type=Path,
-        help="Путь к папке со стадией П (для сравнения)"
-    )
-    
-    parser.add_argument(
-        "--stage-r",
-        type=Path,
-        help="Путь к папке со стадией Р (для сравнения)"
-    )
-    
-    parser.add_argument(
-        "--model",
-        type=str,
-        default=None,
-        help=f"Имя модели LLM (по умолчанию: {config.DEFAULT_MODEL})"
-    )
-    
-    parser.add_argument(
-        "--output",
-        type=Path,
-        help="Путь для сохранения результата в файл (опционально)"
-    )
-    
+    parser = argparse.ArgumentParser()
+    parser.add_argument("query", type=str)
+    parser.add_argument("--data-root", type=Path, required=True)
+    parser.add_argument("--model", type=str)
     args = parser.parse_args()
     
     try:
-        # Проверяем конфигурацию
         config.validate()
-        
-        # Определяем режим работы
-        if args.stage_p and args.stage_r:
-            # Режим сравнения
-            answer = query_comparison(
-                stage_p_root=args.stage_p,
-                stage_r_root=args.stage_r,
-                user_query=args.query,
-                model=args.model
-            )
-        elif args.data_root:
-            # Режим одной стадии
-            answer = query_single_stage(
-                data_root=args.data_root,
-                user_query=args.query,
-                model=args.model
-            )
-        else:
-            print("Ошибка: укажите либо --data-root, либо --stage-p и --stage-r")
-            sys.exit(1)
-        
-        # Выводим результат
-        print("\n" + "="*80)
-        print("РЕЗУЛЬТАТ АНАЛИЗА")
-        print("="*80 + "\n")
-        print(answer)
-        print("\n" + "="*80 + "\n")
-        
-        # Сохраняем в файл если указано
-        if args.output:
-            args.output.parent.mkdir(parents=True, exist_ok=True)
-            with open(args.output, "w", encoding="utf-8") as f:
-                f.write(answer)
-            logger.info(f"Результат сохранён в {args.output}")
-        
+        print(run_agent_loop(args.data_root, args.query, args.model))
     except Exception as e:
-        logger.error(f"Ошибка выполнения: {e}", exc_info=True)
-        print(f"\nОшибка: {e}")
-        sys.exit(1)
-
+        logger.error(f"Error: {e}")
 
 if __name__ == "__main__":
     main()
-

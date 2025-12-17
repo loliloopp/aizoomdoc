@@ -1,330 +1,280 @@
 """
-Клиент для взаимодействия с LLM через OpenRouter API.
-Поддержка мультимодальных запросов (текст + изображения).
+Клиент для взаимодействия с LLM (OpenRouter) в режиме диалога.
 """
 
 import base64
+import json
 import logging
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 
 import requests
 
 from .config import config
-from .models import SearchResult, ViewportCrop
+from .models import ViewportCrop, ZoomRequest, ImageSelection
 
 logger = logging.getLogger(__name__)
 
+# Промт для этапа 1: Выбор картинок
+SELECTION_PROMPT = """Ты — ассистент по анализу документации.
+Твоя задача — прочитать текст и запрос пользователя, и определить, какие ИЗОБРАЖЕНИЯ (ссылки) из текста нужны для ответа.
 
-# Системный промт для инженера-проектировщика
-SYSTEM_PROMPT = """Ты — опытный инженер-проектировщик по разделу ОВ (Отопление и Вентиляция) и ВК (Водоснабжение и Канализация), работающий со строительной документацией.
+СТРУКТУРА ДОКУМЕНТА:
+Блоки с изображениями выглядят так:
+```
+*Изображение:*
+(Описание изображения)
+![Изображение](https://... .pdf)
+```
 
-Твоя задача — анализировать строительные чертежи, спецификации оборудования и пояснительные записки.
+ИНСТРУКЦИЯ:
+1. Найди в тексте блоки, релевантные запросу.
+2. Извлечь URL изображений (из `![...](URL)`).
+3. Верни JSON:
+```json
+{
+  "reasoning": "Для ответа про вентилятор П1 нужно изображение со схемы на листе 5",
+  "needs_images": true,
+  "image_urls": ["https://... .pdf"]
+}
+```
+"""
 
-ПРИНЦИПЫ РАБОТЫ:
-1. ТОЧНОСТЬ И КОНСЕРВАТИЗМ: Будь максимально точен. Избегай догадок и предположений.
-2. ЯВНОЕ УКАЗАНИЕ НЕОПРЕДЕЛЁННОСТИ: Если информации недостаточно для ответа, ЯВНО укажи на это. Лучше признать отсутствие данных, чем дать неверный ответ.
-3. ССЫЛКИ НА ИСТОЧНИКИ: Всегда указывай, откуда взята информация (номер листа, раздел спецификации, позиция на чертеже).
-4. СТРУКТУРИРОВАННОСТЬ: Предоставляй информацию в структурированном виде (списки, таблицы где уместно).
-5. ТЕРМИНОЛОГИЯ: Используй корректную профессиональную терминологию.
+def load_analysis_prompt(data_root: Optional[Path] = None) -> str:
+    """
+    Загружает системный промт для анализа из файла.
+    Если файл не найден, возвращает промт по умолчанию.
+    """
+    default_prompt = """Ты — эксперт-инженер. Твоя задача — анализировать документацию.
 
-КОНТЕКСТ РАБОТЫ:
-- Тебе предоставляются текстовые фрагменты из спецификаций и пояснительных записок.
-- Также предоставляются изображения фрагментов чертежей с подсвеченными (красной рамкой) областями интереса.
-- OCR-текст может содержать ошибки, поэтому приоритет отдавай визуальному анализу изображений.
+ИНСТРУКЦИЯ ПО РАБОТЕ С ИЗОБРАЖЕНИЯМИ:
+1. Тебе передают текстовые описания и ИЗОБРАЖЕНИЯ (превью).
+2. Каждое изображение имеет ID (Image ID) и информацию об оригинальном размере.
+3. То, что ты видишь — это уменьшенная версия (обычно до 2000px).
+4. Если тебе нужно рассмотреть детали, используй инструмент ZOOM.
 
-ФОРМАТ ОТВЕТА:
-- Начинай с краткого резюме.
-- Затем предоставь детальную информацию с разбивкой по пунктам.
-- Для каждого упоминания оборудования или элемента указывай источник.
-- Если сравниваешь две стадии, явно структурируй ответ: "Стадия П", "Стадия Р", "Отличия".
+ФОРМАТ ЗАПРОСА ZOOM (JSON):
+```json
+{
+  "tool": "zoom",
+  "image_id": "uuid-строка-из-описания",
+  "coords_px": [1000, 2000, 1500, 2500],
+  "reason": "Хочу прочитать мелкий текст в центре"
+}
+```
 
-ЗАПРЕЩЕНО:
-- Придумывать информацию, которой нет в предоставленных материалах.
-- Делать предположения о характеристиках оборудования без явного подтверждения в документах.
-- Игнорировать визуальную информацию с чертежей в пользу только текста."""
-
+ОТВЕТ:
+Если информации достаточно, отвечай обычным текстом. Ссылайся на источники."""
+    
+    # Пытаемся найти файл с промтом
+    if data_root is None:
+        data_root = Path.cwd() / "data"
+    
+    prompt_file = Path(data_root) / "llm_system_prompt.txt"
+    
+    if prompt_file.exists():
+        try:
+            with open(prompt_file, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+                if content:
+                    logger.info(f"Загружен пользовательский промт из {prompt_file}")
+                    return content
+        except Exception as e:
+            logger.warning(f"Ошибка чтения файла промта: {e}. Используется промт по умолчанию.")
+    
+    return default_prompt
 
 class LLMClient:
-    """Клиент для работы с LLM через OpenRouter API."""
-    
-    def __init__(
-        self,
-        api_key: Optional[str] = None,
-        base_url: Optional[str] = None,
-        model: Optional[str] = None
-    ):
-        """
-        Инициализирует клиент.
-        
-        Args:
-            api_key: API ключ OpenRouter (если None, берётся из config)
-            base_url: Базовый URL API (если None, берётся из config)
-            model: Имя модели (если None, берётся из config)
-        """
-        self.api_key = api_key or config.OPENROUTER_API_KEY
-        self.base_url = base_url or config.OPENROUTER_BASE_URL
+    def __init__(self, model: Optional[str] = None, data_root: Optional[Path] = None):
+        self.api_key = config.OPENROUTER_API_KEY
+        self.base_url = config.OPENROUTER_BASE_URL
         self.model = model or config.DEFAULT_MODEL
-        
-        if not self.api_key:
-            raise ValueError("OpenRouter API key не задан")
-        
+        self.data_root = data_root or Path.cwd() / "data"
         self.headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
+            "HTTP-Referer": "https://github.com/aizoomdoc",
+            "X-Title": "AIZoomDoc"
         }
-        
-        logger.info(f"LLMClient инициализирован с моделью: {self.model}")
-    
-    def encode_image_to_base64(self, image_path: Path) -> str:
-        """
-        Кодирует изображение в base64.
-        
-        Args:
-            image_path: Путь к изображению
-        
-        Returns:
-            Base64-строка изображения
-        """
-        with open(image_path, "rb") as f:
-            image_bytes = f.read()
-        return base64.b64encode(image_bytes).decode("utf-8")
-    
-    def build_multimodal_prompt(
-        self,
-        user_query: str,
-        search_result: SearchResult,
-        stage_label: str = ""
-    ) -> List[dict]:
-        """
-        Строит мультимодальный промт из текстовых блоков и изображений.
-        
-        Args:
-            user_query: Запрос пользователя
-            search_result: Результаты поиска
-            stage_label: Метка стадии (например, "Стадия П")
-        
-        Returns:
-            Список частей сообщения (text и image_url)
-        """
-        content = []
-        
-        # Начинаем с пользовательского запроса
-        intro = f"ЗАПРОС ПОЛЬЗОВАТЕЛЯ:\n{user_query}\n\n"
-        if stage_label:
-            intro += f"=== {stage_label.upper()} ===\n\n"
-        
-        # Добавляем текстовый контекст
-        if search_result.text_blocks:
-            intro += "ТЕКСТОВЫЙ КОНТЕКСТ (из спецификаций и пояснительных записок):\n\n"
-            
-            for idx, block in enumerate(search_result.text_blocks, 1):
-                intro += f"--- Текстовый блок #{idx} ---\n"
-                if block.section_context:
-                    intro += f"Раздел: {' > '.join(block.section_context)}\n"
-                if block.block_id:
-                    intro += f"Block ID: {block.block_id}\n"
-                intro += f"\n{block.text}\n\n"
-        
-        # Добавляем описания изображений
-        if search_result.viewport_crops:
-            intro += f"ВИЗУАЛЬНЫЙ КОНТЕКСТ ({len(search_result.viewport_crops)} изображений фрагментов чертежей):\n"
-            intro += "Красные рамки на изображениях выделяют области интереса.\n\n"
-            
-            for idx, viewport in enumerate(search_result.viewport_crops, 1):
-                intro += f"Изображение #{idx}: {viewport.description}\n"
-        
-        intro += "\n---\n\nОтветь на запрос пользователя на основе предоставленного контекста.\n"
-        
-        content.append({
-            "type": "text",
-            "text": intro
-        })
-        
-        # Добавляем изображения
-        for viewport in search_result.viewport_crops:
-            if viewport.image_path:
-                image_path = Path(viewport.image_path)
-                if image_path.exists():
-                    # Кодируем в base64
-                    base64_image = self.encode_image_to_base64(image_path)
-                    
-                    # Определяем MIME-тип
-                    mime_type = "image/jpeg"
-                    if image_path.suffix.lower() in [".png"]:
-                        mime_type = "image/png"
-                    
-                    content.append({
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:{mime_type};base64,{base64_image}"
-                        }
-                    })
-                else:
-                    logger.warning(f"Изображение не найдено: {image_path}")
-        
-        return content
-    
-    def query(
-        self,
-        user_query: str,
-        search_result: SearchResult,
-        stage_label: str = "",
-        system_prompt: Optional[str] = None,
-        temperature: float = 0.1,
-        max_tokens: int = 4000
-    ) -> str:
-        """
-        Отправляет запрос к LLM.
-        
-        Args:
-            user_query: Запрос пользователя
-            search_result: Результаты поиска
-            stage_label: Метка стадии
-            system_prompt: Кастомный системный промт (если None, используется SYSTEM_PROMPT)
-            temperature: Температура генерации
-            max_tokens: Максимальное количество токенов в ответе
-        
-        Returns:
-            Ответ от LLM
-        
-        Raises:
-            Exception: При ошибках API
-        """
-        system_prompt = system_prompt or SYSTEM_PROMPT
-        
-        # Строим мультимодальный промт
-        content = self.build_multimodal_prompt(user_query, search_result, stage_label)
-        
-        # Формируем запрос
-        payload = {
-            "model": self.model,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": system_prompt
-                },
-                {
-                    "role": "user",
-                    "content": content
-                }
-            ],
-            "temperature": temperature,
-            "max_tokens": max_tokens
-        }
-        
-        logger.info(f"Отправка запроса к LLM (модель: {self.model})")
-        logger.debug(f"Текстовых блоков: {len(search_result.text_blocks)}")
-        logger.debug(f"Изображений: {len(search_result.viewport_crops)}")
-        
-        try:
-            response = requests.post(
-                f"{self.base_url}/chat/completions",
-                headers=self.headers,
-                json=payload,
-                timeout=120
-            )
-            response.raise_for_status()
-            
-            result = response.json()
-            answer = result["choices"][0]["message"]["content"]
-            
-            logger.info("Ответ от LLM получен успешно")
-            return answer
-            
-        except requests.exceptions.Timeout:
-            logger.error("Таймаут при запросе к LLM")
-            raise Exception("Таймаут при обращении к LLM API")
-        except requests.exceptions.HTTPError as e:
-            logger.error(f"HTTP ошибка: {e}")
-            logger.error(f"Ответ сервера: {response.text}")
-            raise Exception(f"Ошибка API: {e}")
-        except Exception as e:
-            logger.error(f"Неожиданная ошибка: {e}")
-            raise
-    
-    def query_comparison(
-        self,
-        user_query: str,
-        stage_p_result: SearchResult,
-        stage_r_result: SearchResult,
-        system_prompt: Optional[str] = None,
-        temperature: float = 0.1,
-        max_tokens: int = 6000
-    ) -> str:
-        """
-        Отправляет запрос для сравнения двух стадий.
-        
-        Args:
-            user_query: Запрос пользователя
-            stage_p_result: Результаты для стадии П
-            stage_r_result: Результаты для стадии Р
-            system_prompt: Кастомный системный промт
-            temperature: Температура генерации
-            max_tokens: Максимальное количество токенов
-        
-        Returns:
-            Ответ от LLM
-        """
-        system_prompt = system_prompt or SYSTEM_PROMPT
-        
-        # Строим промты для обеих стадий
-        content_p = self.build_multimodal_prompt(user_query, stage_p_result, "Стадия П")
-        content_r = self.build_multimodal_prompt(user_query, stage_r_result, "Стадия Р")
-        
-        # Объединяем контент
-        combined_content = []
-        combined_content.append({
-            "type": "text",
-            "text": f"ЗАДАЧА: Сравни две стадии проектирования (П и Р) по следующему запросу:\n{user_query}\n\n"
-        })
-        combined_content.extend(content_p)
-        combined_content.append({
-            "type": "text",
-            "text": "\n\n========================================\n\n"
-        })
-        combined_content.extend(content_r)
-        combined_content.append({
-            "type": "text",
-            "text": "\n\n---\n\nПроведи детальное сравнение стадии П и стадии Р. "
-                    "Укажи все отличия в оборудовании, параметрах, расположении и т.д."
-        })
-        
-        # Формируем запрос
-        payload = {
-            "model": self.model,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": system_prompt
-                },
-                {
-                    "role": "user",
-                    "content": combined_content
-                }
-            ],
-            "temperature": temperature,
-            "max_tokens": max_tokens
-        }
-        
-        logger.info("Отправка запроса сравнения к LLM")
-        
-        try:
-            response = requests.post(
-                f"{self.base_url}/chat/completions",
-                headers=self.headers,
-                json=payload,
-                timeout=180
-            )
-            response.raise_for_status()
-            
-            result = response.json()
-            answer = result["choices"][0]["message"]["content"]
-            
-            logger.info("Ответ от LLM получен успешно")
-            return answer
-            
-        except Exception as e:
-            logger.error(f"Ошибка при запросе сравнения: {e}")
-            raise
+        self.history: List[Dict[str, Any]] = [] 
+        # Системный промт добавляется позже, в зависимости от режима
 
+    def encode_image(self, path: str) -> str:
+        with open(path, "rb") as f:
+            return base64.b64encode(f.read()).decode("utf-8")
+
+    def select_relevant_images(self, text_context: str, query: str) -> ImageSelection:
+        """Спрашивает LLM, какие картинки нужны."""
+        print(f"[SELECT_IMAGES] Начинаю выбор картинок для запроса: {query[:50]}")
+        print(f"[SELECT_IMAGES] Размер контекста: {len(text_context)} символов")
+        
+        # Передаем весь документ целиком, не обрезаем!
+        messages = [
+            {"role": "system", "content": SELECTION_PROMPT},
+            {"role": "user", "content": f"ЗАПРОС: {query}\n\nДОКУМЕНТ:\n{text_context}"}
+        ]
+        
+        # Попытки повтора для выбора картинок
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                print(f"[SELECT_IMAGES] Попытка {attempt+1}/{max_retries}")
+                resp = requests.post(
+                    f"{self.base_url}/chat/completions",
+                    headers=self.headers,
+                    json={
+                        "model": self.model, 
+                        "messages": messages, 
+                        "temperature": 0.1,
+                        "response_format": {"type": "json_object"}
+                    },
+                    timeout=120
+                )
+                
+                if resp.status_code == 429:
+                    print(f"[SELECT_IMAGES] ⚠️ 429 Too Many Requests. Жду 5 сек...")
+                    import time
+                    time.sleep(5)
+                    continue
+                
+                resp.raise_for_status()
+                response_data = resp.json()
+                
+                if not response_data.get("choices"):
+                    continue
+                
+                content = response_data["choices"][0].get("message", {}).get("content", "")
+                
+                if not content:
+                    continue
+                
+                # Попытка парсинга
+                try:
+                    if "```json" in content:
+                        content = content.split("```json")[1].split("```")[0].strip()
+                    elif "```" in content:
+                        content = content.split("```")[1].split("```")[0].strip()
+                    
+                    data = json.loads(content)
+                    return ImageSelection(
+                        reasoning=data.get("reasoning", ""),
+                        needs_images=data.get("needs_images", False),
+                        image_urls=data.get("image_urls", [])
+                    )
+                except json.JSONDecodeError:
+                    print(f"[SELECT_IMAGES] ⚠️ Ошибка JSON парсинга. Пробую еще раз...")
+                    continue
+                    
+            except Exception as e:
+                print(f"[SELECT_IMAGES] Ошибка при попытке {attempt+1}: {e}")
+                if attempt == max_retries - 1:
+                    return ImageSelection(reasoning=f"Ошибка API: {str(e)}", needs_images=False, image_urls=[])
+        
+        return ImageSelection(reasoning="Не удалось получить корректный ответ", needs_images=False, image_urls=[])
+
+    def init_analysis_chat(self):
+        """Инициализирует диалог с загруженным системным промтом."""
+        analysis_prompt = load_analysis_prompt(self.data_root)
+        self.history = [{"role": "system", "content": analysis_prompt}]
+
+    def add_user_message(self, text: str, images: Optional[List[ViewportCrop]] = None):
+        content = [{"type": "text", "text": text}]
+        
+        if images:
+            for img in images:
+                if img.image_path and Path(img.image_path).exists():
+                    try:
+                        b64 = self.encode_image(img.image_path)
+                        img_id = img.target_blocks[0] if img.target_blocks else "unknown"
+                        
+                        desc = f"IMAGE [ID: {img_id}]. {img.description}"
+                        content.append({"type": "text", "text": desc})
+                        
+                        content.append({
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{b64}"}
+                        })
+                    except Exception as e:
+                        logger.error(f"Ошибка img: {e}")
+
+        self.history.append({"role": "user", "content": content})
+
+    def add_assistant_message(self, text: str):
+        self.history.append({"role": "assistant", "content": text})
+
+    def get_response(self) -> str:
+        print(f"[GET_RESPONSE] Отправляю запрос к модели {self.model}")
+        
+        # Попытки повтора (Retries)
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                payload = {
+                    "model": self.model,
+                    "messages": self.history,
+                    "temperature": 0.2,
+                    "max_tokens": 4000  # Увеличим лимит токенов
+                }
+                
+                resp = requests.post(
+                    f"{self.base_url}/chat/completions",
+                    headers=self.headers,
+                    json=payload,
+                    timeout=120
+                )
+                
+                if resp.status_code == 429:
+                    print(f"[GET_RESPONSE] ⚠️ Ошибка 429 (Too Many Requests). Жду 5 секунд...")
+                    import time
+                    time.sleep(5)
+                    continue
+                
+                resp.raise_for_status()
+                response_data = resp.json()
+                
+                if not response_data.get("choices"):
+                    print(f"[GET_RESPONSE] ⚠️ Попытка {attempt+1}: Нет choices в ответе")
+                    continue
+                
+                answer = response_data["choices"][0]["message"].get("content", "")
+                
+                if not answer:
+                    print(f"[GET_RESPONSE] ⚠️ Попытка {attempt+1}: Пустой content")
+                    # Если пустой ответ - пробуем еще раз
+                    continue
+                
+                print(f"[GET_RESPONSE] ✓ Получен ответ длиной {len(answer)} символов")
+                self.add_assistant_message(answer)
+                return answer
+                
+            except Exception as e:
+                print(f"[GET_RESPONSE] Ошибка при попытке {attempt+1}: {e}")
+                if attempt == max_retries - 1:
+                    logger.error(f"LLM Error after retries: {e}")
+                    raise
+        
+        raise ValueError("Не удалось получить ответ от модели после 3 попыток")
+
+    def parse_zoom_request(self, response_text: str) -> Optional[ZoomRequest]:
+        response_text = response_text.strip()
+        data = None
+        
+        if "```json" in response_text:
+            try:
+                json_str = response_text.split("```json")[1].split("```")[0].strip()
+                data = json.loads(json_str)
+            except: pass
+        elif response_text.startswith("{"):
+             try:
+                data = json.loads(response_text)
+             except: pass
+            
+        if data and data.get("tool") == "zoom":
+            return ZoomRequest(
+                page_number=data.get("page_number", 0),
+                image_id=data.get("image_id"),
+                coords_norm=data.get("coords_norm"),
+                coords_px=data.get("coords_px"),
+                reason=data.get("reason", "")
+            )
+        return None
