@@ -22,7 +22,7 @@ class Config:
     )
     DEFAULT_MODEL: str = os.getenv(
         "DEFAULT_MODEL", 
-        "google/gemini-2.0-flash-thinking-exp"
+        "google/gemini-3-flash-preview"
     )
     
     # Пути к данным
@@ -54,6 +54,35 @@ class Config:
     # Порог расстояния для группировки близких блоков в один viewport (в пикселях)
     CLUSTERING_DISTANCE_THRESHOLD: int = 500
     
+    # ===== Supabase Configuration =====
+    # PostgreSQL БД для хранения чатов и сообщений
+    SUPABASE_URL: str = os.getenv("SUPABASE_URL", "")
+    SUPABASE_ANON_KEY: str = os.getenv("SUPABASE_ANON_KEY", "")
+    SUPABASE_SERVICE_KEY: str = os.getenv("SUPABASE_SERVICE_KEY", "")
+    
+    # Включить сохранение в БД
+    USE_DATABASE: bool = os.getenv("USE_DATABASE", "false").lower() == "true"
+    
+    # ===== S3 / Cloudflare R2 Configuration =====
+    # Хранилище для изображений и документов (по умолчанию R2)
+    S3_ENDPOINT: str = os.getenv("R2_ENDPOINT_URL", os.getenv("S3_ENDPOINT", ""))
+    S3_ACCESS_KEY: str = os.getenv("R2_ACCESS_KEY_ID", os.getenv("S3_ACCESS_KEY", ""))
+    S3_SECRET_KEY: str = os.getenv("R2_SECRET_ACCESS_KEY", os.getenv("S3_SECRET_KEY", ""))
+    S3_BUCKET: str = os.getenv("R2_BUCKET_NAME", os.getenv("S3_BUCKET", "aizoomdoc"))
+    S3_REGION: str = os.getenv("S3_REGION", "auto") # R2 обычно использует 'auto'
+    
+    # Публичный домен (опционально)
+    S3_PUBLIC_DOMAIN: str = os.getenv("R2_PUBLIC_DOMAIN", "")
+    
+    # Включить хранение в S3/R2
+    USE_S3_STORAGE: bool = os.getenv("USE_S3_STORAGE", "true").lower() == "true"
+    
+    # Максимальный размер файла (МБ)
+    MAX_FILE_SIZE_MB: int = int(os.getenv("MAX_FILE_SIZE_MB", "100"))
+    
+    # TTL для подписанных S3 URLs (секунды)
+    S3_URL_EXPIRATION: int = int(os.getenv("S3_URL_EXPIRATION", "3600"))
+
     @classmethod
     def validate(cls) -> None:
         """Проверяет обязательные параметры конфигурации."""
@@ -61,6 +90,20 @@ class Config:
             raise ValueError(
                 "OPENROUTER_API_KEY не задан. Установите его в .env файле."
             )
+        
+        # Проверка Supabase (если включена БД)
+        if cls.USE_DATABASE:
+            if not cls.SUPABASE_URL:
+                raise ValueError(
+                    "SUPABASE_URL не задан."
+                )
+        
+        # Проверка S3/R2
+        if cls.USE_S3_STORAGE:
+            if not cls.S3_ENDPOINT:
+                 raise ValueError("R2_ENDPOINT_URL (или S3_ENDPOINT) не задан.")
+            if not cls.S3_ACCESS_KEY or not cls.S3_SECRET_KEY:
+                raise ValueError("R2/S3 ключи доступа не заданы.")
     
     @classmethod
     def get_document_paths(cls, root_path: Path) -> Tuple[Path, Path]:

@@ -22,7 +22,8 @@ from .config import config
 from .gui_agent import AgentWorker
 
 MODELS = {
-    "Qwen3 VL (Default)": "qwen/qwen3-vl-235b-a22b-thinking",
+    "Gemini 3 Flash (Default)": "google/gemini-3-flash-preview",
+    "Qwen3 VL": "qwen/qwen3-vl-235b-a22b-thinking",
     "Gemini 3 Pro": "google/gemini-3-pro-preview",
     "Gemini 2.0 Flash": "google/gemini-2.0-flash-thinking-exp",
     "Claude 3.5 Sonnet": "anthropic/claude-3.5-sonnet"
@@ -732,8 +733,8 @@ class MainWindow(QMainWindow):
         self.combo_models = QComboBox()
         for name, mid in MODELS.items():
             self.combo_models.addItem(name, mid)
-        # Устанавливаем Gemini 3 Pro по умолчанию
-        self.combo_models.setCurrentIndex(1)
+        # Устанавливаем Gemini 3 Flash по умолчанию (индекс 0)
+        self.combo_models.setCurrentIndex(0)
         right_layout.addWidget(self.combo_models)
         
         right_layout.addSpacing(8)
