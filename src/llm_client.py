@@ -291,17 +291,25 @@ class LLMClient:
         response_text = response_text.strip()
         data = None
         
-        if "```json" in response_text:
+        # Попытка найти JSON внутри текста, даже если он не в начале
+        json_start = response_text.find("```json")
+        if json_start != -1:
             try:
                 json_str = response_text.split("```json")[1].split("```")[0].strip()
                 data = json.loads(json_str)
             except: pass
+        elif "```" in response_text: # Иногда модель забывает 'json'
+             try:
+                json_str = response_text.split("```")[1].split("```")[0].strip()
+                data = json.loads(json_str)
+             except: pass
         elif response_text.startswith("{"):
              try:
                 data = json.loads(response_text)
              except: pass
             
-        if data and data.get("tool") == "zoom":
+        # Если найден tool: zoom, возвращаем ZoomRequest
+        if data and isinstance(data, dict) and data.get("tool") == "zoom":
             return ZoomRequest(
                 page_number=data.get("page_number", 0),
                 image_id=data.get("image_id"),

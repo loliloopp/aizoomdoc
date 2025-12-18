@@ -103,7 +103,7 @@ class ImageProcessor:
                     new_w, new_h = int(w * scale), int(h * scale)
                     img_preview = cv2.resize(img_bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
                     scale_percent = int(scale * 100)
-                    desc = f"⚠️ SCALED PREVIEW: Original {w}x{h}px → Scaled to {new_w}x{new_h}px ({scale_percent}%). Use ZOOM for details."
+                    desc = f"⚠️ SCALED PREVIEW: Original {w}x{h}px → Scaled to {new_w}x{new_h}px ({scale_percent}%). Use ZOOM to verify details."
                     
                     # Сохраняем preview в PNG
                     preview_path = self.temp_dir / f"{img_id}_preview.png"
