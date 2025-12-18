@@ -15,8 +15,8 @@ from PyQt6.QtWidgets import (
     QFileDialog, QMenuBar, QMenu, QDialog, QDialogButtonBox, QMessageBox,
     QGroupBox, QSizePolicy
 )
-from PyQt6.QtCore import Qt, QUrl
-from PyQt6.QtGui import QFont, QPixmap, QAction, QDragEnterEvent, QDropEvent
+from PyQt6.QtCore import Qt, QUrl, QSize
+from PyQt6.QtGui import QFont, QPixmap, QAction, QDragEnterEvent, QDropEvent, QTextCursor, QKeyEvent
 
 from .config import config
 from .gui_agent import AgentWorker
@@ -288,11 +288,68 @@ class PromptEditDialog(QDialog):
             QMessageBox.critical(self, "Ошибка", f"Ошибка при сохранении: {e}")
 
 
-class DragDropLineEdit(QLineEdit):
-    """QLineEdit с поддержкой Drag & Drop для .md файлов."""
+class DragDropTextEdit(QTextEdit):
+    """QTextEdit с поддержкой Drag & Drop для .md файлов и автоматическим изменением размера."""
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAcceptDrops(True)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        
+        # Настройка минимальной и максимальной высоты
+        self.document().documentLayout().documentSizeChanged.connect(self.adjust_height)
+        self.max_lines = 5
+        
+        # Начальная настройка высоты
+        font_metrics = self.fontMetrics()
+        self.min_height_val = font_metrics.lineSpacing() + 10 # Запас для паддингов
+        self.setMinimumHeight(self.min_height_val)
+        self.adjust_height()
+    
+    def adjust_height(self):
+        """Автоматически подстраивает высоту под содержимое (до 5 строк)."""
+        doc_height = self.document().size().height()
+        margins = self.contentsMargins()
+        
+        # Вычисляем высоту одной строки
+        font_metrics = self.fontMetrics()
+        line_height = font_metrics.lineSpacing()
+        
+        # Корректируем total_height
+        total_height = int(doc_height + margins.top() + margins.bottom())
+        
+        # Максимальная высота = 5 строк
+        max_height = int(line_height * self.max_lines + margins.top() + margins.bottom() + 10)
+        
+        # Минимальная высота
+        min_h = self.min_height_val
+        
+        if total_height < min_h:
+            total_height = min_h
+        elif total_height > max_height:
+            total_height = max_height
+            
+        self.setFixedHeight(total_height)
+        self.updateGeometry()
+    
+    def keyPressEvent(self, event: QKeyEvent):
+        """Обработка нажатия клавиш: Enter отправляет, Shift+Enter - новая строка."""
+        if event.key() == Qt.Key.Key_Return or event.key() == Qt.Key.Key_Enter:
+            if event.modifiers() == Qt.KeyboardModifier.ShiftModifier:
+                # Shift+Enter - вставляем новую строку
+                super().keyPressEvent(event)
+            else:
+                # Enter без модификаторов - отправляем сообщение
+                parent = self.parent()
+                while parent:
+                    if isinstance(parent, MainWindow):
+                        parent.start_agent()
+                        return
+                    parent = parent.parent()
+        else:
+            super().keyPressEvent(event)
     
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
@@ -303,12 +360,12 @@ class DragDropLineEdit(QLineEdit):
         for url in urls:
             path = url.toLocalFile()
             if path.endswith(".md"):
-                # Добавляем путь в поле (можно добавить команду @file:path)
-                current = self.text()
+                # Добавляем путь в поле
+                current = self.toPlainText()
                 if current:
-                    self.setText(f"{current} @файл:{path}")
+                    self.setPlainText(f"{current} @файл:{path}")
                 else:
-                    self.setText(f"@файл:{path}")
+                    self.setPlainText(f"@файл:{path}")
                 break
 
 
@@ -601,8 +658,9 @@ class MainWindow(QMainWindow):
         
         # Панель ввода в стиле ChatGPT
         self.input_container = QWidget()
+        self.input_container.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
         input_container_layout = QVBoxLayout(self.input_container)
-        input_container_layout.setContentsMargins(0, 12, 0, 24)
+        input_container_layout.setContentsMargins(0, 8, 0, 12)
         
         # Центрируем панель ввода с отступами 5% с каждой стороны
         input_center_layout = QHBoxLayout()
@@ -615,23 +673,24 @@ class MainWindow(QMainWindow):
         input_center_layout.addWidget(left_spacer, 1)
         
         self.input_frame = QFrame()
+        self.input_frame.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
         
         input_layout = QHBoxLayout(self.input_frame)
-        input_layout.setContentsMargins(16, 12, 4, 12)
-        input_layout.setSpacing(8)
+        input_layout.setContentsMargins(6, 4, 4, 4)
+        input_layout.setSpacing(4)
+        input_layout.setAlignment(Qt.AlignmentFlag.AlignBottom) # Выравнивание элементов по низу
         
         # Кнопка добавления файлов
         self.btn_attach = QPushButton("+")
-        self.btn_attach.setFixedSize(36, 36)
+        self.btn_attach.setFixedSize(28, 28)
         self.btn_attach.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_attach.setToolTip("Прикрепить файлы")
         self.btn_attach.clicked.connect(self.on_attach_clicked)
-        input_layout.addWidget(self.btn_attach)
+        input_layout.addWidget(self.btn_attach, 0, Qt.AlignmentFlag.AlignBottom)
         
         # Поле ввода
-        self.txt_input = DragDropLineEdit()
-        self.txt_input.setPlaceholderText("Введите сообщение...")
-        self.txt_input.returnPressed.connect(self.start_agent)
+        self.txt_input = DragDropTextEdit()
+        self.txt_input.setPlaceholderText("Введите сообщение... (Enter - отправить, Shift+Enter - новая строка)")
         input_layout.addWidget(self.txt_input, 1)
         
         # Индикатор файлов (кликабельный)
@@ -639,14 +698,14 @@ class MainWindow(QMainWindow):
         self.lbl_file_count.setVisible(False)
         self.lbl_file_count.setCursor(Qt.CursorShape.PointingHandCursor)
         self.lbl_file_count.mousePressEvent = lambda e: self.show_files_menu()
-        input_layout.addWidget(self.lbl_file_count)
+        input_layout.addWidget(self.lbl_file_count, 0, Qt.AlignmentFlag.AlignBottom)
         
         # Кнопка отправки
         self.btn_send = QPushButton("↑")
-        self.btn_send.setFixedSize(36, 36)
+        self.btn_send.setFixedSize(28, 28)
         self.btn_send.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_send.clicked.connect(self.start_agent)
-        input_layout.addWidget(self.btn_send)
+        input_layout.addWidget(self.btn_send, 0, Qt.AlignmentFlag.AlignBottom)
         
         # Центральная часть (90%)
         input_center_layout.addWidget(self.input_frame, 18)
@@ -906,7 +965,7 @@ class MainWindow(QMainWindow):
             self.log(f"Ошибка загрузки истории: {e}")
 
     def start_agent(self):
-        query = self.txt_input.text().strip()
+        query = self.txt_input.toPlainText().strip()
         if not query: return
         
         # ВАЖНО: Сохраняем список файлов ДО очистки чата!
@@ -1102,7 +1161,7 @@ class MainWindow(QMainWindow):
             self.input_frame.setStyleSheet("""
                 QFrame {
                     background-color: #3d3d3d;
-                    border-radius: 24px;
+                    border-radius: 12px;
                     border: 1px solid #4d4d4f;
                 }
             """)
@@ -1112,8 +1171,8 @@ class MainWindow(QMainWindow):
                     background-color: transparent;
                     color: #8e8ea0;
                     border: none;
-                    border-radius: 18px;
-                    font-size: 24px;
+                    border-radius: 14px;
+                    font-size: 18px;
                     font-weight: bold;
                 }
                 QPushButton:hover {
@@ -1123,12 +1182,12 @@ class MainWindow(QMainWindow):
             """)
             
             self.txt_input.setStyleSheet("""
-                QLineEdit {
+                QTextEdit {
                     background-color: transparent;
                     border: none;
                     color: #ececec;
                     font-size: 14px;
-                    padding: 8px;
+                    padding: 2px 8px;
                 }
             """)
             
@@ -1145,8 +1204,8 @@ class MainWindow(QMainWindow):
                     background-color: #10A37F;
                     color: white;
                     border: none;
-                    border-radius: 18px;
-                    font-size: 20px;
+                    border-radius: 14px;
+                    font-size: 16px;
                     font-weight: bold;
                 }
                 QPushButton:hover {
@@ -1382,7 +1441,7 @@ class MainWindow(QMainWindow):
             self.input_frame.setStyleSheet("""
                 QFrame {
                     background-color: #f4f4f4;
-                    border-radius: 24px;
+                    border-radius: 12px;
                     border: 1px solid #e5e5e5;
                 }
             """)
@@ -1392,8 +1451,8 @@ class MainWindow(QMainWindow):
                     background-color: transparent;
                     color: #8e8ea0;
                     border: none;
-                    border-radius: 18px;
-                    font-size: 24px;
+                    border-radius: 14px;
+                    font-size: 18px;
                     font-weight: bold;
                 }
                 QPushButton:hover {
@@ -1403,12 +1462,12 @@ class MainWindow(QMainWindow):
             """)
             
             self.txt_input.setStyleSheet("""
-                QLineEdit {
+                QTextEdit {
                     background-color: transparent;
                     border: none;
                     color: #2d333a;
                     font-size: 14px;
-                    padding: 8px;
+                    padding: 2px 8px;
                 }
             """)
             
@@ -1425,8 +1484,8 @@ class MainWindow(QMainWindow):
                     background-color: #10A37F;
                     color: white;
                     border: none;
-                    border-radius: 18px;
-                    font-size: 20px;
+                    border-radius: 14px;
+                    font-size: 16px;
                     font-weight: bold;
                 }
                 QPushButton:hover {
