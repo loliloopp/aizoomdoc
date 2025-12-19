@@ -41,11 +41,13 @@ class SupabaseClient:
     
     # ===== Folder & File Operations (V2) =====
     
-    async def create_folder(self, name: str, user_id: str = "default_user", parent_id: Optional[str] = None) -> Optional[str]:
+    async def create_folder(self, name: str, user_id: str = "default_user", parent_id: Optional[str] = None, slug: Optional[str] = None) -> Optional[str]:
         """Создать новую папку. Если user_id не передан, используется 'default_user'."""
         if not self.is_connected(): return None
         try:
             data = {"name": name, "user_id": user_id, "parent_id": parent_id}
+            if slug:
+                data["slug"] = slug
             response = self.client.table("folders").insert(data).execute()
             if response.data:
                 folder_id = response.data[0]["id"]

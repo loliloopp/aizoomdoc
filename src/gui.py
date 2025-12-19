@@ -26,6 +26,8 @@ from PyQt6.QtGui import (
 from .config import config
 from .gui_agent import AgentWorker
 from .supabase_client import supabase_client
+from .s3_storage import s3_storage
+from .utils import transliterate
 import asyncio
 
 MODELS = {
@@ -1133,9 +1135,15 @@ class MainWindow(QMainWindow):
             
             # Сначала создаем все папки
             for f in folders:
+                # Если slug пустой (старая папка), генерируем его на лету
+                slug = f.get('slug')
+                if not slug:
+                    slug = transliterate(f['name'])
+                    
                 f_item = QStandardItem(f"📁 {f['name']}")
                 f_item.setData(f['id'], Qt.ItemDataRole.UserRole) # ID папки
                 f_item.setData("folder", Qt.ItemDataRole.UserRole + 1) # Тип
+                f_item.setData(slug, Qt.ItemDataRole.UserRole + 4) # Slug для S3
                 folder_items[f['id']] = f_item
 
             # Добавляем в модель (учитывая parent_id)
@@ -1167,9 +1175,10 @@ class MainWindow(QMainWindow):
         name, ok = QInputDialog.getText(self, "Новая папка", "Введите название тематической папки:")
         if ok and name:
             try:
-                folder_id = self.run_async(supabase_client.create_folder(name))
+                slug = transliterate(name)
+                folder_id = self.run_async(supabase_client.create_folder(name, slug=slug))
                 if folder_id:
-                    self.log(f"Логическая папка создана: {name}")
+                    self.log(f"Логическая папка создана: {name} (slug: {slug})")
                     self.refresh_folders()
                 else:
                     QMessageBox.warning(self, "Ошибка", "Не удалось создать папку в БД")
@@ -1190,6 +1199,7 @@ class MainWindow(QMainWindow):
         item = self.logical_model.itemFromIndex(index)
         db_id = item.data(Qt.ItemDataRole.UserRole)
         item_type = item.data(Qt.ItemDataRole.UserRole + 1)
+        folder_slug = item.data(Qt.ItemDataRole.UserRole + 4)
         
         menu = QMenu()
         
@@ -1201,7 +1211,7 @@ class MainWindow(QMainWindow):
             action_delete = menu.addAction("🗑️ Удалить папку")
             
             action_attach_all.triggered.connect(lambda: self.attach_folder_files_db(db_id, item.text()))
-            action_add_files.triggered.connect(lambda: self.add_external_files_to_db_folder(db_id))
+            action_add_files.triggered.connect(lambda: self.add_external_files_to_db_folder(db_id, folder_slug))
             action_new_subfolder.triggered.connect(lambda: self.create_subfolder_db(db_id))
             action_delete.triggered.connect(lambda: self.delete_db_item(db_id, "folder", item.text()))
         else:
@@ -1219,31 +1229,60 @@ class MainWindow(QMainWindow):
     def create_subfolder_db(self, parent_id):
         name, ok = QInputDialog.getText(self, "Новая подпапка", "Введите название:")
         if ok and name:
-            self.run_async(supabase_client.create_folder(name, parent_id=parent_id))
+            slug = transliterate(name)
+            self.run_async(supabase_client.create_folder(name, parent_id=parent_id, slug=slug))
             self.refresh_folders()
 
-    def add_external_files_to_db_folder(self, folder_id):
-        """Регистрирует внешние файлы в БД и добавляет в папку."""
-        files, _ = QFileDialog.getOpenFileNames(self, "Выберите файлы для добавления", "", "All Files (*)")
+    def add_external_files_to_db_folder(self, folder_id, folder_slug=None):
+        """Загружает внешние файлы в S3, регистрирует в БД и добавляет в папку."""
+        if not s3_storage.is_connected():
+            QMessageBox.critical(self, "Ошибка S3", "S3 не подключен. Проверьте настройки в .env")
+            return
+
+        files, _ = QFileDialog.getOpenFileNames(self, "Выберите файлы для загрузки в S3", "", "All Files (*)")
         if files:
             count = 0
+            # Если slug не передан, берем из имени папки (хотя он должен быть передан)
+            slug = folder_slug or "unsorted"
+            
+            # Показываем диалог прогресса
+            progress = QProgressBar()
+            progress.setMaximum(len(files))
+            progress.setValue(0)
+            
             for f_path in files:
                 p = Path(f_path)
                 try:
-                    # В реальном приложении мы бы загрузили файл в S3, 
-                    # но здесь мы просто регистрируем путь к локальному файлу как storage_path
-                    file_id = self.run_async(supabase_client.register_file(
-                        source_type="user_upload",
-                        filename=p.name,
-                        storage_path=str(p),
-                        size_bytes=p.stat().st_size
+                    # Путь в S3: folders/slug/filename (используем строчный регистр для folders)
+                    s3_key = f"folders/{slug}/{p.name}"
+                    
+                    self.log(f"Загрузка {p.name} в S3 (путь: {s3_key})...")
+                    s3_url = self.run_async(s3_storage.upload_file(
+                        file_path=str(p),
+                        s3_key=s3_key
                     ))
-                    if file_id:
-                        self.run_async(supabase_client.add_file_to_folder(folder_id, file_id))
-                        count += 1
+                    
+                    if s3_url:
+                        self.log(f"Успешно загружено в S3. Регистрация в БД...")
+                        file_id = self.run_async(supabase_client.register_file(
+                            source_type="user_upload",
+                            filename=p.name,
+                            storage_path=s3_key,
+                            size_bytes=p.stat().st_size
+                        ))
+                        if file_id:
+                            self.run_async(supabase_client.add_file_to_folder(folder_id, file_id))
+                            count += 1
+                        else:
+                            self.log(f"Ошибка регистрации {p.name} в БД")
+                    else:
+                        error_msg = f"Ошибка загрузки {p.name} в S3. Проверьте логи терминала (возможно ошибка региона или доступов)."
+                        self.log(error_msg)
+                        QMessageBox.warning(self, "Ошибка загрузки", error_msg)
                 except Exception as e:
                     self.log(f"Ошибка добавления {p.name}: {e}")
-            self.log(f"Добавлено файлов в папку БД: {count}")
+            
+            self.log(f"Завершено. Загружено и добавлено в папку: {count}")
             self.refresh_folders()
 
     def attach_single_file_db(self, file_id, name, path):
