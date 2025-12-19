@@ -1166,6 +1166,9 @@ class MainWindow(QMainWindow):
                     file_item.setData(file.get('storage_path') or file.get('external_url'), Qt.ItemDataRole.UserRole + 2) # Путь/URL
                     file_item.setData(f_id, Qt.ItemDataRole.UserRole + 3) # ID родительской папки в БД
                     f_item.appendRow(file_item)
+            
+            # Разворачиваем все папки, чтобы видеть файлы
+            self.tree_folders.expandAll()
                     
         except Exception as e:
             self.log(f"Ошибка обновления папок: {e}")
@@ -1213,7 +1216,7 @@ class MainWindow(QMainWindow):
             action_attach_all.triggered.connect(lambda: self.attach_folder_files_db(db_id, item.text()))
             action_add_files.triggered.connect(lambda: self.add_external_files_to_db_folder(db_id, folder_slug))
             action_new_subfolder.triggered.connect(lambda: self.create_subfolder_db(db_id))
-            action_delete.triggered.connect(lambda: self.delete_db_item(db_id, "folder", item.text()))
+            action_delete.triggered.connect(lambda: self.delete_db_item(db_id, "folder", item.text(), folder_slug=folder_slug))
         else:
             action_attach = menu.addAction("📎 Прикрепить к чату")
             action_delete = menu.addAction("🗑️ Удалить из этой папки")
@@ -1222,7 +1225,7 @@ class MainWindow(QMainWindow):
             parent_folder_id = item.data(Qt.ItemDataRole.UserRole + 3)
             
             action_attach.triggered.connect(lambda: self.attach_single_file_db(db_id, item.text(), file_path))
-            action_delete.triggered.connect(lambda: self.delete_db_item(db_id, "file", item.text(), parent_folder_id))
+            action_delete.triggered.connect(lambda: self.delete_db_item(db_id, "file", item.text(), parent_folder_id=parent_folder_id))
 
         menu.exec(self.tree_folders.viewport().mapToGlobal(position))
 
@@ -1245,11 +1248,6 @@ class MainWindow(QMainWindow):
             # Если slug не передан, берем из имени папки (хотя он должен быть передан)
             slug = folder_slug or "unsorted"
             
-            # Показываем диалог прогресса
-            progress = QProgressBar()
-            progress.setMaximum(len(files))
-            progress.setValue(0)
-            
             for f_path in files:
                 p = Path(f_path)
                 try:
@@ -1271,8 +1269,11 @@ class MainWindow(QMainWindow):
                             size_bytes=p.stat().st_size
                         ))
                         if file_id:
-                            self.run_async(supabase_client.add_file_to_folder(folder_id, file_id))
-                            count += 1
+                            success = self.run_async(supabase_client.add_file_to_folder(folder_id, file_id))
+                            if success:
+                                count += 1
+                            else:
+                                self.log(f"Ошибка привязки {p.name} к папке в БД")
                         else:
                             self.log(f"Ошибка регистрации {p.name} в БД")
                     else:
@@ -1337,23 +1338,31 @@ class MainWindow(QMainWindow):
             self.update_file_indicator()
             self.log(f"Прикреплено из дерева БД: {added_count}")
 
-    def delete_db_item(self, db_id, item_type, name, parent_folder_id=None):
-        """Удалить папку или файл из БД."""
+    def delete_db_item(self, db_id, item_type, name, parent_folder_id=None, folder_slug=None):
+        """Удалить папку или файл из БД и S3."""
         msg = f"Удалить папку '{name}' и все её связи?" if item_type == "folder" else f"Удалить '{name}' из этой папки?"
         reply = QMessageBox.question(self, "Удаление", msg,
                                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if reply == QMessageBox.StandardButton.Yes:
             try:
+                success = False
                 if item_type == "folder":
+                    # 1. Сначала удаляем из S3 если это папка
+                    if folder_slug:
+                        s3_prefix = f"folders/{folder_slug}/"
+                        self.log(f"Удаление содержимого папки в S3: {s3_prefix}")
+                        self.run_async(s3_storage.delete_folder(s3_prefix))
+                    
+                    # 2. Затем из БД
                     success = self.run_async(supabase_client.delete_folder(db_id))
                 else:
                     success = self.run_async(supabase_client.delete_file_from_folder(parent_folder_id, db_id))
                 
                 if success:
-                    self.log(f"Удалено из БД: {name}")
+                    self.log(f"Удалено: {name}")
                     self.refresh_folders()
                 else:
-                    self.log(f"Ошибка при удалении {name} из БД")
+                    self.log(f"Ошибка при удалении {name}")
             except Exception as e:
                 self.log(f"Ошибка удаления: {e}")
 
