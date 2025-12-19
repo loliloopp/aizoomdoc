@@ -5,6 +5,7 @@
 import sys
 import os
 import json
+import shutil
 from pathlib import Path
 from datetime import datetime
 
@@ -13,13 +14,19 @@ from PyQt6.QtWidgets import (
     QTextEdit, QLineEdit, QPushButton, QLabel, QComboBox, QSplitter,
     QListWidget, QListWidgetItem, QFrame, QScrollArea, QProgressBar,
     QFileDialog, QMenuBar, QMenu, QDialog, QDialogButtonBox, QMessageBox,
-    QGroupBox, QSizePolicy
+    QGroupBox, QSizePolicy, QTreeView, QButtonGroup, QInputDialog,
+    QHeaderView
 )
 from PyQt6.QtCore import Qt, QUrl, QSize
-from PyQt6.QtGui import QFont, QPixmap, QAction, QDragEnterEvent, QDropEvent, QTextCursor, QKeyEvent
+from PyQt6.QtGui import (
+    QFont, QPixmap, QAction, QDragEnterEvent, QDropEvent, 
+    QTextCursor, QKeyEvent, QFileSystemModel, QStandardItemModel, QStandardItem
+)
 
 from .config import config
 from .gui_agent import AgentWorker
+from .supabase_client import supabase_client
+import asyncio
 
 MODELS = {
     "Gemini 3 Flash (Default)": "google/gemini-3-flash-preview",
@@ -598,6 +605,35 @@ class MainWindow(QMainWindow):
         top_bar_layout = QHBoxLayout(self.top_bar)
         top_bar_layout.setContentsMargins(16, 8, 16, 8)
         
+        # Вкладки переключения левой панели
+        tabs_container = QWidget()
+        tabs_layout = QHBoxLayout(tabs_container)
+        tabs_layout.setContentsMargins(0, 0, 0, 0)
+        tabs_layout.setSpacing(4)
+
+        self.btn_tab_chats = QPushButton("Чаты")
+        self.btn_tab_chats.setCheckable(True)
+        self.btn_tab_chats.setChecked(True)
+        self.btn_tab_chats.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_tab_chats.clicked.connect(lambda: self.switch_left_tab("chats"))
+        self.btn_tab_chats.setFixedSize(80, 34)
+
+        self.btn_tab_folders = QPushButton("Папки")
+        self.btn_tab_folders.setCheckable(True)
+        self.btn_tab_folders.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_tab_folders.clicked.connect(lambda: self.switch_left_tab("folders"))
+        self.btn_tab_folders.setFixedSize(80, 34)
+        
+        # Группа для взаимоисключения (визуально)
+        self.left_tabs_group = QButtonGroup(self)
+        self.left_tabs_group.addButton(self.btn_tab_chats)
+        self.left_tabs_group.addButton(self.btn_tab_folders)
+        
+        tabs_layout.addWidget(self.btn_tab_chats)
+        tabs_layout.addWidget(self.btn_tab_folders)
+
+        top_bar_layout.addWidget(tabs_container)
+        
         top_bar_layout.addStretch()
         
         # Переключатель темы
@@ -619,24 +655,80 @@ class MainWindow(QMainWindow):
         self.left_panel = QFrame()
         self.left_panel.setFixedWidth(260)
         left_layout = QVBoxLayout(self.left_panel)
-        left_layout.setSpacing(8)
-        left_layout.setContentsMargins(12, 12, 12, 12)
+        left_layout.setSpacing(0)
+        left_layout.setContentsMargins(0, 0, 0, 0)
         
+        # --- ВКЛАДКА ЧАТЫ ---
+        self.chats_widget = QWidget()
+        chats_layout = QVBoxLayout(self.chats_widget)
+        chats_layout.setSpacing(8)
+        chats_layout.setContentsMargins(12, 12, 12, 12)
+
         # Кнопка "Новый чат" в стиле ChatGPT
         self.btn_new_chat = QPushButton("+ Новый чат")
         self.btn_new_chat.clicked.connect(self.new_chat)
-        left_layout.addWidget(self.btn_new_chat)
+        chats_layout.addWidget(self.btn_new_chat)
         
-        left_layout.addSpacing(12)
+        chats_layout.addSpacing(12)
         
         # Заголовок истории
         self.history_label = QLabel("Недавние чаты")
-        left_layout.addWidget(self.history_label)
+        chats_layout.addWidget(self.history_label)
         
         # Список истории
         self.list_history = QListWidget()
         self.list_history.itemClicked.connect(self.load_chat_history)
-        left_layout.addWidget(self.list_history)
+        chats_layout.addWidget(self.list_history)
+        
+        left_layout.addWidget(self.chats_widget)
+
+        # --- ВКЛАДКА ПАПКИ ---
+        self.folders_widget = QWidget()
+        self.folders_widget.setVisible(False)
+        folders_layout = QVBoxLayout(self.folders_widget)
+        folders_layout.setSpacing(8)
+        folders_layout.setContentsMargins(12, 12, 12, 12)
+        
+        # Кнопки управления папками
+        folders_btns_layout = QHBoxLayout()
+        folders_btns_layout.setSpacing(4)
+        
+        self.btn_new_folder = QPushButton("+ Папка")
+        self.btn_new_folder.clicked.connect(self.create_new_folder)
+        self.btn_new_folder.setToolTip("Создать тематическую папку")
+        
+        self.btn_refresh_folders = QPushButton("🔄")
+        self.btn_refresh_folders.setFixedWidth(30)
+        self.btn_refresh_folders.clicked.connect(self.refresh_folders)
+        
+        folders_btns_layout.addWidget(self.btn_new_folder)
+        folders_btns_layout.addWidget(self.btn_refresh_folders)
+        folders_layout.addLayout(folders_btns_layout)
+        
+        self.folders_label = QLabel("Файлы проекта")
+        folders_layout.addWidget(self.folders_label)
+        
+        # Дерево файлов
+        self.tree_folders = QTreeView()
+        self.tree_folders.setHeaderHidden(True)
+        self.tree_folders.setIndentation(20)
+        self.tree_folders.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tree_folders.customContextMenuRequested.connect(self.show_tree_context_menu)
+        self.tree_folders.setSelectionMode(QTreeView.SelectionMode.ExtendedSelection)
+        
+        # Логическая модель (БД)
+        self.logical_model = QStandardItemModel()
+        self.tree_folders.setModel(self.logical_model)
+        
+        self.tree_folders.doubleClicked.connect(self.on_tree_double_clicked)
+        folders_layout.addWidget(self.tree_folders)
+        
+        # Кнопка прикрепления выбранных
+        self.btn_attach_selected = QPushButton("📎 Прикрепить выбранные")
+        self.btn_attach_selected.clicked.connect(self.attach_selected_from_tree)
+        folders_layout.addWidget(self.btn_attach_selected)
+        
+        left_layout.addWidget(self.folders_widget)
         
         # ЦЕНТР
         self.center_panel = QFrame()
@@ -950,6 +1042,10 @@ class MainWindow(QMainWindow):
                         self.list_history.addItem(item)
                 except: pass
 
+    def run_async(self, coro):
+        """Вспомогательный метод для запуска асинхронных задач без предупреждений."""
+        return asyncio.run(coro)
+
     def load_chat_history(self, item):
         path = item.data(Qt.ItemDataRole.UserRole)
         self.new_chat()
@@ -1003,6 +1099,225 @@ class MainWindow(QMainWindow):
         self.progress.setVisible(False)
         self.log("Готово.")
     
+    def switch_left_tab(self, tab_name):
+        """Переключает вкладку левой панели."""
+        if tab_name == "chats":
+            self.chats_widget.setVisible(True)
+            self.folders_widget.setVisible(False)
+            self.btn_tab_chats.setChecked(True)
+            self.btn_tab_folders.setChecked(False)
+        else:
+            self.chats_widget.setVisible(False)
+            self.folders_widget.setVisible(True)
+            self.btn_tab_chats.setChecked(False)
+            self.btn_tab_folders.setChecked(True)
+            # Обновляем логические папки при переключении
+            self.refresh_folders()
+
+    def refresh_folders(self):
+        """Обновляет дерево логических папок из БД."""
+        self.logical_model.clear()
+        if not supabase_client.is_connected():
+            item = QStandardItem("Supabase не подключен")
+            item.setEnabled(False)
+            self.logical_model.appendRow(item)
+            return
+
+        try:
+            folders = self.run_async(supabase_client.get_folders())
+            
+            # Строим дерево
+            # Для простоты пока плоский список или один уровень вложенности, 
+            # но можно сделать рекурсивно по parent_id
+            folder_items = {}
+            
+            # Сначала создаем все папки
+            for f in folders:
+                f_item = QStandardItem(f"📁 {f['name']}")
+                f_item.setData(f['id'], Qt.ItemDataRole.UserRole) # ID папки
+                f_item.setData("folder", Qt.ItemDataRole.UserRole + 1) # Тип
+                folder_items[f['id']] = f_item
+
+            # Добавляем в модель (учитывая parent_id)
+            for f in folders:
+                f_item = folder_items[f['id']]
+                parent_id = f.get('parent_id')
+                if parent_id and parent_id in folder_items:
+                    folder_items[parent_id].appendRow(f_item)
+                else:
+                    self.logical_model.appendRow(f_item)
+            
+            # Загружаем файлы для каждой папки
+            for f_id, f_item in folder_items.items():
+                files = self.run_async(supabase_client.get_folder_files(f_id))
+                for file in files:
+                    name = file.get('filename') or "Без названия"
+                    file_item = QStandardItem(f"📄 {name}")
+                    file_item.setData(file['id'], Qt.ItemDataRole.UserRole) # ID файла
+                    file_item.setData("file", Qt.ItemDataRole.UserRole + 1) # Тип
+                    file_item.setData(file.get('storage_path') or file.get('external_url'), Qt.ItemDataRole.UserRole + 2) # Путь/URL
+                    file_item.setData(f_id, Qt.ItemDataRole.UserRole + 3) # ID родительской папки в БД
+                    f_item.appendRow(file_item)
+                    
+        except Exception as e:
+            self.log(f"Ошибка обновления папок: {e}")
+
+    def create_new_folder(self):
+        """Создает новую логическую папку в БД."""
+        name, ok = QInputDialog.getText(self, "Новая папка", "Введите название тематической папки:")
+        if ok and name:
+            try:
+                folder_id = self.run_async(supabase_client.create_folder(name))
+                if folder_id:
+                    self.log(f"Логическая папка создана: {name}")
+                    self.refresh_folders()
+                else:
+                    QMessageBox.warning(self, "Ошибка", "Не удалось создать папку в БД")
+            except Exception as e:
+                QMessageBox.critical(self, "Ошибка", f"Ошибка: {e}")
+
+    def show_tree_context_menu(self, position):
+        """Контекстное меню для дерева логических папок."""
+        indexes = self.tree_folders.selectedIndexes()
+        if not indexes:
+            menu = QMenu()
+            action_new_folder = menu.addAction("➕ Создать папку")
+            action_new_folder.triggered.connect(self.create_new_folder)
+            menu.exec(self.tree_folders.viewport().mapToGlobal(position))
+            return
+
+        index = indexes[0]
+        item = self.logical_model.itemFromIndex(index)
+        db_id = item.data(Qt.ItemDataRole.UserRole)
+        item_type = item.data(Qt.ItemDataRole.UserRole + 1)
+        
+        menu = QMenu()
+        
+        if item_type == "folder":
+            action_attach_all = menu.addAction("📎 Прикрепить ВСЕ файлы")
+            action_add_files = menu.addAction("📥 Добавить файлы в эту папку")
+            menu.addSeparator()
+            action_new_subfolder = menu.addAction("➕ Создать подпапку")
+            action_delete = menu.addAction("🗑️ Удалить папку")
+            
+            action_attach_all.triggered.connect(lambda: self.attach_folder_files_db(db_id, item.text()))
+            action_add_files.triggered.connect(lambda: self.add_external_files_to_db_folder(db_id))
+            action_new_subfolder.triggered.connect(lambda: self.create_subfolder_db(db_id))
+            action_delete.triggered.connect(lambda: self.delete_db_item(db_id, "folder", item.text()))
+        else:
+            action_attach = menu.addAction("📎 Прикрепить к чату")
+            action_delete = menu.addAction("🗑️ Удалить из этой папки")
+            
+            file_path = item.data(Qt.ItemDataRole.UserRole + 2)
+            parent_folder_id = item.data(Qt.ItemDataRole.UserRole + 3)
+            
+            action_attach.triggered.connect(lambda: self.attach_single_file_db(db_id, item.text(), file_path))
+            action_delete.triggered.connect(lambda: self.delete_db_item(db_id, "file", item.text(), parent_folder_id))
+
+        menu.exec(self.tree_folders.viewport().mapToGlobal(position))
+
+    def create_subfolder_db(self, parent_id):
+        name, ok = QInputDialog.getText(self, "Новая подпапка", "Введите название:")
+        if ok and name:
+            self.run_async(supabase_client.create_folder(name, parent_id=parent_id))
+            self.refresh_folders()
+
+    def add_external_files_to_db_folder(self, folder_id):
+        """Регистрирует внешние файлы в БД и добавляет в папку."""
+        files, _ = QFileDialog.getOpenFileNames(self, "Выберите файлы для добавления", "", "All Files (*)")
+        if files:
+            count = 0
+            for f_path in files:
+                p = Path(f_path)
+                try:
+                    # В реальном приложении мы бы загрузили файл в S3, 
+                    # но здесь мы просто регистрируем путь к локальному файлу как storage_path
+                    file_id = self.run_async(supabase_client.register_file(
+                        source_type="user_upload",
+                        filename=p.name,
+                        storage_path=str(p),
+                        size_bytes=p.stat().st_size
+                    ))
+                    if file_id:
+                        self.run_async(supabase_client.add_file_to_folder(folder_id, file_id))
+                        count += 1
+                except Exception as e:
+                    self.log(f"Ошибка добавления {p.name}: {e}")
+            self.log(f"Добавлено файлов в папку БД: {count}")
+            self.refresh_folders()
+
+    def attach_single_file_db(self, file_id, name, path):
+        """Прикрепить файл из БД."""
+        if path and path not in self.selected_md_files:
+            self.selected_md_files.append(path)
+            self.update_file_indicator()
+            self.log(f"Прикреплен файл из БД: {name}")
+
+    def attach_folder_files_db(self, folder_id, folder_name):
+        """Прикрепить все файлы из папки БД."""
+        files = self.run_async(supabase_client.get_folder_files(folder_id))
+        added_count = 0
+        for f in files:
+            path = f.get('storage_path') or f.get('external_url')
+            if path and path not in self.selected_md_files:
+                self.selected_md_files.append(path)
+                added_count += 1
+        
+        if added_count > 0:
+            self.update_file_indicator()
+            self.log(f"Из папки '{folder_name}' прикреплено файлов: {added_count}")
+        else:
+            self.log(f"В папке '{folder_name}' не найдено новых файлов для прикрепления")
+
+    def on_tree_double_clicked(self, index):
+        item = self.logical_model.itemFromIndex(index)
+        item_type = item.data(Qt.ItemDataRole.UserRole + 1)
+        if item_type == "file":
+            db_id = item.data(Qt.ItemDataRole.UserRole)
+            path = item.data(Qt.ItemDataRole.UserRole + 2)
+            self.attach_single_file_db(db_id, item.text(), path)
+
+    def attach_selected_from_tree(self):
+        """Прикрепляет все выбранные в дереве файлы из БД."""
+        indexes = self.tree_folders.selectedIndexes()
+        added_count = 0
+        
+        unique_items = set()
+        for index in indexes:
+            if index.column() == 0:
+                item = self.logical_model.itemFromIndex(index)
+                if item.data(Qt.ItemDataRole.UserRole + 1) == "file":
+                    unique_items.add((item.text(), item.data(Qt.ItemDataRole.UserRole + 2)))
+        
+        for name, path in unique_items:
+            if path and path not in self.selected_md_files:
+                self.selected_md_files.append(path)
+                added_count += 1
+        
+        if added_count > 0:
+            self.update_file_indicator()
+            self.log(f"Прикреплено из дерева БД: {added_count}")
+
+    def delete_db_item(self, db_id, item_type, name, parent_folder_id=None):
+        """Удалить папку или файл из БД."""
+        msg = f"Удалить папку '{name}' и все её связи?" if item_type == "folder" else f"Удалить '{name}' из этой папки?"
+        reply = QMessageBox.question(self, "Удаление", msg,
+                                   QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply == QMessageBox.StandardButton.Yes:
+            try:
+                if item_type == "folder":
+                    success = self.run_async(supabase_client.delete_folder(db_id))
+                else:
+                    success = self.run_async(supabase_client.delete_file_from_folder(parent_folder_id, db_id))
+                
+                if success:
+                    self.log(f"Удалено из БД: {name}")
+                    self.refresh_folders()
+                else:
+                    self.log(f"Ошибка при удалении {name} из БД")
+            except Exception as e:
+                self.log(f"Ошибка удаления: {e}")
+
     def toggle_theme(self):
         """Переключает тему интерфейса."""
         self.is_dark_theme = not self.is_dark_theme
@@ -1134,6 +1449,80 @@ class MainWindow(QMainWindow):
                 }
                 QListWidget::item:selected {
                     background-color: #3d3d3d;
+                }
+            """)
+            
+            self.folders_label.setStyleSheet("""
+                color: #8e8ea0;
+                font-size: 11px;
+                font-weight: 500;
+                padding-left: 8px;
+            """)
+
+            self.tree_folders.setStyleSheet("""
+                QTreeView {
+                    border: none;
+                    background: transparent;
+                    outline: none;
+                }
+                QTreeView::item {
+                    color: #ececec;
+                    padding: 4px;
+                }
+                QTreeView::item:hover {
+                    background-color: #2d2d2d;
+                }
+                QTreeView::item:selected {
+                    background-color: #3d3d3d;
+                }
+            """)
+            
+            tab_style_dark = """
+                QPushButton {
+                    background-color: transparent;
+                    border: none;
+                    color: #8e8ea0;
+                    font-size: 14px;
+                    font-weight: 600;
+                }
+                QPushButton:checked {
+                    color: #ececec;
+                    border-bottom: 2px solid #10A37F;
+                }
+                QPushButton:hover {
+                    color: #ececec;
+                }
+            """
+            self.btn_tab_chats.setStyleSheet(tab_style_dark)
+            self.btn_tab_folders.setStyleSheet(tab_style_dark)
+
+            # Кнопки папок
+            folders_btn_style_dark = """
+                QPushButton {
+                    background-color: #3d3d3d;
+                    color: #ececec;
+                    border: 1px solid #4d4d4f;
+                    border-radius: 6px;
+                    padding: 4px 8px;
+                }
+                QPushButton:hover {
+                    background-color: #4d4d4f;
+                }
+            """
+            self.btn_new_folder.setStyleSheet(folders_btn_style_dark)
+            self.btn_refresh_folders.setStyleSheet(folders_btn_style_dark)
+            self.btn_attach_selected.setStyleSheet("""
+                QPushButton {
+                    background-color: #10A37F;
+                    color: white;
+                    border: none;
+                    border-radius: 6px;
+                    padding: 8px;
+                    font-weight: 600;
+                    margin-top: 4px;
+                }
+                QPushButton:hover {
+                    background-color: #0d8c6d;
                 }
             """)
             
@@ -1414,6 +1803,80 @@ class MainWindow(QMainWindow):
                 }
                 QListWidget::item:selected {
                     background-color: #d1d5db;
+                }
+            """)
+            
+            self.folders_label.setStyleSheet("""
+                color: #6e6e80;
+                font-size: 11px;
+                font-weight: 500;
+                padding-left: 8px;
+            """)
+
+            self.tree_folders.setStyleSheet("""
+                QTreeView {
+                    border: none;
+                    background: transparent;
+                    outline: none;
+                }
+                QTreeView::item {
+                    color: #2d333a;
+                    padding: 4px;
+                }
+                QTreeView::item:hover {
+                    background-color: #e5e5e5;
+                }
+                QTreeView::item:selected {
+                    background-color: #d1d5db;
+                }
+            """)
+            
+            tab_style_light = """
+                QPushButton {
+                    background-color: transparent;
+                    border: none;
+                    color: #6e6e80;
+                    font-size: 14px;
+                    font-weight: 600;
+                }
+                QPushButton:checked {
+                    color: #2d333a;
+                    border-bottom: 2px solid #10A37F;
+                }
+                QPushButton:hover {
+                    color: #2d333a;
+                }
+            """
+            self.btn_tab_chats.setStyleSheet(tab_style_light)
+            self.btn_tab_folders.setStyleSheet(tab_style_light)
+
+            # Кнопки папок
+            folders_btn_style_light = """
+                QPushButton {
+                    background-color: #ffffff;
+                    color: #2d333a;
+                    border: 1px solid #d1d5db;
+                    border-radius: 6px;
+                    padding: 4px 8px;
+                }
+                QPushButton:hover {
+                    background-color: #f3f4f6;
+                }
+            """
+            self.btn_new_folder.setStyleSheet(folders_btn_style_light)
+            self.btn_refresh_folders.setStyleSheet(folders_btn_style_light)
+            self.btn_attach_selected.setStyleSheet("""
+                QPushButton {
+                    background-color: #10A37F;
+                    color: white;
+                    border: none;
+                    border-radius: 6px;
+                    padding: 8px;
+                    font-weight: 600;
+                    margin-top: 4px;
+                }
+                QPushButton:hover {
+                    background-color: #0d8c6d;
                 }
             """)
             

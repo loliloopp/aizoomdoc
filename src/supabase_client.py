@@ -110,6 +110,42 @@ class SupabaseClient:
             logger.error(f"❌ Ошибка добавления файла в папку: {e}")
             return False
 
+    async def get_folder_files(self, folder_id: str) -> List[Dict[str, Any]]:
+        """Получить список файлов в папке."""
+        if not self.is_connected(): return []
+        try:
+            items = self.client.table("folder_items").select("file_id").eq("folder_id", folder_id).execute().data or []
+            if not items: return []
+            file_ids = [item["file_id"] for item in items]
+            files = self.client.table("storage_files").select("*").in_("id", file_ids).execute().data or []
+            return files
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения файлов папки: {e}")
+            return []
+
+    async def delete_folder(self, folder_id: str) -> bool:
+        """Удалить папку и связи с файлами."""
+        if not self.is_connected(): return False
+        try:
+            # Сначала удаляем связи
+            self.client.table("folder_items").delete().eq("folder_id", folder_id).execute()
+            # Затем саму папку
+            self.client.table("folders").delete().eq("id", folder_id).execute()
+            return True
+        except Exception as e:
+            logger.error(f"❌ Ошибка удаления папки: {e}")
+            return False
+
+    async def delete_file_from_folder(self, folder_id: str, file_id: str) -> bool:
+        """Удалить файл из конкретной папки (связь)."""
+        if not self.is_connected(): return False
+        try:
+            self.client.table("folder_items").delete().eq("folder_id", folder_id).eq("file_id", file_id).execute()
+            return True
+        except Exception as e:
+            logger.error(f"❌ Ошибка удаления файла из папки: {e}")
+            return False
+
     async def add_attachment_to_message(self, message_id: str, file_id: str) -> bool:
         """Прикрепить файл (из папки или загруженный) к сообщению."""
         if not self.is_connected(): return False
