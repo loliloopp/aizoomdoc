@@ -6,6 +6,7 @@
 import logging
 import json
 import uuid
+import asyncio
 from pathlib import Path
 from datetime import datetime
 from typing import List
@@ -15,6 +16,8 @@ from .config import config
 from .llm_client import LLMClient
 from .image_processor import ImageProcessor
 from .markdown_parser import MarkdownParser
+from .supabase_client import supabase_client
+from .s3_storage import s3_storage
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +53,7 @@ class AgentWorker(QThread):
             "md_files": self.md_files,
             "messages": []
         }
+        self.db_chat_id = None
 
     def save_message(self, role: str, content: str, images: list = None):
         msg = {
@@ -62,6 +66,75 @@ class AgentWorker(QThread):
         
         self.chat_history_data["messages"].append(msg)
         self._save_to_disk()
+        
+        # Сохранение в БД и S3
+        if config.USE_DATABASE:
+            try:
+                asyncio.run(self._save_to_db(role, content, images))
+            except Exception as e:
+                logger.error(f"Ошибка сохранения в БД: {e}")
+
+    async def _save_to_db(self, role: str, content: str, images: list = None):
+        """Асинхронное сохранение сообщения и картинок в Supabase и S3."""
+        try:
+            # 1. Создаем чат если еще не создан
+            if not self.db_chat_id:
+                title = self.query[:100]
+                self.db_chat_id = await supabase_client.create_chat(
+                    title=title,
+                    user_id="default_user",
+                    description=self.query,
+                    metadata={
+                        "local_chat_id": self.chat_id,
+                        "model": self.model,
+                        "md_files": self.md_files
+                    }
+                )
+                if not self.db_chat_id:
+                    logger.warning("Не удалось создать чат в Supabase")
+                    return
+
+            # 2. Добавляем сообщение
+            msg_id = await supabase_client.add_message(
+                chat_id=self.db_chat_id,
+                role=role,
+                content=content
+            )
+            
+            if not msg_id:
+                logger.warning("Не удалось сохранить сообщение в Supabase")
+                return
+
+            # 3. Если есть картинки - загружаем в S3 и регистрируем
+            if images:
+                for img in images:
+                    if not img.image_path or not Path(img.image_path).exists():
+                        continue
+                        
+                    # Генерируем путь в S3
+                    img_type = "zoom_crop" if img.is_zoom_request else "viewport"
+                    filename = Path(img.image_path).name
+                    s3_key = s3_storage.generate_s3_path(self.db_chat_id, img_type, filename)
+                    
+                    # Загружаем в S3
+                    s3_url = await s3_storage.upload_file(img.image_path, s3_key)
+                    
+                    if s3_url:
+                        # Регистрируем в БД
+                        await supabase_client.add_image_to_message(
+                            chat_id=self.db_chat_id,
+                            message_id=msg_id,
+                            image_name=filename,
+                            s3_path=s3_key,
+                            s3_url=s3_url,
+                            image_type=img_type,
+                            description=img.description
+                        )
+                    else:
+                        logger.error(f"Не удалось загрузить {filename} в S3")
+                        
+        except Exception as e:
+            logger.error(f"Критическая ошибка в _save_to_db: {e}", exc_info=True)
 
     def _save_to_disk(self):
         history_path = self.chat_dir / "history.json"
@@ -174,29 +247,33 @@ class AgentWorker(QThread):
                 print(f"[GUI_AGENT] Получен ответ длиной {len(response)} символов")
                 print(f"[GUI_AGENT] Первые 300 символов ответа: {response[:300]}")
                 
-                zoom_req = llm_client.parse_zoom_request(response)
-                print(f"[GUI_AGENT] Zoom запрос: {zoom_req is not None}")
+                zoom_reqs = llm_client.parse_zoom_request(response)
+                print(f"[GUI_AGENT] Zoom запросов: {len(zoom_reqs)}")
                 
-                if zoom_req:
-                    zoom_msg = f"🔄 *Zoom:* {zoom_req.reason}"
-                    self.sig_log.emit(zoom_msg)
-                    self.sig_message.emit("assistant", zoom_msg)
-                    self.save_message("assistant", zoom_msg)
-                    
-                    zoom_crop = image_processor.process_zoom_request(
-                        zoom_req,
-                        output_path=self.images_dir / f"zoom_step_{step}.png"
-                    )
-                    
-                    if zoom_crop:
-                        if zoom_crop.image_path:
-                            self.sig_image.emit(zoom_crop.image_path, "Zoom Result")
-                            self.save_message("assistant", "Zoom Image", images=[zoom_crop])
-                            
-                        llm_client.add_user_message("Увеличенный фрагмент:", images=[zoom_crop])
+                if zoom_reqs:
+                    zoom_crops = []
+                    for i, zr in enumerate(zoom_reqs):
+                        zoom_msg = f"🔄 *Zoom [{i+1}/{len(zoom_reqs)}]:* {zr.reason}"
+                        self.sig_log.emit(zoom_msg)
+                        self.sig_message.emit("assistant", zoom_msg)
+                        self.save_message("assistant", zoom_msg)
+                        
+                        zoom_crop = image_processor.process_zoom_request(
+                            zr,
+                            output_path=self.images_dir / f"zoom_step_{step}_{i}.png"
+                        )
+                        
+                        if zoom_crop:
+                            zoom_crops.append(zoom_crop)
+                            if zoom_crop.image_path:
+                                self.sig_image.emit(zoom_crop.image_path, f"Zoom {i+1}")
+                        else:
+                            self.sig_log.emit(f"Ошибка Zoom {i+1}")
+
+                    if zoom_crops:
+                        llm_client.add_user_message("Результаты Zoom:", images=zoom_crops)
                     else:
-                        self.sig_log.emit("Ошибка Zoom")
-                        llm_client.add_user_message("Ошибка Zoom.")
+                        llm_client.add_user_message("Ошибка Zoom: не удалось получить фрагменты.")
                 else:
                     self.sig_message.emit("assistant", response)
                     self.save_message("assistant", response)

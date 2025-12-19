@@ -287,7 +287,7 @@ class LLMClient:
         
         raise ValueError("Не удалось получить ответ от модели после 3 попыток")
 
-    def parse_zoom_request(self, response_text: str) -> Optional[ZoomRequest]:
+    def parse_zoom_request(self, response_text: str) -> List[ZoomRequest]:
         response_text = response_text.strip()
         data = None
         
@@ -303,18 +303,27 @@ class LLMClient:
                 json_str = response_text.split("```")[1].split("```")[0].strip()
                 data = json.loads(json_str)
              except: pass
-        elif response_text.startswith("{"):
+        elif response_text.startswith("{") or response_text.startswith("["):
              try:
                 data = json.loads(response_text)
              except: pass
             
-        # Если найден tool: zoom, возвращаем ZoomRequest
-        if data and isinstance(data, dict) and data.get("tool") == "zoom":
-            return ZoomRequest(
-                page_number=data.get("page_number", 0),
-                image_id=data.get("image_id"),
-                coords_norm=data.get("coords_norm"),
-                coords_px=data.get("coords_px"),
-                reason=data.get("reason", "")
-            )
-        return None
+        # Превращаем в список, если это один объект
+        if isinstance(data, dict):
+            data_list = [data]
+        elif isinstance(data, list):
+            data_list = data
+        else:
+            return []
+            
+        zoom_requests = []
+        for item in data_list:
+            if isinstance(item, dict) and item.get("tool") == "zoom":
+                zoom_requests.append(ZoomRequest(
+                    page_number=item.get("page_number", 0),
+                    image_id=item.get("image_id"),
+                    coords_norm=item.get("coords_norm"),
+                    coords_px=item.get("coords_px"),
+                    reason=item.get("reason", "")
+                ))
+        return zoom_requests

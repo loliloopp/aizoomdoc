@@ -272,7 +272,91 @@ class SupabaseClient:
 
     # ===== Old Methods (Keep for interface compatibility but create_chat/add_image are overridden above) =====
     
-    # ... (get_chat, get_chats, update_chat, archive_chat, add_message, get_chat_messages remain same)
+    async def add_message(
+        self,
+        chat_id: str,
+        role: str,
+        content: str,
+        message_type: str = "text"
+    ) -> Optional[str]:
+        """Добавить сообщение в чат."""
+        if not self.is_connected():
+            return None
+        
+        try:
+            data = {
+                "chat_id": chat_id,
+                "role": role,
+                "content": content,
+                "message_type": message_type
+            }
+            response = self.client.table("chat_messages").insert(data).execute()
+            if response.data:
+                msg_id = response.data[0]["id"]
+                logger.info(f"✅ Сообщение добавлено: {msg_id}")
+                return msg_id
+            return None
+        except Exception as e:
+            logger.error(f"❌ Ошибка добавления сообщения: {e}")
+            return None
+
+    async def get_chat(self, chat_id: str) -> Optional[Dict[str, Any]]:
+        """Получить информацию о чате."""
+        if not self.is_connected(): return None
+        try:
+            response = self.client.table("chats").select("*").eq("id", chat_id).execute()
+            return response.data[0] if response.data else None
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения чата {chat_id}: {e}")
+            return None
+
+    async def get_chats(self, user_id: str = "default_user", limit: int = 50) -> List[Dict[str, Any]]:
+        """Получить список чатов пользователя."""
+        if not self.is_connected(): return []
+        try:
+            response = (
+                self.client.table("chats")
+                .select("*")
+                .eq("user_id", user_id)
+                .order("updated_at", desc=True)
+                .limit(limit)
+                .execute()
+            )
+            return response.data or []
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения чатов: {e}")
+            return []
+
+    async def update_chat(self, chat_id: str, data: Dict[str, Any]) -> bool:
+        """Обновить информацию о чате."""
+        if not self.is_connected(): return False
+        try:
+            data["updated_at"] = datetime.utcnow().isoformat()
+            self.client.table("chats").update(data).eq("id", chat_id).execute()
+            return True
+        except Exception as e:
+            logger.error(f"❌ Ошибка обновления чата {chat_id}: {e}")
+            return False
+
+    async def get_chat_messages(self, chat_id: str) -> List[Dict[str, Any]]:
+        """Получить все сообщения чата."""
+        if not self.is_connected(): return []
+        try:
+            response = (
+                self.client.table("chat_messages")
+                .select("*")
+                .eq("chat_id", chat_id)
+                .order("created_at", desc=False)
+                .execute()
+            )
+            return response.data or []
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения сообщений чата {chat_id}: {e}")
+            return []
+
+    async def archive_chat(self, chat_id: str) -> bool:
+        """Архивировать чат."""
+        return await self.update_chat(chat_id, {"is_archived": True})
     
     async def get_message_images(self, message_id: str) -> List[Dict[str, Any]]:
         """
