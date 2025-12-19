@@ -339,11 +339,18 @@ class S3Storage:
         Returns:
             Публичный URL
         """
+        # 1. Если включен Dev URL для разработки
+        if config.USE_S3_DEV_URL and config.S3_DEV_URL:
+            # Убеждаемся, что URL заканчивается на / для корректного склеивания
+            base_url = config.S3_DEV_URL.rstrip("/")
+            return f"{base_url}/{s3_key}"
+            
+        # 2. Если задан основной публичный домен (например Cloudflare R2 Custom Domain)
         if config.S3_PUBLIC_DOMAIN:
-            # Если задан публичный домен R2 (например https://pub-xxx.r2.dev)
-            return f"{config.S3_PUBLIC_DOMAIN}/{s3_key}"
+            base_url = config.S3_PUBLIC_DOMAIN.rstrip("/")
+            return f"{base_url}/{s3_key}"
         
-        # Если нет, возвращаем endpoint URL (может не работать публично без настройки прав)
+        # 3. Fallback: возвращаем URL через S3 Endpoint (может не работать публично)
         return f"{config.S3_ENDPOINT}/{config.S3_BUCKET}/{s3_key}"
     
     def generate_s3_path(

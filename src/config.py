@@ -74,6 +74,10 @@ class Config:
     # Публичный домен (опционально)
     S3_PUBLIC_DOMAIN: str = os.getenv("R2_PUBLIC_DOMAIN", "")
     
+    # Публичный URL для разработки (опционально, например через туннель или dev-домен)
+    S3_DEV_URL: str = os.getenv("S3_DEV_URL", "")
+    USE_S3_DEV_URL: bool = os.getenv("USE_S3_DEV_URL", "false").lower() == "true"
+    
     # Включить хранение в S3/R2
     USE_S3_STORAGE: bool = os.getenv("USE_S3_STORAGE", "true").lower() == "true"
     
