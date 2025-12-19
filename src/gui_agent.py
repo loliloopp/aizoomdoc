@@ -77,24 +77,11 @@ class AgentWorker(QThread):
     async def _save_to_db(self, role: str, content: str, images: list = None):
         """Асинхронное сохранение сообщения и картинок в Supabase и S3."""
         try:
-            # 1. Создаем чат если еще не создан
             if not self.db_chat_id:
-                title = self.query[:100]
-                self.db_chat_id = await supabase_client.create_chat(
-                    title=title,
-                    user_id="default_user",
-                    description=self.query,
-                    metadata={
-                        "local_chat_id": self.chat_id,
-                        "model": self.model,
-                        "md_files": self.md_files
-                    }
-                )
-                if not self.db_chat_id:
-                    logger.warning("Не удалось создать чат в Supabase")
-                    return
+                logger.warning("Supabase chat_id не инициализирован, сохранение невозможно")
+                return
 
-            # 2. Добавляем сообщение
+            # 1. Добавляем сообщение
             msg_id = await supabase_client.add_message(
                 chat_id=self.db_chat_id,
                 role=role,
@@ -105,11 +92,16 @@ class AgentWorker(QThread):
                 logger.warning("Не удалось сохранить сообщение в Supabase")
                 return
 
-            # 3. Если есть картинки - загружаем в S3 и регистрируем
+            # 2. Если есть картинки - загружаем в S3 и регистрируем
             if images:
+                processed_paths = set()
                 for img in images:
                     if not img.image_path or not Path(img.image_path).exists():
                         continue
+                    
+                    if img.image_path in processed_paths:
+                        continue
+                    processed_paths.add(img.image_path)
                         
                     # Генерируем путь в S3
                     img_type = "zoom_crop" if img.is_zoom_request else "viewport"
@@ -117,21 +109,38 @@ class AgentWorker(QThread):
                     s3_key = s3_storage.generate_s3_path(self.db_chat_id, img_type, filename)
                     
                     # Загружаем в S3
-                    s3_url = await s3_storage.upload_file(img.image_path, s3_key)
-                    
-                    if s3_url:
-                        # Регистрируем в БД
-                        await supabase_client.add_image_to_message(
-                            chat_id=self.db_chat_id,
-                            message_id=msg_id,
-                            image_name=filename,
-                            s3_path=s3_key,
-                            s3_url=s3_url,
-                            image_type=img_type,
-                            description=img.description
-                        )
-                    else:
-                        logger.error(f"Не удалось загрузить {filename} в S3")
+                    try:
+                        s3_url = await s3_storage.upload_file(img.image_path, s3_key)
+                        
+                        if s3_url:
+                            # Регистрируем в БД (это также создает запись в storage_files)
+                            await supabase_client.add_image_to_message(
+                                chat_id=self.db_chat_id,
+                                message_id=msg_id,
+                                image_name=filename,
+                                s3_path=s3_key,
+                                s3_url=s3_url,
+                                image_type=img_type,
+                                description=img.description
+                            )
+                            
+                            # ПРОВЕРКА: Если это превью, загружаем также и оригинал (full)
+                            if "_preview.png" in img.image_path:
+                                full_path = img.image_path.replace("_preview.png", "_full.png")
+                                if Path(full_path).exists():
+                                    s3_full_key = s3_key.replace("_preview.png", "_full.png")
+                                    await s3_storage.upload_file(full_path, s3_full_key)
+                                    # Просто регистрируем в хранилище файлов
+                                    await supabase_client.register_file(
+                                        user_id="default_user",
+                                        source_type="llm_generated",
+                                        filename=Path(full_path).name,
+                                        storage_path=s3_full_key
+                                    )
+                        else:
+                            logger.error(f"Не удалось загрузить {filename} в S3 (s3_url is None)")
+                    except Exception as upload_err:
+                        logger.error(f"Ошибка загрузки/регистрации изображения {filename}: {upload_err}")
                         
         except Exception as e:
             logger.error(f"Критическая ошибка в _save_to_db: {e}", exc_info=True)
@@ -146,15 +155,33 @@ class AgentWorker(QThread):
         try:
             self.sig_log.emit(f"Старт чата {self.chat_id}...")
             
+            # 0. Инициализация чата в Supabase (сразу, чтобы иметь ID)
+            if config.USE_DATABASE:
+                try:
+                    title = self.query[:100]
+                    self.db_chat_id = asyncio.run(supabase_client.create_chat(
+                        title=title,
+                        user_id="default_user",
+                        description=self.query,
+                        metadata={
+                            "local_chat_id": self.chat_id,
+                            "model": self.model,
+                            "md_files": self.md_files
+                        }
+                    ))
+                    if self.db_chat_id:
+                        self.sig_log.emit(f"Чат зарегистрирован в облаке: {self.db_chat_id}")
+                except Exception as e:
+                    logger.error(f"Ошибка создания чата в Supabase: {e}")
+
             image_processor = ImageProcessor(self.data_root)
             image_processor.temp_dir = self.images_dir
             
             llm_client = LLMClient(model=self.model, data_root=self.data_root)
             
             # Если указаны конкретные md файлы через GUI - используем их
-            # Иначе берем result.md из data_root
             full_text = ""
-            all_blocks = []  # Сохраняем все блоки для последующего использования
+            all_blocks = []
             
             if self.md_files:
                 self.sig_log.emit(f"Используются выбранные MD файлы: {len(self.md_files)}")
@@ -163,14 +190,41 @@ class AgentWorker(QThread):
                         md_path = Path(md_path_str)
                         self.sig_log.emit(f"Читаю: {md_path}")
                         
-                        # Передаем Path объект, а не строку
+                        # Загружаем MD в S3 и регистрируем в БД
+                        if self.db_chat_id:
+                            try:
+                                s3_doc_key = s3_storage.generate_s3_path(self.db_chat_id, "document", md_path.name)
+                                s3_url = asyncio.run(s3_storage.upload_file(str(md_path), s3_doc_key))
+                                
+                                asyncio.run(supabase_client.register_file(
+                                    user_id="default_user",
+                                    source_type="user_upload",
+                                    filename=md_path.name,
+                                    storage_path=s3_doc_key,
+                                    external_url=s3_url
+                                ))
+                            except Exception as e:
+                                logger.error(f"Ошибка загрузки/регистрации MD: {e}")
+
                         parser = MarkdownParser(md_path)
                         blocks = parser.parse()
-                        all_blocks.extend(blocks)  # Сохраняем блоки
+                        all_blocks.extend(blocks)
                         
                         self.sig_log.emit(f"Прочитано блоков: {len(blocks)}")
                         for block in blocks:
                             full_text += block.text + "\n\n"
+                            
+                            # Сохраняем блоки в search_results
+                            if self.db_chat_id:
+                                try:
+                                    asyncio.run(supabase_client.add_search_result(
+                                        chat_id=self.db_chat_id,
+                                        message_id=None,
+                                        block_id=block.block_id,
+                                        block_text=block.text[:1000]
+                                    ))
+                                except: pass
+
                     except Exception as e:
                         self.sig_log.emit(f"Ошибка чтения {md_path_str}: {e}")
                         import traceback
@@ -182,23 +236,40 @@ class AgentWorker(QThread):
                 if Path(markdown_path).exists():
                     parser = MarkdownParser(markdown_path)
                     blocks = parser.parse()
-                    all_blocks = blocks  # Сохраняем блоки
+                    all_blocks = blocks
+                    
+                    # Загружаем MD в S3
+                    if self.db_chat_id:
+                        try:
+                            s3_doc_key = s3_storage.generate_s3_path(self.db_chat_id, "document", Path(markdown_path).name)
+                            s3_url = asyncio.run(s3_storage.upload_file(str(markdown_path), s3_doc_key))
+                            asyncio.run(supabase_client.register_file(
+                                user_id="default_user",
+                                source_type="user_upload",
+                                filename=Path(markdown_path).name,
+                                storage_path=s3_doc_key,
+                                external_url=s3_url
+                            ))
+                        except: pass
+
                     for block in blocks:
                         full_text += block.text + "\n\n"
-                else:
-                    err_msg = f"result.md не найден в {self.data_root}. Выберите MD файлы через 'Обзор MD...' или укажите правильную папку в Настройках."
-                    self.sig_error.emit(err_msg)
-                    raise FileNotFoundError(err_msg)
+                        
+                        if self.db_chat_id:
+                            try:
+                                asyncio.run(supabase_client.add_search_result(
+                                    chat_id=self.db_chat_id,
+                                    message_id=None,
+                                    block_id=block.block_id,
+                                    block_text=block.text[:1000]
+                                ))
+                            except: pass
             
             if not full_text.strip():
                 raise ValueError("Документ пуст")
             
             self.sig_log.emit("Анализ запроса и выбор картинок...")
-            print(f"[GUI_AGENT] Вызываю select_relevant_images для запроса: {self.query}")
-            print(f"[GUI_AGENT] Размер документа: {len(full_text)} символов")
             selection = llm_client.select_relevant_images(full_text, self.query)
-            print(f"[GUI_AGENT] Результат: needs_images={selection.needs_images}, картинок={len(selection.image_urls)}")
-            print(f"[GUI_AGENT] Reasoning: {selection.reasoning}")
             
             self.sig_log.emit(f"Выбрано изображений: {len(selection.image_urls)}")
             
@@ -256,7 +327,6 @@ class AgentWorker(QThread):
                         zoom_msg = f"🔄 *Zoom [{i+1}/{len(zoom_reqs)}]:* {zr.reason}"
                         self.sig_log.emit(zoom_msg)
                         self.sig_message.emit("assistant", zoom_msg)
-                        self.save_message("assistant", zoom_msg)
                         
                         zoom_crop = image_processor.process_zoom_request(
                             zr,
@@ -271,9 +341,13 @@ class AgentWorker(QThread):
                             self.sig_log.emit(f"Ошибка Zoom {i+1}")
 
                     if zoom_crops:
+                        # Сохраняем в историю и БД ОДНИМ сообщением со всеми картинками
+                        reasons = " | ".join([zr.reason for zr in zoom_reqs])
+                        self.save_message("assistant", f"🔎 Выполнен Zoom:\n{reasons}", images=zoom_crops)
                         llm_client.add_user_message("Результаты Zoom:", images=zoom_crops)
                     else:
-                        llm_client.add_user_message("Ошибка Zoom: не удалось получить фрагменты.")
+                        self.sig_log.emit("Ошибка Zoom: не удалось получить фрагменты.")
+                        self.save_message("assistant", "⚠️ Ошибка Zoom: не удалось получить фрагменты.")
                 else:
                     self.sig_message.emit("assistant", response)
                     self.save_message("assistant", response)

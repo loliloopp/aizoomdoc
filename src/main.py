@@ -48,6 +48,19 @@ async def save_to_db(chat_id: str, role: str, content: str, images: list = None)
                         image_type=img_type,
                         description=img.description
                     )
+                    
+                    # ПРОВЕРКА: Загружаем также оригинал (full) если это превью
+                    if "_preview.png" in img.image_path:
+                        full_path = img.image_path.replace("_preview.png", "_full.png")
+                        if Path(full_path).exists():
+                            s3_full_key = s3_key.replace("_preview.png", "_full.png")
+                            await s3_storage.upload_file(full_path, s3_full_key)
+                            await supabase_client.register_file(
+                                user_id="cli_user",
+                                source_type="llm_generated",
+                                filename=Path(full_path).name,
+                                storage_path=s3_full_key
+                            )
     return msg_id
 
 def run_agent_loop(data_root: Path, user_query: str, model: str = None) -> str:

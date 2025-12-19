@@ -188,10 +188,7 @@ class SupabaseClient:
             
             # Обратная совместимость (если миграция не удалила колонку)
             if document_path and not document_file_id:
-                # В идеале здесь мы должны создать запись в storage_files и получить ID,
-                # но для простоты оставим как есть, если колонка существует.
-                # Если колонки нет, этот код вызовет ошибку Supabase, поэтому лучше проверить.
-                pass 
+                data["document_path"] = document_path
             
             response = self.client.table("chats").insert(data).execute()
             
