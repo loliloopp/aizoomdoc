@@ -28,6 +28,7 @@ class AgentWorker(QThread):
     sig_finished = pyqtSignal()
     sig_error = pyqtSignal(str)
     sig_history_saved = pyqtSignal(str, str)
+    sig_usage = pyqtSignal(int, int) # used, remaining
     
     def __init__(self, data_root: Path, query: str, model: str, md_files: List[str] = None, 
                  existing_chat_id: str = None, existing_db_chat_id: str = None):
@@ -349,6 +350,8 @@ class AgentWorker(QThread):
                         f"[Контекст/факт][выбор] prompt={pt}, completion={ct}, total={tt}, "
                         f"лимит={ctx if ctx is not None else 'неизв.'}, остаток={rem if rem is not None else 'неизв.'}"
                     )
+                    if isinstance(pt, int) and isinstance(rem, int):
+                        self.sig_usage.emit(pt, rem)
             except Exception:
                 pass
             
@@ -447,6 +450,8 @@ class AgentWorker(QThread):
                             f"[Контекст/факт][анализ] prompt={pt}, completion={ct}, total={tt}, "
                             f"лимит={ctx if ctx is not None else 'неизв.'}, остаток={rem if rem is not None else 'неизв.'}"
                         )
+                        if isinstance(pt, int) and isinstance(rem, int):
+                            self.sig_usage.emit(pt, rem)
                 except Exception:
                     pass
                 

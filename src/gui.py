@@ -884,6 +884,34 @@ class MainWindow(QMainWindow):
         self.lbl_data_root.setWordWrap(True)
         right_layout.addWidget(self.lbl_data_root)
         
+        # Счетчик использования
+        self.usage_frame = QFrame()
+        self.usage_frame.setStyleSheet("""
+            QFrame {
+                background-color: #f3f4f6;
+                border: 1px solid #e5e7eb;
+                border-radius: 8px;
+                padding: 4px;
+            }
+            QLabel {
+                font-size: 11px;
+                color: #4b5563;
+                border: none;
+                background: transparent;
+            }
+        """)
+        usage_layout = QHBoxLayout(self.usage_frame)
+        usage_layout.setContentsMargins(8, 4, 8, 4)
+        
+        self.lbl_used = QLabel("Использовано: 0")
+        self.lbl_remaining = QLabel("Осталось: 0")
+        
+        usage_layout.addWidget(self.lbl_used)
+        usage_layout.addStretch()
+        usage_layout.addWidget(self.lbl_remaining)
+        
+        right_layout.addWidget(self.usage_frame)
+        
         # Логи
         self.logs_label = QLabel("Логи выполнения")
         right_layout.addWidget(self.logs_label)
@@ -1047,6 +1075,11 @@ class MainWindow(QMainWindow):
     def log(self, text):
         self.log_view.append(f"{datetime.now().strftime('%H:%M:%S')} {text}")
 
+    def update_usage(self, used, remaining):
+        """Обновляет счетчик использованного и оставшегося контента."""
+        self.lbl_used.setText(f"Использовано: {used:,}".replace(",", " "))
+        self.lbl_remaining.setText(f"Осталось: {remaining:,}".replace(",", " "))
+
     def add_chat_message(self, role, text):
         w = ChatMessageWidget(role, text, is_dark_theme=self.is_dark_theme)
         self.chat_layout.insertWidget(self.chat_layout.count()-1, w)
@@ -1069,6 +1102,7 @@ class MainWindow(QMainWindow):
         self.clear_md_files()
         self.current_chat_id = None
         self.current_db_chat_id = None
+        self.update_usage(0, 0)
 
     def show_chat_context_menu(self, pos):
         """Контекстное меню для списка чатов."""
@@ -1294,6 +1328,7 @@ class MainWindow(QMainWindow):
         self.current_worker.sig_image.connect(self.add_chat_image)
         self.current_worker.sig_finished.connect(self.on_finished)
         self.current_worker.sig_history_saved.connect(self.on_history_saved)
+        self.current_worker.sig_usage.connect(self.update_usage)
         self.current_worker.start()
 
     def on_history_saved(self, chat_id, title):
