@@ -468,6 +468,18 @@ class SupabaseClient:
             return []
 
 
+    async def get_file_info(self, file_id: str) -> Optional[Dict[str, Any]]:
+        """Получить информацию о файле."""
+        if not self.is_connected(): return None
+        try:
+            response = self.client.table("storage_files").select("*").eq("id", file_id).execute()
+            if response.data:
+                return response.data[0]
+            return None
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения инфо о файле {file_id}: {e}")
+            return None
+
 # Глобальный экземпляр клиента
 supabase_client = SupabaseClient()
 

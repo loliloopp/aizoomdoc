@@ -510,17 +510,52 @@ class ImageMessageWidget(QFrame):
         
         # Изображение
         self.lbl_image = QLabel()
-        pixmap = QPixmap(image_path)
         
-        if pixmap.width() > 600:
-            pixmap = pixmap.scaledToWidth(600, Qt.TransformationMode.SmoothTransformation)
+        # Проверяем, это локальный путь или URL
+        if image_path.startswith(("http://", "https://")):
+            # Загружаем из сети асинхронно
+            self.lbl_image.setText("Загрузка изображения...")
+            self.load_image_from_url(image_path)
+        else:
+            pixmap = QPixmap(image_path)
+            if pixmap.width() > 600:
+                pixmap = pixmap.scaledToWidth(600, Qt.TransformationMode.SmoothTransformation)
+            self.lbl_image.setPixmap(pixmap)
             
-        self.lbl_image.setPixmap(pixmap)
         content_layout.addWidget(self.lbl_image)
         
         main_layout.addWidget(self.content_widget)
         
         self.apply_theme(is_dark_theme)
+
+    def load_image_from_url(self, url):
+        """Загружает изображение по URL и отображает его."""
+        import requests
+        from PyQt6.QtCore import QThread, pyqtSignal
+        
+        class ImageLoader(QThread):
+            finished = pyqtSignal(bytes)
+            def run(self):
+                try:
+                    response = requests.get(url, timeout=10)
+                    if response.status_code == 200:
+                        self.finished.emit(response.content)
+                except:
+                    pass
+        
+        self.loader = ImageLoader(self)
+        def on_loaded(data):
+            pixmap = QPixmap()
+            pixmap.loadFromData(data)
+            if not pixmap.isNull():
+                if pixmap.width() > 600:
+                    pixmap = pixmap.scaledToWidth(600, Qt.TransformationMode.SmoothTransformation)
+                self.lbl_image.setPixmap(pixmap)
+            else:
+                self.lbl_image.setText("Ошибка загрузки изображения")
+                
+        self.loader.finished.connect(on_loaded)
+        self.loader.start()
     
     def apply_theme(self, is_dark_theme):
         """Применяет тему к виджету изображения."""
@@ -1024,6 +1059,23 @@ class MainWindow(QMainWindow):
 
     def refresh_history_list(self):
         self.list_history.clear()
+        
+        # 1. Загружаем из облака, если включено
+        if config.USE_DATABASE and supabase_client.is_connected():
+            try:
+                chats = self.run_async(supabase_client.get_chats())
+                for chat in chats:
+                    title = chat.get("title") or chat.get("description", "Без названия")
+                    display_query = title[:45] + "..." if len(title) > 45 else title
+                    item = QListWidgetItem(f"☁️ {display_query}")
+                    item.setData(Qt.ItemDataRole.UserRole, chat["id"])
+                    item.setData(Qt.ItemDataRole.UserRole + 1, "cloud")
+                    item.setToolTip(title)
+                    self.list_history.addItem(item)
+            except Exception as e:
+                print(f"Ошибка загрузки чатов из БД: {e}")
+
+        # 2. Загружаем локальные чаты
         chats_dir = self.data_root / "chats"
         if not chats_dir.exists(): return
         
@@ -1040,6 +1092,7 @@ class MainWindow(QMainWindow):
                         display_query = query[:45] + "..." if len(query) > 45 else query
                         item = QListWidgetItem(f"💬 {display_query}")
                         item.setData(Qt.ItemDataRole.UserRole, str(hist_file))
+                        item.setData(Qt.ItemDataRole.UserRole + 1, "local")
                         item.setToolTip(query)  # Полный текст в подсказке
                         self.list_history.addItem(item)
                 except: pass
@@ -1049,8 +1102,51 @@ class MainWindow(QMainWindow):
         return asyncio.run(coro)
 
     def load_chat_history(self, item):
-        path = item.data(Qt.ItemDataRole.UserRole)
+        data_id = item.data(Qt.ItemDataRole.UserRole)
+        origin = item.data(Qt.ItemDataRole.UserRole + 1)
+        
         self.new_chat()
+        
+        if origin == "cloud":
+            try:
+                self.log(f"Загрузка чата {data_id} из облака...")
+                messages = self.run_async(supabase_client.get_chat_messages(data_id))
+                for msg in messages:
+                    role = msg.get("role", "user")
+                    content = msg.get("content", "")
+                    self.add_chat_message(role, content)
+                    
+                    # Проверяем наличие картинок в сообщении
+                    images = self.run_async(supabase_client.get_message_images(msg["id"]))
+                    for img in images:
+                        # В новой схеме путь лежит в storage_files, связанном через file_id
+                        # Проверяем оба варианта для совместимости
+                        s3_key = img.get("s3_key") # Старый вариант
+                        
+                        if not s3_key and img.get("file_id"):
+                            # Новый вариант: нужно получить storage_path из storage_files
+                            try:
+                                file_info = self.run_async(supabase_client.get_file_info(img["file_id"]))
+                                if file_info:
+                                    s3_key = file_info.get("storage_path")
+                            except: pass
+
+                        if s3_key and s3_storage.is_connected():
+                            # Получаем временный URL для отображения
+                            url = s3_storage.get_signed_url(s3_key)
+                            if url:
+                                # TODO: ImageMessageWidget пока не умеет грузить по URL
+                                # Но мы хотя бы пытаемся
+                                self.add_chat_image(url, "Из облака")
+                
+                self.log("История загружена из облака.")
+                return
+            except Exception as e:
+                self.log(f"Ошибка загрузки истории из облака: {e}")
+                return
+
+        # Локальная загрузка
+        path = data_id
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
