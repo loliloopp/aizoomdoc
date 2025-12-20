@@ -29,7 +29,8 @@ class AgentWorker(QThread):
     sig_error = pyqtSignal(str)
     sig_history_saved = pyqtSignal(str, str)
     
-    def __init__(self, data_root: Path, query: str, model: str, md_files: List[str] = None):
+    def __init__(self, data_root: Path, query: str, model: str, md_files: List[str] = None, 
+                 existing_chat_id: str = None, existing_db_chat_id: str = None):
         super().__init__()
         self.data_root = data_root
         self.query = query
@@ -37,23 +38,48 @@ class AgentWorker(QThread):
         self.md_files = md_files or []
         self.is_running = True
         
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.chat_id = f"{timestamp}_{uuid.uuid4().hex[:6]}"
+        if existing_chat_id:
+            self.chat_id = existing_chat_id
+            self.is_new_chat = False
+        else:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.chat_id = f"{timestamp}_{uuid.uuid4().hex[:6]}"
+            self.is_new_chat = True
         
         self.chat_dir = data_root / "chats" / self.chat_id
         self.images_dir = self.chat_dir / "images"
         self.chat_dir.mkdir(parents=True, exist_ok=True)
         self.images_dir.mkdir(parents=True, exist_ok=True)
         
-        self.chat_history_data = {
-            "id": self.chat_id,
-            "timestamp": timestamp,
-            "query": query,
-            "model": model,
-            "md_files": self.md_files,
-            "messages": []
-        }
-        self.db_chat_id = None
+        self.db_chat_id = existing_db_chat_id
+        
+        if self.is_new_chat:
+            self.chat_history_data = {
+                "id": self.chat_id,
+                "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S"),
+                "query": query,
+                "model": model,
+                "md_files": self.md_files,
+                "messages": []
+            }
+        else:
+            # Загружаем существующую историю
+            history_path = self.chat_dir / "history.json"
+            if history_path.exists():
+                with open(history_path, "r", encoding="utf-8") as f:
+                    self.chat_history_data = json.load(f)
+                    # Восстанавливаем список файлов из истории, если он не передан явно
+                    if not self.md_files and "md_files" in self.chat_history_data:
+                        self.md_files = self.chat_history_data["md_files"]
+            else:
+                self.chat_history_data = {
+                    "id": self.chat_id,
+                    "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S"),
+                    "query": query,
+                    "model": model,
+                    "md_files": self.md_files,
+                    "messages": []
+                }
 
     def save_message(self, role: str, content: str, images: list = None):
         msg = {
@@ -91,6 +117,8 @@ class AgentWorker(QThread):
             if not msg_id:
                 logger.warning("Не удалось сохранить сообщение в Supabase")
                 return
+            
+            self._current_msg_id = msg_id # Сохраняем для привязки результатов поиска
 
             # 2. Если есть картинки - загружаем в S3 и регистрируем
             if images:
@@ -154,9 +182,10 @@ class AgentWorker(QThread):
     def run(self):
         try:
             self.sig_log.emit(f"Старт чата {self.chat_id}...")
+            self._current_msg_id = None # Для привязки блоков к сообщению
             
-            # 0. Инициализация чата в Supabase (сразу, чтобы иметь ID)
-            if config.USE_DATABASE:
+            # 0. Инициализация чата в Supabase (только для новых чатов)
+            if config.USE_DATABASE and not self.db_chat_id:
                 try:
                     title = self.query[:100]
                     self.db_chat_id = asyncio.run(supabase_client.create_chat(
@@ -179,10 +208,23 @@ class AgentWorker(QThread):
             
             llm_client = LLMClient(model=self.model, data_root=self.data_root)
             
+            # Инициализируем диалог с историей, если она есть
+            from .llm_client import load_analysis_prompt
+            analysis_prompt = load_analysis_prompt(self.data_root)
+            llm_client.history = [{"role": "system", "content": analysis_prompt}]
+            
+            for msg in self.chat_history_data.get("messages", []):
+                # Для истории добавляем как простые текстовые сообщения
+                # (картинки из истории пока не прокидываем в контекст для простоты, 
+                # но они есть в самих сообщениях если нужно будет)
+                llm_client.history.append({"role": msg["role"], "content": msg["content"]})
+
             # Если указаны конкретные md файлы через GUI - используем их
             full_text = ""
             all_blocks = []
             
+            # ВАЖНО: Если мы продолжаем чат, нам все равно нужен текст документа в контексте.
+            # Для варианта A мы просто заново читаем файлы.
             if self.md_files:
                 self.sig_log.emit(f"Используются выбранные MD файлы: {len(self.md_files)}")
                 for md_path_str in self.md_files:
@@ -214,16 +256,15 @@ class AgentWorker(QThread):
                         for block in blocks:
                             full_text += block.text + "\n\n"
                             
-                            # Сохраняем блоки в search_results
-                            if self.db_chat_id:
-                                try:
-                                    asyncio.run(supabase_client.add_search_result(
-                                        chat_id=self.db_chat_id,
-                                        message_id=None,
-                                        block_id=block.block_id,
-                                        block_text=block.text[:1000]
-                                    ))
-                                except: pass
+                        # Сохраняем блоки в search_results
+                        if self.db_chat_id:
+                            try:
+                                # Для варианта A привязываем блоки к чату.
+                                # Если в БД message_id обязателен, то для первичного индекса 
+                                # мы пока пропускаем или привязываем к будущему сообщению.
+                                pass
+                            except Exception as e:
+                                logger.error(f"Ошибка сохранения блока: {e}")
 
                     except Exception as e:
                         self.sig_log.emit(f"Ошибка чтения {md_path_str}: {e}")
@@ -266,12 +307,50 @@ class AgentWorker(QThread):
                             except: pass
             
             if not full_text.strip():
-                raise ValueError("Документ пуст")
+                raise ValueError("В чате нет прикрепленных документов для анализа. Прикрепите .md файлы.")
             
             self.sig_log.emit("Анализ запроса и выбор картинок...")
+            
+            # ВАЖНО: Если в сессии уже есть история, добавляем ее в контекст выбора картинок.
+            # Для этапа 1 (выбор) мы передаем только текущий запрос, но можно добавить краткий контекст.
             selection = llm_client.select_relevant_images(full_text, self.query)
+
+            # Прогноз по контексту для выбора картинок
+            try:
+                est = llm_client.last_prompt_estimate_selection
+                if est:
+                    ctx = est.get("context_length")
+                    prompt_est = est.get("prompt_tokens_est")
+                    max_tokens = est.get("max_tokens")
+                    img_cnt = est.get("image_count")
+                    rem = est.get("remaining_after_max_completion")
+                    overflow = est.get("will_overflow")
+                    self.sig_log.emit(
+                        f"[Контекст/прогноз][выбор] prompt≈{prompt_est} tok (картинок: {img_cnt}), max={max_tokens}, "
+                        f"лимит={ctx if ctx is not None else 'неизв.'}, "
+                        f"остаток≈{rem if rem is not None else 'неизв.'}, "
+                        f"{'⚠️ риск лимита' if overflow else 'OK'}"
+                    )
+            except Exception:
+                pass
             
             self.sig_log.emit(f"Выбрано изображений: {len(selection.image_urls)}")
+
+            # Факт по usage для выбора картинок
+            try:
+                usage = llm_client.last_usage_selection
+                if isinstance(usage, dict) and usage.get("prompt_tokens") is not None:
+                    pt = usage.get("prompt_tokens")
+                    ct = usage.get("completion_tokens")
+                    tt = usage.get("total_tokens")
+                    ctx = llm_client.get_model_context_length()
+                    rem = (ctx - pt) if (isinstance(ctx, int) and isinstance(pt, int)) else None
+                    self.sig_log.emit(
+                        f"[Контекст/факт][выбор] prompt={pt}, completion={ct}, total={tt}, "
+                        f"лимит={ctx if ctx is not None else 'неизв.'}, остаток={rem if rem is not None else 'неизв.'}"
+                    )
+            except Exception:
+                pass
             
             downloaded_images = []
             if selection.needs_images and selection.image_urls:
@@ -304,6 +383,24 @@ class AgentWorker(QThread):
             
             self.save_message("user", self.query, images=downloaded_images)
             
+            # После сохранения первого сообщения пользователя у нас есть message_id.
+            # Теперь можно сохранить блоки поиска ПАКЕТНО, привязав их к этому сообщению.
+            if self.db_chat_id and hasattr(self, '_current_msg_id') and self._current_msg_id:
+                bulk_data = []
+                for block in all_blocks:
+                    bulk_data.append({
+                        "chat_id": self.db_chat_id,
+                        "message_id": self._current_msg_id,
+                        "block_id": block.block_id,
+                        "block_text": block.text[:1000]
+                    })
+                
+                if bulk_data:
+                    try:
+                        asyncio.run(supabase_client.add_search_results_bulk(bulk_data))
+                    except Exception as e:
+                        logger.error(f"Ошибка пакетного сохранения блоков: {e}")
+
             llm_client.add_user_message(context, images=downloaded_images)
             
             step = 0
@@ -313,10 +410,45 @@ class AgentWorker(QThread):
                 step += 1
                 print(f"[GUI_AGENT] === ШАГ {step} ===")
                 self.sig_log.emit(f"Шаг {step}...")
+
+                # Прогноз по контексту перед запросом (анализ)
+                try:
+                    est = llm_client.last_prompt_estimate or llm_client.build_context_report(llm_client.history, max_tokens=4000)
+                    if est:
+                        ctx = est.get("context_length")
+                        prompt_est = est.get("prompt_tokens_est")
+                        max_tokens = est.get("max_tokens")
+                        img_cnt = est.get("image_count")
+                        rem = est.get("remaining_after_max_completion")
+                        overflow = est.get("will_overflow")
+                        self.sig_log.emit(
+                            f"[Контекст/прогноз][анализ] prompt≈{prompt_est} tok (картинок: {img_cnt}), max={max_tokens}, "
+                            f"лимит={ctx if ctx is not None else 'неизв.'}, "
+                            f"остаток≈{rem if rem is not None else 'неизв.'}, "
+                            f"{'⚠️ риск лимита' if overflow else 'OK'}"
+                        )
+                except Exception:
+                    pass
                 
                 response = llm_client.get_response()
                 print(f"[GUI_AGENT] Получен ответ длиной {len(response)} символов")
                 print(f"[GUI_AGENT] Первые 300 символов ответа: {response[:300]}")
+
+                # Факт по usage (анализ)
+                try:
+                    usage = llm_client.last_usage
+                    if isinstance(usage, dict) and usage.get("prompt_tokens") is not None:
+                        pt = usage.get("prompt_tokens")
+                        ct = usage.get("completion_tokens")
+                        tt = usage.get("total_tokens")
+                        ctx = llm_client.get_model_context_length()
+                        rem = (ctx - pt) if (isinstance(ctx, int) and isinstance(pt, int)) else None
+                        self.sig_log.emit(
+                            f"[Контекст/факт][анализ] prompt={pt}, completion={ct}, total={tt}, "
+                            f"лимит={ctx if ctx is not None else 'неизв.'}, остаток={rem if rem is not None else 'неизв.'}"
+                        )
+                except Exception:
+                    pass
                 
                 zoom_reqs = llm_client.parse_zoom_request(response)
                 print(f"[GUI_AGENT] Zoom запросов: {len(zoom_reqs)}")

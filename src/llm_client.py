@@ -15,6 +15,53 @@ from .models import ViewportCrop, ZoomRequest, ImageSelection
 
 logger = logging.getLogger(__name__)
 
+
+def _estimate_tokens_for_text(text: str) -> int:
+    """
+    Грубая оценка токенов по размеру текста.
+
+    Важно: это НЕ точный токенайзер конкретной модели. Используется только для прогноза.
+    """
+    if not text:
+        return 0
+    # Эвристика: ~4 байта UTF‑8 на 1 токен (приблизительно).
+    return max(1, int(len(text.encode("utf-8")) / 4))
+
+
+def estimate_prompt_tokens(messages: List[Dict[str, Any]], image_token_cost: int = 1200) -> Dict[str, int]:
+    """
+    Грубая оценка prompt-токенов для messages в OpenAI-compatible chat формате.
+
+    - Текст считаем по эвристике.
+    - Картинки считаем как фиксированную стоимость (очень грубо), т.к. base64/URL не отражают реальную стоимость vision-токенов.
+    """
+    text_tokens = 0
+    image_count = 0
+
+    for msg in messages:
+        content = msg.get("content", "")
+        # OpenRouter принимает и строку, и multimodal list.
+        if isinstance(content, str):
+            text_tokens += _estimate_tokens_for_text(content)
+            continue
+
+        if isinstance(content, list):
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") == "text":
+                    text_tokens += _estimate_tokens_for_text(part.get("text", ""))
+                elif part.get("type") == "image_url":
+                    image_count += 1
+
+    image_tokens = image_count * max(0, int(image_token_cost))
+    return {
+        "text_tokens_est": text_tokens,
+        "image_count": image_count,
+        "image_tokens_est": image_tokens,
+        "prompt_tokens_est": text_tokens + image_tokens,
+    }
+
 # Промт для этапа 1: Выбор картинок
 SELECTION_PROMPT = """Ты — ассистент по анализу технической документации.
 Твоя задача — найти в тексте ИЗОБРАЖЕНИЯ, необходимые для ответа на запрос пользователя.
@@ -134,6 +181,68 @@ class LLMClient:
         self.history: List[Dict[str, Any]] = [] 
         # Системный промт добавляется позже, в зависимости от режима
 
+        # Контроль контекста / usage
+        self._context_length_cache: Dict[str, int] = {}
+        self.last_usage: Optional[Dict[str, int]] = None
+        self.last_usage_selection: Optional[Dict[str, int]] = None
+        self.last_prompt_estimate: Optional[Dict[str, int]] = None
+        self.last_prompt_estimate_selection: Optional[Dict[str, int]] = None
+
+    def get_model_context_length(self) -> Optional[int]:
+        """
+        Пытается получить длину контекста выбранной модели через OpenRouter /models.
+        Кэширует результат.
+        """
+        if self.model in self._context_length_cache:
+            return self._context_length_cache[self.model]
+
+        try:
+            resp = requests.get(
+                f"{self.base_url}/models",
+                headers=self.headers,
+                timeout=30
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            models = data.get("data") or data.get("models") or []
+            for m in models:
+                if isinstance(m, dict) and m.get("id") == self.model:
+                    ctx = m.get("context_length") or m.get("context_length_tokens") or m.get("context") or None
+                    if isinstance(ctx, int) and ctx > 0:
+                        self._context_length_cache[self.model] = ctx
+                        return ctx
+        except Exception as e:
+            logger.warning(f"Не удалось получить context_length модели {self.model}: {e}")
+
+        return None
+
+    def build_context_report(self, messages: List[Dict[str, Any]], max_tokens: int) -> Dict[str, Any]:
+        """
+        Возвращает прогноз по текущему запросу:
+        - оценка prompt токенов
+        - лимит контекста (если удалось получить)
+        - сколько осталось / риск переполнения
+        """
+        est = estimate_prompt_tokens(messages)
+        ctx = self.get_model_context_length()
+
+        report: Dict[str, Any] = {
+            "model": self.model,
+            "context_length": ctx,
+            **est,
+            "max_tokens": max_tokens,
+            "will_overflow": None,
+            "remaining_after_prompt": None,
+            "remaining_after_max_completion": None,
+        }
+
+        if isinstance(ctx, int) and ctx > 0:
+            report["remaining_after_prompt"] = ctx - est["prompt_tokens_est"]
+            report["remaining_after_max_completion"] = ctx - (est["prompt_tokens_est"] + max_tokens)
+            report["will_overflow"] = (est["prompt_tokens_est"] + max_tokens) > ctx
+
+        return report
+
     def encode_image(self, path: str) -> str:
         with open(path, "rb") as f:
             return base64.b64encode(f.read()).decode("utf-8")
@@ -151,6 +260,9 @@ class LLMClient:
             {"role": "system", "content": selection_prompt},
             {"role": "user", "content": f"ЗАПРОС: {query}\n\nДОКУМЕНТ:\n{text_context}"}
         ]
+
+        # Прогноз (очень грубо)
+        self.last_prompt_estimate_selection = self.build_context_report(messages, max_tokens=800)
         
         # Попытки повтора для выбора картинок
         max_retries = 3
@@ -164,6 +276,7 @@ class LLMClient:
                         "model": self.model, 
                         "messages": messages, 
                         "temperature": 0.1,
+                        "max_tokens": 800,
                         "response_format": {"type": "json_object"}
                     },
                     timeout=120
@@ -177,6 +290,7 @@ class LLMClient:
                 
                 resp.raise_for_status()
                 response_data = resp.json()
+                self.last_usage_selection = response_data.get("usage") if isinstance(response_data, dict) else None
                 
                 if not response_data.get("choices"):
                     continue
@@ -253,6 +367,9 @@ class LLMClient:
                     "temperature": 0.2,
                     "max_tokens": 4000  # Увеличим лимит токенов
                 }
+
+                # Прогноз (очень грубо)
+                self.last_prompt_estimate = self.build_context_report(self.history, max_tokens=payload["max_tokens"])
                 
                 resp = requests.post(
                     f"{self.base_url}/chat/completions",
@@ -269,6 +386,7 @@ class LLMClient:
                 
                 resp.raise_for_status()
                 response_data = resp.json()
+                self.last_usage = response_data.get("usage") if isinstance(response_data, dict) else None
                 
                 if not response_data.get("choices"):
                     print(f"[GET_RESPONSE] ⚠️ Попытка {attempt+1}: Нет choices в ответе")

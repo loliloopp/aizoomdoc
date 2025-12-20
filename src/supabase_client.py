@@ -3,6 +3,7 @@
 """
 
 import logging
+import asyncio
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 from uuid import UUID
@@ -39,6 +40,23 @@ class SupabaseClient:
         """Проверить подключение к БД."""
         return self.client is not None
     
+    async def _retry_request(self, func, *args, max_retries: int = 3, delay: float = 1.0, **kwargs):
+        """Вспомогательный метод для повторных попыток при сетевых ошибках."""
+        last_err = None
+        for i in range(max_retries):
+            try:
+                return await func(*args, **kwargs)
+            except Exception as e:
+                last_err = e
+                err_str = str(e).lower()
+                if "disconnected" in err_str or "timeout" in err_str or "connection" in err_str:
+                    logger.warning(f"⚠️ Сетевая ошибка (попытка {i+1}/{max_retries}): {e}. Жду {delay}с...")
+                    await asyncio.sleep(delay)
+                    delay *= 2 # Экспоненциальная задержка
+                    continue
+                raise e
+        raise last_err
+
     # ===== Folder & File Operations (V2) =====
     
     async def create_folder(self, name: str, user_id: str = "default_user", parent_id: Optional[str] = None, slug: Optional[str] = None) -> Optional[str]:
@@ -278,25 +296,28 @@ class SupabaseClient:
         content: str,
         message_type: str = "text"
     ) -> Optional[str]:
-        """Добавить сообщение в чат."""
+        """Добавить сообщение в чат с поддержкой повторных попыток."""
         if not self.is_connected():
             return None
         
-        try:
+        async def _do_insert():
             data = {
                 "chat_id": chat_id,
                 "role": role,
                 "content": content,
                 "message_type": message_type
             }
-            response = self.client.table("chat_messages").insert(data).execute()
+            return self.client.table("chat_messages").insert(data).execute()
+
+        try:
+            response = await self._retry_request(_do_insert)
             if response.data:
                 msg_id = response.data[0]["id"]
                 logger.info(f"✅ Сообщение добавлено: {msg_id}")
                 return msg_id
             return None
         except Exception as e:
-            logger.error(f"❌ Ошибка добавления сообщения: {e}")
+            logger.error(f"❌ Ошибка добавления сообщения после попыток: {e}")
             return None
 
     async def get_chat(self, chat_id: str) -> Optional[Dict[str, Any]]:
@@ -400,6 +421,28 @@ class SupabaseClient:
     
     # ===== Search Results Operations =====
     
+    async def add_search_results_bulk(
+        self,
+        results: List[Dict[str, Any]]
+    ) -> bool:
+        """
+        Пакетное добавление результатов поиска.
+        Каждый элемент в results должен содержать: chat_id, message_id, block_id, etc.
+        """
+        if not self.is_connected() or not results:
+            return False
+            
+        async def _do_bulk_insert():
+            return self.client.table("search_results").insert(results).execute()
+
+        try:
+            await self._retry_request(_do_bulk_insert)
+            logger.info(f"✅ Пакетно добавлено результатов поиска: {len(results)}")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Ошибка пакетного добавления результатов: {e}")
+            return False
+
     async def add_search_result(
         self,
         chat_id: str,

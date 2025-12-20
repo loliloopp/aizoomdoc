@@ -628,6 +628,8 @@ class MainWindow(QMainWindow):
         
         self.current_worker = None
         self.selected_md_files = []
+        self.current_chat_id = None
+        self.current_db_chat_id = None
         
         # Меню
         self.menubar = self.menuBar()
@@ -1065,6 +1067,8 @@ class MainWindow(QMainWindow):
         self.btn_send.setEnabled(True)
         self.btn_attach.setEnabled(True)
         self.clear_md_files()
+        self.current_chat_id = None
+        self.current_db_chat_id = None
 
     def show_chat_context_menu(self, pos):
         """Контекстное меню для списка чатов."""
@@ -1193,7 +1197,16 @@ class MainWindow(QMainWindow):
         
         if origin == "cloud":
             try:
+                self.current_db_chat_id = data_id
                 self.log(f"Загрузка чата {data_id} из облака...")
+                
+                # Загружаем инфо о чате для получения метаданных (local_chat_id)
+                chat_info = self.run_async(supabase_client.get_chat(data_id))
+                if chat_info and "metadata" in chat_info:
+                    self.current_chat_id = chat_info["metadata"].get("local_chat_id")
+                    self.selected_md_files = chat_info["metadata"].get("md_files", [])
+                    self.update_file_indicator()
+
                 messages = self.run_async(supabase_client.get_chat_messages(data_id))
                 for msg in messages:
                     role = msg.get("role", "user")
@@ -1234,6 +1247,10 @@ class MainWindow(QMainWindow):
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
+                self.current_chat_id = data.get("id")
+                self.selected_md_files = data.get("md_files", [])
+                self.update_file_indicator()
+                
                 for msg in data.get("messages", []):
                     self.add_chat_message(msg["role"], msg["content"])
                     if "images" in msg:
@@ -1247,10 +1264,13 @@ class MainWindow(QMainWindow):
         query = self.txt_input.toPlainText().strip()
         if not query: return
         
-        # ВАЖНО: Сохраняем список файлов ДО очистки чата!
+        # ВАЖНО: Сохраняем список файлов
         files_to_use = self.selected_md_files.copy()
         
-        self.new_chat()
+        # Если это новый вопрос в существующем чате - не очищаем чат
+        if not self.current_chat_id:
+            self.new_chat()
+            
         self.add_chat_message("user", query)
         self.txt_input.clear()
         self.txt_input.setEnabled(False)
@@ -1260,19 +1280,29 @@ class MainWindow(QMainWindow):
         
         mid = self.combo_models.currentData()
         
-        # Передаем сохраненные md файлы в воркера
+        # Передаем сохраненные md файлы и текущие ID чата в воркера
         self.current_worker = AgentWorker(
             self.data_root, 
             query, 
             mid, 
-            md_files=files_to_use
+            md_files=files_to_use,
+            existing_chat_id=self.current_chat_id,
+            existing_db_chat_id=self.current_db_chat_id
         )
         self.current_worker.sig_log.connect(self.log)
         self.current_worker.sig_message.connect(self.add_chat_message)
         self.current_worker.sig_image.connect(self.add_chat_image)
         self.current_worker.sig_finished.connect(self.on_finished)
-        self.current_worker.sig_history_saved.connect(self.refresh_history_list)
+        self.current_worker.sig_history_saved.connect(self.on_history_saved)
         self.current_worker.start()
+
+    def on_history_saved(self, chat_id, title):
+        """Обновляет текущие ID чата после первого сохранения."""
+        self.current_chat_id = chat_id
+        # Если воркер сохранил db_chat_id, мы должны его тоже запомнить
+        if hasattr(self.current_worker, 'db_chat_id'):
+            self.current_db_chat_id = self.current_worker.db_chat_id
+        self.refresh_history_list()
 
     def on_finished(self):
         self.txt_input.setEnabled(True)
