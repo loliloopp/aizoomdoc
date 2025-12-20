@@ -513,6 +513,8 @@ class ImageMessageWidget(QFrame):
         
         # Описание
         self.lbl_desc = QLabel(f"🖼 {description}")
+        self.lbl_desc.setWordWrap(True)
+        self.lbl_desc.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         content_layout.addWidget(self.lbl_desc)
         
         # Изображение
