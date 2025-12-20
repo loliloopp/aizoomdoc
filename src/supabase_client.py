@@ -357,6 +357,20 @@ class SupabaseClient:
         """Архивировать чат."""
         return await self.update_chat(chat_id, {"is_archived": True})
     
+    async def delete_chat(self, chat_id: str) -> bool:
+        """
+        Полностью удалить чат из БД.
+        Связанные сообщения, картинки и результаты поиска будут удалены каскадно.
+        """
+        if not self.is_connected(): return False
+        try:
+            self.client.table("chats").delete().eq("id", chat_id).execute()
+            logger.info(f"✅ Чат удален из БД: {chat_id}")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Ошибка удаления чата {chat_id} из БД: {e}")
+            return False
+    
     async def get_message_images(self, message_id: str) -> List[Dict[str, Any]]:
         """
         Получить все картинки сообщения.

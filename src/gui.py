@@ -715,6 +715,8 @@ class MainWindow(QMainWindow):
         # Список истории
         self.list_history = QListWidget()
         self.list_history.itemClicked.connect(self.load_chat_history)
+        self.list_history.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.list_history.customContextMenuRequested.connect(self.show_chat_context_menu)
         chats_layout.addWidget(self.list_history)
         
         left_layout.addWidget(self.chats_widget)
@@ -1056,6 +1058,81 @@ class MainWindow(QMainWindow):
         self.btn_send.setEnabled(True)
         self.btn_attach.setEnabled(True)
         self.clear_md_files()
+
+    def show_chat_context_menu(self, pos):
+        """Контекстное меню для списка чатов."""
+        item = self.list_history.itemAt(pos)
+        if not item: return
+        
+        menu = QMenu()
+        delete_action = menu.addAction("🗑️ Удалить чат")
+        
+        action = menu.exec(self.list_history.mapToGlobal(pos))
+        if action == delete_action:
+            self.confirm_delete_chat(item)
+
+    def confirm_delete_chat(self, item):
+        """Подтверждение удаления чата."""
+        chat_name = item.text()
+        reply = QMessageBox.question(
+            self, "Удаление чата",
+            f"Вы уверены, что хотите полностью удалить чат '{chat_name}'?\n"
+            "Это удалит данные из БД, S3 и локальной папки.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        
+        if reply == QMessageBox.StandardButton.Yes:
+            self.perform_delete_chat(item)
+
+    def perform_delete_chat(self, item):
+        """Выполнение удаления чата (БД + S3 + Локально)."""
+        data_id = item.data(Qt.ItemDataRole.UserRole)
+        origin = item.data(Qt.ItemDataRole.UserRole + 1)
+        
+        try:
+            if origin == "cloud":
+                # 1. Получаем инфо о чате для метаданных
+                chat_info = self.run_async(supabase_client.get_chat(data_id))
+                local_chat_id = None
+                if chat_info and "metadata" in chat_info:
+                    local_chat_id = chat_info["metadata"].get("local_chat_id")
+                
+                # 2. Удаляем из S3
+                if s3_storage.is_connected():
+                    self.log(f"Удаление файлов чата {data_id} из S3...")
+                    # Удаляем и картинки и документы этого чата
+                    self.run_async(s3_storage.delete_folder(f"chats/{data_id}/"))
+                
+                # 3. Удаляем из БД
+                self.log(f"Удаление чата {data_id} из БД...")
+                self.run_async(supabase_client.delete_chat(data_id))
+                
+                # 4. Удаляем локальную папку (если есть)
+                if local_chat_id:
+                    local_dir = self.data_root / "chats" / local_chat_id
+                    if local_dir.exists():
+                        self.log(f"Удаление локальной папки {local_chat_id}...")
+                        shutil.rmtree(local_dir)
+                else:
+                    # Попытка найти локальную папку по названию если UUID не совпадает
+                    # (на случай если мы в облаке видим чат, созданный на этой же машине)
+                    pass
+            else:
+                # Локальное удаление
+                history_file = Path(data_id)
+                chat_dir = history_file.parent
+                if chat_dir.exists():
+                    self.log(f"Удаление локальной папки {chat_dir.name}...")
+                    shutil.rmtree(chat_dir)
+            
+            self.log("Чат успешно удален.")
+            self.refresh_history_list()
+            # Очищаем текущий экран чата
+            self.new_chat()
+            
+        except Exception as e:
+            self.log(f"Ошибка при удалении чата: {e}")
+            QMessageBox.critical(self, "Ошибка", f"Не удалось полностью удалить чат: {e}")
 
     def refresh_history_list(self):
         self.list_history.clear()
