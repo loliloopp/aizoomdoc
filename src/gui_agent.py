@@ -213,12 +213,25 @@ class AgentWorker(QThread):
             from .llm_client import load_analysis_prompt
             analysis_prompt = load_analysis_prompt(self.data_root)
             llm_client.history = [{"role": "system", "content": analysis_prompt}]
-            
-            for msg in self.chat_history_data.get("messages", []):
-                # Для истории добавляем как простые текстовые сообщения
-                # (картинки из истории пока не прокидываем в контекст для простоты, 
-                # но они есть в самих сообщениях если нужно будет)
-                llm_client.history.append({"role": msg["role"], "content": msg["content"]})
+
+            # Краткая память диалога (устойчиво для длинных чатов)
+            memory_path = self.chat_dir / "memory.txt"
+            if memory_path.exists():
+                try:
+                    memory_text = memory_path.read_text(encoding="utf-8").strip()
+                    if memory_text:
+                        llm_client.history.append(
+                            {"role": "system", "content": f"КРАТКАЯ ПАМЯТЬ ДИАЛОГА (обновляется автоматически):\n{memory_text}"}
+                        )
+                except Exception as e:
+                    logger.warning(f"Не удалось прочитать memory.txt: {e}")
+
+            # Для истории добавляем только последние сообщения (остальное сжимается в memory.txt).
+            # Это предотвращает рост контекста в бесконечном диалоге.
+            history_messages = self.chat_history_data.get("messages", [])
+            tail_n = 12
+            for msg in history_messages[-tail_n:]:
+                llm_client.history.append({"role": msg.get("role", "user"), "content": msg.get("content", "")})
 
             # Если указаны конкретные md файлы через GUI - используем их
             full_text = ""
@@ -309,82 +322,46 @@ class AgentWorker(QThread):
             
             if not full_text.strip():
                 raise ValueError("В чате нет прикрепленных документов для анализа. Прикрепите .md файлы.")
-            
-            self.sig_log.emit("Анализ запроса и выбор картинок...")
-            
-            # ВАЖНО: Если в сессии уже есть история, добавляем ее в контекст выбора картинок.
-            # Для этапа 1 (выбор) мы передаем только текущий запрос, но можно добавить краткий контекст.
-            selection = llm_client.select_relevant_images(full_text, self.query)
 
-            # Прогноз по контексту для выбора картинок
-            try:
-                est = llm_client.last_prompt_estimate_selection
-                if est:
-                    ctx = est.get("context_length")
-                    prompt_est = est.get("prompt_tokens_est")
-                    max_tokens = est.get("max_tokens")
-                    img_cnt = est.get("image_count")
-                    rem = est.get("remaining_after_max_completion")
-                    overflow = est.get("will_overflow")
-                    self.sig_log.emit(
-                        f"[Контекст/прогноз][выбор] prompt≈{prompt_est} tok (картинок: {img_cnt}), max={max_tokens}, "
-                        f"лимит={ctx if ctx is not None else 'неизв.'}, "
-                        f"остаток≈{rem if rem is not None else 'неизв.'}, "
-                        f"{'⚠️ риск лимита' if overflow else 'OK'}"
-                    )
-            except Exception:
-                pass
-            
-            self.sig_log.emit(f"Выбрано изображений: {len(selection.image_urls)}")
+            # ===== Новая устойчивая схема для длинного диалога =====
+            # 1) Локально индексируем документ (извлекаем каталог изображений и делаем чанки текста),
+            # чтобы не заставлять модель возвращать длинные URL и не пересылать весь документ целиком.
+            self.sig_log.emit("Индексирую документ и готовлю краткий контекст (retrieval)...")
 
-            # Факт по usage для выбора картинок
-            try:
-                usage = llm_client.last_usage_selection
-                if isinstance(usage, dict) and usage.get("prompt_tokens") is not None:
-                    pt = usage.get("prompt_tokens")
-                    ct = usage.get("completion_tokens")
-                    tt = usage.get("total_tokens")
-                    ctx = llm_client.get_model_context_length()
-                    rem = (ctx - pt) if (isinstance(ctx, int) and isinstance(pt, int)) else None
-                    self.sig_log.emit(
-                        f"[Контекст/факт][выбор] prompt={pt}, completion={ct}, total={tt}, "
-                        f"лимит={ctx if ctx is not None else 'неизв.'}, остаток={rem if rem is not None else 'неизв.'}"
-                    )
-                    if isinstance(pt, int) and isinstance(rem, int):
-                        self.sig_usage.emit(pt, rem)
-            except Exception:
-                pass
-            
-            downloaded_images = []
-            if selection.needs_images and selection.image_urls:
-                info_msg = f"🔎 *Анализ:* {selection.reasoning}\nСкачиваю {len(selection.image_urls)} изображений..."
-                self.sig_message.emit("assistant", info_msg)
-                self.save_message("assistant", info_msg)
-                
-                for url in selection.image_urls:
-                    if not self.is_running: return
-                    self.sig_log.emit(f"Скачивание: {url}")
-                    
-                    crop_info = image_processor.download_and_process_pdf(url)
-                    if crop_info:
-                        downloaded_images.append(crop_info)
-                        if crop_info.image_path:
-                            self.sig_image.emit(crop_info.image_path, f"Источник: {url}")
-            else:
-                msg = "Изображения не требуются."
-                self.sig_message.emit("assistant", msg)
-                self.save_message("assistant", msg)
+            from .doc_index import build_index, retrieve_text_chunks
 
-            llm_client.init_analysis_chat()
-            
-            # Передаем ВЕСЬ документ - ответ может быть в любом блоке
-            context = f"ДОКУМЕНТ:\n{full_text}\n\nЗАПРОС ПОЛЬЗОВАТЕЛЯ: {self.query}"
+            doc_index = build_index(full_text)
+            text_snippets = retrieve_text_chunks(doc_index, self.query, top_k=10)
+
+            # Короткий каталог изображений (id + стр. + краткое описание), без URL.
+            # Это позволяет модели запросить картинки по id через tool=request_images.
+            img_entries = sorted(
+                doc_index.images.values(),
+                key=lambda e: ((e.page or 0), e.image_id),
+            )
+            catalog_lines = []
+            for e in img_entries:
+                summary = (e.content_summary or "").replace("\n", " ").strip()
+                if len(summary) > 180:
+                    summary = summary[:180] + "..."
+                catalog_lines.append(f"- {e.image_id} (стр. {e.page}): {summary}")
+            catalog_text = "\n".join(catalog_lines) if catalog_lines else "(каталог изображений пуст)"
+
+            # Собираем минимальный контекст вместо полного result.md
+            snippets_text = "\n\n".join([f"[{cid}]\n{txt}" for cid, txt in text_snippets]) if text_snippets else "(релевантных фрагментов текста не найдено)"
+            context = (
+                f"ЗАПРОС ПОЛЬЗОВАТЕЛЯ:\n{self.query}\n\n"
+                f"РЕЛЕВАНТНЫЕ ФРАГМЕНТЫ ТЕКСТА/ТАБЛИЦ ИЗ ДОКУМЕНТА:\n{snippets_text}\n\n"
+                f"КАТАЛОГ ИЗОБРАЖЕНИЙ (id → страница → краткое описание):\n{catalog_text}\n\n"
+                f"Если для вывода нужны чертежи/схемы — запроси их через tool=request_images, используя image_ids из каталога."
+            )
             
             print(f"[GUI_AGENT] Инициализирован анализ-чат")
             print(f"[GUI_AGENT] Размер контекста: {len(context)} символов")
-            print(f"[GUI_AGENT] Количество картинок: {len(downloaded_images)}")
+            print(f"[GUI_AGENT] Количество картинок: 0")
             
-            self.save_message("user", self.query, images=downloaded_images)
+            # В историю сохраняем только запрос пользователя (без многосоттысячного контекста)
+            self.save_message("user", self.query, images=None)
             
             # После сохранения первого сообщения пользователя у нас есть message_id.
             # Теперь можно сохранить блоки поиска ПАКЕТНО, привязав их к этому сообщению.
@@ -404,7 +381,7 @@ class AgentWorker(QThread):
                     except Exception as e:
                         logger.error(f"Ошибка пакетного сохранения блоков: {e}")
 
-            llm_client.add_user_message(context, images=downloaded_images)
+            llm_client.add_user_message(context, images=None)
             
             step = 0
             max_steps = 5
@@ -455,6 +432,54 @@ class AgentWorker(QThread):
                 except Exception:
                     pass
                 
+                # 1) Обрабатываем запросы на подгрузку изображений
+                img_reqs = llm_client.parse_image_requests(response)
+                if img_reqs:
+                    # Собираем уникальные id
+                    req_ids = []
+                    for r in img_reqs:
+                        for rid in r.image_ids:
+                            rid = str(rid).strip()
+                            if rid.endswith(".pdf"):
+                                rid = rid[:-4]
+                            if rid and rid not in req_ids:
+                                req_ids.append(rid)
+
+                    info_msg = f"🖼️ Запрошены изображения: {', '.join(req_ids[:15])}{' ...' if len(req_ids) > 15 else ''}"
+                    self.sig_message.emit("assistant", info_msg)
+                    self.save_message("assistant", info_msg)
+
+                    downloaded_imgs = []
+                    missing_ids = []
+                    for rid in req_ids:
+                        if not self.is_running:
+                            return
+                        entry = doc_index.images.get(rid)
+                        if not entry:
+                            missing_ids.append(rid)
+                            continue
+                        self.sig_log.emit(f"Скачивание (по id): {rid}")
+                        crop_info = image_processor.download_and_process_pdf(entry.uri, image_id=rid)
+                        if crop_info:
+                            downloaded_imgs.append(crop_info)
+                            if crop_info.image_path:
+                                self.sig_image.emit(crop_info.image_path, f"Image ID: {rid}")
+
+                    if missing_ids:
+                        warn = f"⚠️ Не найдено в каталоге: {', '.join(missing_ids[:10])}{' ...' if len(missing_ids) > 10 else ''}"
+                        self.sig_log.emit(warn)
+                        self.save_message("assistant", warn)
+
+                    if downloaded_imgs:
+                        self.save_message("assistant", "🖼️ Загружены изображения по запросу модели.", images=downloaded_imgs)
+                        llm_client.add_user_message("Запрошенные изображения:", images=downloaded_imgs)
+                        # Продолжаем цикл — модель увидит картинки и сможет запросить zoom/сделать выводы
+                        continue
+                    else:
+                        # Нечего показывать модели — продолжаем, чтобы она могла переформулировать запрос
+                        llm_client.add_user_message("Не удалось загрузить запрошенные изображения. Попробуй указать другие image_ids из каталога.")
+                        continue
+
                 zoom_reqs = llm_client.parse_zoom_request(response)
                 print(f"[GUI_AGENT] Zoom запросов: {len(zoom_reqs)}")
                 
@@ -464,6 +489,23 @@ class AgentWorker(QThread):
                         zoom_msg = f"🔄 *Zoom [{i+1}/{len(zoom_reqs)}]:* {zr.reason}"
                         self.sig_log.emit(zoom_msg)
                         self.sig_message.emit("assistant", zoom_msg)
+
+                        # Если модель просит zoom по image_id, но базовая картинка ещё не загружена —
+                        # подгружаем её автоматически по каталогу (устойчивость).
+                        try:
+                            img_id = getattr(zr, "image_id", None)
+                            if isinstance(img_id, str) and img_id:
+                                # Нормализация: иногда модель присылает id с .pdf
+                                if img_id.endswith(".pdf"):
+                                    img_id = img_id[:-4]
+                                    zr.image_id = img_id
+                                if img_id not in getattr(image_processor, "_image_cache", {}):
+                                    entry = doc_index.images.get(img_id)
+                                    if entry:
+                                        self.sig_log.emit(f"Подгружаю изображение для zoom: {img_id}")
+                                        image_processor.download_and_process_pdf(entry.uri, image_id=img_id)
+                        except Exception as e:
+                            self.sig_log.emit(f"Не удалось подготовить изображение для zoom: {e}")
                         
                         zoom_crop = image_processor.process_zoom_request(
                             zr,
@@ -488,6 +530,18 @@ class AgentWorker(QThread):
                 else:
                     self.sig_message.emit("assistant", response)
                     self.save_message("assistant", response)
+
+                    # Обновляем краткую память диалога (для устойчивых длинных чатов)
+                    try:
+                        prev_mem = ""
+                        if memory_path.exists():
+                            prev_mem = memory_path.read_text(encoding="utf-8").strip()
+                        new_mem = llm_client.update_memory_summary(prev_mem, self.query, response)
+                        if new_mem:
+                            memory_path.write_text(new_mem.strip(), encoding="utf-8")
+                    except Exception as e:
+                        logger.warning(f"Не удалось обновить память диалога: {e}")
+
                     self.sig_finished.emit()
                     return
 

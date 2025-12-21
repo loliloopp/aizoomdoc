@@ -46,7 +46,12 @@ class ImageProcessor:
             return None
         return cv2.imread(str(path))
 
-    def download_and_process_pdf(self, url: str, max_side: int = 2000) -> Optional[ViewportCrop]:
+    def download_and_process_pdf(
+        self,
+        url: str,
+        max_side: int = 2000,
+        image_id: Optional[str] = None,
+    ) -> Optional[ViewportCrop]:
         """
         1. Скачивает PDF по ссылке.
         2. Рендерит первую страницу в полном разрешении.
@@ -55,6 +60,45 @@ class ImageProcessor:
         5. Возвращает ViewportCrop с путем к превью и метаданными.
         """
         try:
+            # Стабильный ID (если задан) позволяет:
+            # - не тащить длинные URL в промты
+            # - переиспользовать уже скачанные изображения в длинном диалоге
+            img_id = image_id or str(uuid.uuid5(uuid.NAMESPACE_URL, url))
+            cache_path = self.temp_dir / f"{img_id}_full.png"
+            preview_path = self.temp_dir / f"{img_id}_preview.png"
+
+            # Если уже есть кэш на диске — не скачиваем заново.
+            if cache_path.exists():
+                img_bgr = cv2.imread(str(cache_path))
+                if img_bgr is not None:
+                    h, w = img_bgr.shape[:2]
+                    self._image_cache[img_id] = cache_path
+                    self._image_sizes[img_id] = (w, h)
+
+                    # Preview может отсутствовать (например, если раньше max_side был другой)
+                    if not preview_path.exists() and max(h, w) > max_side:
+                        scale = max_side / max(h, w)
+                        new_w, new_h = int(w * scale), int(h * scale)
+                        img_preview = cv2.resize(img_bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                        cv2.imwrite(str(preview_path), img_preview)
+                        desc = f"⚠️ CACHED + SCALED PREVIEW: Original {w}x{h}px → {new_w}x{new_h}px. Use ZOOM to verify details."
+                        img_path = preview_path
+                    else:
+                        if max(h, w) > max_side and preview_path.exists():
+                            desc = f"⚠️ CACHED SCALED PREVIEW available. Use ZOOM to verify details."
+                            img_path = preview_path
+                        else:
+                            desc = f"✓ CACHED FULL RESOLUTION IMAGE: {w}x{h}px"
+                            img_path = cache_path
+
+                    return ViewportCrop(
+                        page_number=0,
+                        crop_coords=(0, 0, w, h),
+                        image_path=str(img_path),
+                        description=desc,
+                        target_blocks=[img_id],
+                    )
+
             logger.info(f"Скачивание PDF: {url}")
             response = requests.get(url, timeout=30)
             response.raise_for_status()
@@ -87,12 +131,12 @@ class ImageProcessor:
                 
                 h, w = img_bgr.shape[:2]
                 
-                # Генерируем ID для кэша
-                img_id = str(uuid.uuid5(uuid.NAMESPACE_URL, url))
+                # img_id уже вычислен выше (для возможности дискового кэша)
                 
                 # Сохраняем ОРИГИНАЛ в кэш
-                cache_path = self.temp_dir / f"{img_id}_full.png"
-                cv2.imwrite(str(cache_path), img_bgr)
+                # cache_path уже вычислен выше
+                if not cache_path.exists():
+                    cv2.imwrite(str(cache_path), img_bgr)
                 self._image_cache[img_id] = cache_path
                 self._image_sizes[img_id] = (w, h)
                 
@@ -106,8 +150,9 @@ class ImageProcessor:
                     desc = f"⚠️ SCALED PREVIEW: Original {w}x{h}px → Scaled to {new_w}x{new_h}px ({scale_percent}%). Use ZOOM to verify details."
                     
                     # Сохраняем preview в PNG
-                    preview_path = self.temp_dir / f"{img_id}_preview.png"
-                    cv2.imwrite(str(preview_path), img_preview)
+                    # preview_path уже вычислен выше
+                    if not preview_path.exists():
+                        cv2.imwrite(str(preview_path), img_preview)
                 else:
                     # Изображение маленькое - используем оригинал напрямую, preview не создаем
                     preview_path = cache_path  # Используем full.png

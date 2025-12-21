@@ -1184,6 +1184,8 @@ class MainWindow(QMainWindow):
     def refresh_history_list(self):
         self.list_history.clear()
         
+        cloud_local_ids = set()
+        
         # 1. Загружаем из облака, если включено
         if config.USE_DATABASE and supabase_client.is_connected():
             try:
@@ -1196,6 +1198,12 @@ class MainWindow(QMainWindow):
                     item.setData(Qt.ItemDataRole.UserRole + 1, "cloud")
                     item.setToolTip(title)
                     self.list_history.addItem(item)
+                    
+                    # Запоминаем локальный ID, чтобы не дублировать
+                    if chat.get("metadata") and isinstance(chat["metadata"], dict):
+                        local_id = chat["metadata"].get("local_chat_id")
+                        if local_id:
+                            cloud_local_ids.add(local_id)
             except Exception as e:
                 print(f"Ошибка загрузки чатов из БД: {e}")
 
@@ -1211,6 +1219,12 @@ class MainWindow(QMainWindow):
                 try:
                     with open(hist_file, "r", encoding="utf-8") as f:
                         data = json.load(f)
+                        
+                        # Пропускаем, если этот чат уже загружен из облака
+                        local_id = data.get("id")
+                        if local_id in cloud_local_ids:
+                            continue
+                            
                         query = data.get("query", "Без названия")
                         # Ограничиваем длину запроса для отображения
                         display_query = query[:45] + "..." if len(query) > 45 else query

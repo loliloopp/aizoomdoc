@@ -97,6 +97,13 @@ class ZoomRequest:
     coords_px: Optional[List[int]] = None
     reason: str = ""
 
+
+@dataclass
+class ImageRequest:
+    """Запрос от LLM на подгрузку изображений по их коротким ID."""
+    image_ids: List[str] = field(default_factory=list)
+    reason: str = ""
+
 @dataclass
 class MarkdownBlock:
     text: str

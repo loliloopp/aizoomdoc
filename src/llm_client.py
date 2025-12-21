@@ -5,13 +5,14 @@
 import base64
 import json
 import logging
+import re
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 
 import requests
 
 from .config import config
-from .models import ViewportCrop, ZoomRequest, ImageSelection
+from .models import ViewportCrop, ZoomRequest, ImageRequest, ImageSelection
 
 logger = logging.getLogger(__name__)
 
@@ -144,6 +145,19 @@ def load_analysis_prompt(data_root: Optional[Path] = None) -> str:
   "reason": "Хочу прочитать мелкий текст в центре"
 }
 ```
+
+ФОРМАТ ЗАПРОСА ДОПОЛНИТЕЛЬНЫХ ИЗОБРАЖЕНИЙ (JSON):
+```json
+{
+  "tool": "request_images",
+  "image_ids": ["image_...","image_..."],
+  "reason": "Нужно проверить маркировку/узел/таблицу на чертеже"
+}
+```
+
+ВАЖНО:
+- `image_id`/`image_ids` берутся из каталога изображений или из строк вида `IMAGE [ID: ...]`.
+- Если нужно несколько запросов инструментов, можно вернуть список JSON-объектов.
 
 ОТВЕТ:
 Если информации достаточно, отвечай обычным текстом. Ссылайся на источники."""
@@ -302,6 +316,7 @@ class LLMClient:
                 
                 # Попытка парсинга
                 try:
+                    original_content = content # Сохраняем оригинал для логирования
                     if "```json" in content:
                         content = content.split("```json")[1].split("```")[0].strip()
                     elif "```" in content:
@@ -313,8 +328,10 @@ class LLMClient:
                         needs_images=data.get("needs_images", False),
                         image_urls=data.get("image_urls", [])
                     )
-                except json.JSONDecodeError:
-                    print(f"[SELECT_IMAGES] ⚠️ Ошибка JSON парсинга. Пробую еще раз...")
+                except json.JSONDecodeError as e:
+                    print(f"[SELECT_IMAGES] ⚠️ Ошибка JSON парсинга: {e}")
+                    print(f"[SELECT_IMAGES] RAW CONTENT:\n{original_content}")
+                    print(f"[SELECT_IMAGES] CLEANED CONTENT:\n{content}")
                     continue
                     
             except Exception as e:
@@ -411,6 +428,58 @@ class LLMClient:
         
         raise ValueError("Не удалось получить ответ от модели после 3 попыток")
 
+    def update_memory_summary(self, prev_summary: str, user_message: str, assistant_message: str) -> str:
+        """
+        Обновляет краткую "память" диалога для длинных чатов.
+        Делает отдельный запрос к модели и НЕ влияет на self.history.
+        """
+        system_prompt = (
+            "Ты — модуль памяти диалога.\n"
+            "Твоя задача: обновить краткую память (summary) по переписке.\n"
+            "Правила:\n"
+            "- Пиши по-русски.\n"
+            "- Максимум 1200-1800 символов.\n"
+            "- Только факты/решения/проверенные гипотезы/не закрытые вопросы/важные ссылки на листы/узлы.\n"
+            "- Без воды, без повторов.\n"
+            "- Если предыдущая память пустая — создай новую.\n"
+        )
+        user_payload = (
+            f"ПРЕДЫДУЩАЯ ПАМЯТЬ:\n{(prev_summary or '').strip()}\n\n"
+            f"НОВЫЙ ВОПРОС ПОЛЬЗОВАТЕЛЯ:\n{(user_message or '').strip()}\n\n"
+            f"НОВЫЙ ОТВЕТ АССИСТЕНТА:\n{(assistant_message or '').strip()}\n\n"
+            "Верни ТОЛЬКО обновлённую память (plain text)."
+        )
+
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_payload},
+            ],
+            "temperature": 0.1,
+            "max_tokens": 600,
+        }
+
+        try:
+            resp = requests.post(
+                f"{self.base_url}/chat/completions",
+                headers=self.headers,
+                json=payload,
+                timeout=60,
+            )
+            if resp.status_code == 429:
+                return (prev_summary or "").strip()
+            resp.raise_for_status()
+            data = resp.json()
+            if not isinstance(data, dict) or not data.get("choices"):
+                return (prev_summary or "").strip()
+            content = data["choices"][0].get("message", {}).get("content", "")
+            if not isinstance(content, str) or not content.strip():
+                return (prev_summary or "").strip()
+            return content.strip()
+        except Exception:
+            return (prev_summary or "").strip()
+
     def parse_zoom_request(self, response_text: str) -> List[ZoomRequest]:
         response_text = response_text.strip()
         data = None
@@ -421,16 +490,19 @@ class LLMClient:
             try:
                 json_str = response_text.split("```json")[1].split("```")[0].strip()
                 data = json.loads(json_str)
-            except: pass
+            except Exception as e:
+                print(f"[ZOOM_PARSE] ⚠️ Ошибка в блоке ```json: {e}")
         elif "```" in response_text: # Иногда модель забывает 'json'
              try:
                 json_str = response_text.split("```")[1].split("```")[0].strip()
                 data = json.loads(json_str)
-             except: pass
+             except Exception as e:
+                print(f"[ZOOM_PARSE] ⚠️ Ошибка в блоке ```: {e}")
         elif response_text.startswith("{") or response_text.startswith("["):
              try:
                 data = json.loads(response_text)
-             except: pass
+             except Exception as e:
+                print(f"[ZOOM_PARSE] ⚠️ Ошибка raw JSON: {e}")
             
         # Превращаем в список, если это один объект
         if isinstance(data, dict):
@@ -451,3 +523,61 @@ class LLMClient:
                     reason=item.get("reason", "")
                 ))
         return zoom_requests
+
+    def parse_image_requests(self, response_text: str) -> List[ImageRequest]:
+        """
+        Ищет в ответе JSON-команды tool=request_images и возвращает список ImageRequest.
+        Поддерживает:
+        - один объект
+        - список объектов
+        - JSON внутри ```json``` или ```...```
+        """
+        response_text = (response_text or "").strip()
+        if not response_text:
+            return []
+
+        data_list: List[dict] = []
+
+        # 1) JSON в fenced blocks
+        json_blocks = re.findall(r"```json\s*(\{.*?\}|\[.*?\])\s*```", response_text, re.DOTALL | re.IGNORECASE)
+        if not json_blocks:
+            json_blocks = re.findall(r"```\s*(\{.*?\}|\[.*?\])\s*```", response_text, re.DOTALL)
+
+        for block in json_blocks:
+            try:
+                parsed = json.loads(block)
+                if isinstance(parsed, dict):
+                    data_list.append(parsed)
+                elif isinstance(parsed, list):
+                    data_list.extend([x for x in parsed if isinstance(x, dict)])
+            except Exception as e:
+                print(f"[IMG_REQ_PARSE] ⚠️ Ошибка парсинга json блока: {e}", flush=True)
+
+        # 2) raw json (редко, но бывает)
+        if not data_list and (response_text.startswith("{") or response_text.startswith("[")):
+            try:
+                parsed = json.loads(response_text)
+                if isinstance(parsed, dict):
+                    data_list.append(parsed)
+                elif isinstance(parsed, list):
+                    data_list.extend([x for x in parsed if isinstance(x, dict)])
+            except Exception:
+                pass
+
+        requests_out: List[ImageRequest] = []
+        for item in data_list:
+            if not isinstance(item, dict):
+                continue
+            if item.get("tool") != "request_images":
+                continue
+            ids = item.get("image_ids") or item.get("images") or item.get("ids") or []
+            if isinstance(ids, str):
+                ids = [ids]
+            if not isinstance(ids, list):
+                ids = []
+            ids = [str(x) for x in ids if x]
+            if not ids:
+                continue
+            requests_out.append(ImageRequest(image_ids=ids, reason=str(item.get("reason") or "")))
+
+        return requests_out
