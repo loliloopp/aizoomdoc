@@ -688,6 +688,15 @@ class MainWindow(QMainWindow):
         
         top_bar_layout.addStretch()
         
+        # Переключатель режима MD (RAG / Full MD)
+        self.combo_md_mode = QComboBox()
+        self.combo_md_mode.addItem("RAG (блоки)", "rag")
+        self.combo_md_mode.addItem("Полный MD", "full_md")
+        self.combo_md_mode.setFixedWidth(140)
+        self.combo_md_mode.setFixedHeight(34)
+        self.combo_md_mode.currentIndexChanged.connect(self.save_md_mode)
+        top_bar_layout.addWidget(self.combo_md_mode)
+        
         # Переключатель темы
         self.theme_toggle = QPushButton("🌙" if self.is_dark_theme else "☀️")
         self.theme_toggle.setFixedSize(40, 34)
@@ -943,6 +952,9 @@ class MainWindow(QMainWindow):
         
         # Применяем тему
         self.apply_theme()
+        
+        # Загружаем настройки режима MD из БД
+        self.load_md_mode()
         
         self.refresh_history_list()
 
@@ -1333,6 +1345,7 @@ class MainWindow(QMainWindow):
         self.progress.setVisible(True)
         
         mid = self.combo_models.currentData()
+        md_mode = self.combo_md_mode.currentData()
         
         # Передаем сохраненные md файлы и текущие ID чата в воркера
         self.current_worker = AgentWorker(
@@ -1341,7 +1354,8 @@ class MainWindow(QMainWindow):
             mid, 
             md_files=files_to_use,
             existing_chat_id=self.current_chat_id,
-            existing_db_chat_id=self.current_db_chat_id
+            existing_db_chat_id=self.current_db_chat_id,
+            md_mode=md_mode
         )
         self.current_worker.sig_log.connect(self.log)
         self.current_worker.sig_message.connect(self.add_chat_message)
@@ -1630,6 +1644,29 @@ class MainWindow(QMainWindow):
                     self.log(f"Ошибка при удалении {name}")
             except Exception as e:
                 self.log(f"Ошибка удаления: {e}")
+
+    def load_md_mode(self):
+        """Загружает режим обработки MD из Supabase."""
+        if config.USE_DATABASE and supabase_client.is_connected():
+            try:
+                mode = self.run_async(supabase_client.get_md_processing_mode())
+                index = self.combo_md_mode.findData(mode)
+                if index >= 0:
+                    self.combo_md_mode.blockSignals(True)
+                    self.combo_md_mode.setCurrentIndex(index)
+                    self.combo_md_mode.blockSignals(False)
+            except Exception as e:
+                self.log(f"Ошибка загрузки режима MD: {e}")
+
+    def save_md_mode(self):
+        """Сохраняет режим обработки MD в Supabase."""
+        mode = self.combo_md_mode.currentData()
+        if config.USE_DATABASE and supabase_client.is_connected():
+            try:
+                self.run_async(supabase_client.set_md_processing_mode(mode))
+                self.log(f"Режим MD изменен на: {mode}")
+            except Exception as e:
+                self.log(f"Ошибка сохранения режима MD: {e}")
 
     def toggle_theme(self):
         """Переключает тему интерфейса."""
@@ -1955,6 +1992,30 @@ class MainWindow(QMainWindow):
                     selection-background-color: #4d4d4f;
                 }
             """)
+
+            md_combo_style_dark = """
+                QComboBox {
+                    background-color: #3d3d3d;
+                    border: 1px solid #4d4d4f;
+                    border-radius: 6px;
+                    padding: 4px 8px;
+                    color: #ececec;
+                    font-size: 12px;
+                }
+                QComboBox:hover {
+                    border-color: #10A37F;
+                }
+                QComboBox::drop-down {
+                    border: none;
+                }
+                QComboBox QAbstractItemView {
+                    background-color: #3d3d3d;
+                    color: #ececec;
+                    selection-background-color: #4d4d4f;
+                    outline: none;
+                }
+            """
+            self.combo_md_mode.setStyleSheet(md_combo_style_dark)
             
             self.lbl_data_root.setStyleSheet("""
                 color: #8e8ea0;
@@ -2309,6 +2370,24 @@ class MainWindow(QMainWindow):
                     selection-background-color: #f3f4f6;
                 }
             """)
+
+            md_combo_style_light = """
+                QComboBox {
+                    background-color: #ffffff;
+                    border: 1px solid #d1d5db;
+                    border-radius: 6px;
+                    padding: 4px 8px;
+                    color: #2d333a;
+                    font-size: 12px;
+                }
+                QComboBox:hover {
+                    border-color: #10A37F;
+                }
+                QComboBox::drop-down {
+                    border: none;
+                }
+            """
+            self.combo_md_mode.setStyleSheet(md_combo_style_light)
             
             self.lbl_data_root.setStyleSheet("""
                 color: #6e6e80;

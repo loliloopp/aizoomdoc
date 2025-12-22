@@ -57,6 +57,102 @@ class SupabaseClient:
                 raise e
         raise last_err
 
+    # ===== Global Settings (UI / App) =====
+
+    async def get_settings_row(self, user_id: str = "default_user") -> Optional[Dict[str, Any]]:
+        """
+        Получить строку настроек пользователя из таблицы settings.
+        Ожидаемая схема (см. scripts/SUPABASE_SETTINGS.sql):
+        - user_id (text, unique)
+        - page_settings (jsonb)
+        """
+        if not self.is_connected():
+            return None
+        try:
+            resp = (
+                self.client.table("settings")
+                .select("*")
+                .eq("user_id", user_id)
+                .limit(1)
+                .execute()
+            )
+            if resp.data:
+                return resp.data[0]
+            return None
+        except Exception as e:
+            logger.error(f"❌ Ошибка чтения settings для user_id={user_id}: {e}")
+            return None
+
+    async def upsert_settings_row(self, user_id: str, page_settings: Dict[str, Any]) -> bool:
+        """
+        Upsert строки settings по user_id.
+        """
+        if not self.is_connected():
+            return False
+        try:
+            data = {
+                "user_id": user_id,
+                "page_settings": page_settings or {},
+                "updated_at": datetime.utcnow().isoformat(),
+            }
+            self.client.table("settings").upsert(data, on_conflict="user_id").execute()
+            return True
+        except Exception as e:
+            logger.error(f"❌ Ошибка upsert settings для user_id={user_id}: {e}")
+            return False
+
+    async def get_page_settings(self, page_key: str, user_id: str = "default_user") -> Dict[str, Any]:
+        """
+        Возвращает объект настроек для конкретной страницы/экрана (page_key) из page_settings (jsonb).
+        """
+        row = await self.get_settings_row(user_id=user_id)
+        if not row:
+            return {}
+        page_settings = row.get("page_settings")
+        if not isinstance(page_settings, dict):
+            return {}
+        page_obj = page_settings.get(page_key)
+        return page_obj if isinstance(page_obj, dict) else {}
+
+    async def update_page_settings(self, page_key: str, patch: Dict[str, Any], user_id: str = "default_user") -> bool:
+        """
+        Обновляет (shallow-merge) настройки конкретной страницы/экрана в page_settings.
+        """
+        if not isinstance(patch, dict):
+            return False
+
+        row = await self.get_settings_row(user_id=user_id)
+        page_settings: Dict[str, Any] = {}
+        if row and isinstance(row.get("page_settings"), dict):
+            page_settings = dict(row["page_settings"])
+
+        page_obj: Dict[str, Any] = {}
+        if isinstance(page_settings.get(page_key), dict):
+            page_obj = dict(page_settings[page_key])
+
+        page_obj.update(patch)
+        page_settings[page_key] = page_obj
+        return await self.upsert_settings_row(user_id=user_id, page_settings=page_settings)
+
+    async def get_md_processing_mode(self, user_id: str = "default_user", page_key: str = "main_window") -> str:
+        """
+        Текущее значение переключателя режима обработки MD.
+        Возвращает 'rag' (по умолчанию) или 'full_md'.
+        """
+        page = await self.get_page_settings(page_key=page_key, user_id=user_id)
+        mode = page.get("md_processing_mode")
+        if mode in ("rag", "full_md"):
+            return mode
+        return "rag"
+
+    async def set_md_processing_mode(self, mode: str, user_id: str = "default_user", page_key: str = "main_window") -> bool:
+        """
+        Сохранить режим обработки MD в settings.page_settings[page_key].md_processing_mode.
+        """
+        if mode not in ("rag", "full_md"):
+            return False
+        return await self.update_page_settings(page_key=page_key, patch={"md_processing_mode": mode}, user_id=user_id)
+
     # ===== Folder & File Operations (V2) =====
     
     async def create_folder(self, name: str, user_id: str = "default_user", parent_id: Optional[str] = None, slug: Optional[str] = None) -> Optional[str]:

@@ -31,12 +31,13 @@ class AgentWorker(QThread):
     sig_usage = pyqtSignal(int, int) # used, remaining
     
     def __init__(self, data_root: Path, query: str, model: str, md_files: List[str] = None, 
-                 existing_chat_id: str = None, existing_db_chat_id: str = None):
+                 existing_chat_id: str = None, existing_db_chat_id: str = None, md_mode: str = "rag"):
         super().__init__()
         self.data_root = data_root
         self.query = query
         self.model = model
         self.md_files = md_files or []
+        self.md_mode = md_mode
         self.is_running = True
         
         if existing_chat_id:
@@ -379,66 +380,126 @@ class AgentWorker(QThread):
             if not full_text.strip():
                 raise ValueError("В чате нет прикрепленных документов для анализа. Прикрепите .md файлы.")
 
-            # ===== Новая устойчивая схема для длинного диалога =====
-            # 1) Локально индексируем документ (извлекаем каталог изображений и делаем чанки текста),
-            # чтобы не заставлять модель возвращать длинные URL и не пересылать весь документ целиком.
-            self.sig_log.emit("Индексирую документ и готовлю краткий контекст (retrieval)...")
-
-            from .doc_index import build_index, retrieve_text_chunks
-
-            doc_index = build_index(full_text)
-            text_snippets = retrieve_text_chunks(doc_index, self.query, top_k=10)
-
-            # Сохранение лога поиска для GUI
-            self._save_gui_search_log(self.query, text_snippets, doc_index)
-
-            # Короткий каталог изображений (id + стр. + краткое описание), без URL.
-            # Это позволяет модели запросить картинки по id через tool=request_images.
-            img_entries = sorted(
-                doc_index.images.values(),
-                key=lambda e: ((e.page or 0), e.image_id),
-            )
-            catalog_lines = []
-            for e in img_entries:
-                summary = (e.content_summary or "").replace("\n", " ").strip()
-                if len(summary) > 180:
-                    summary = summary[:180] + "..."
-                catalog_lines.append(f"- {e.image_id} (стр. {e.page}): {summary}")
-            catalog_text = "\n".join(catalog_lines) if catalog_lines else "(каталог изображений пуст)"
-
-            # Собираем минимальный контекст вместо полного result.md
-            snippets_text = "\n\n".join([f"[{cid}]\n{txt}" for cid, txt in text_snippets]) if text_snippets else "(релевантных фрагментов текста не найдено)"
-            context = (
-                f"ЗАПРОС ПОЛЬЗОВАТЕЛЯ:\n{self.query}\n\n"
-                f"РЕЛЕВАНТНЫЕ ФРАГМЕНТЫ ТЕКСТА/ТАБЛИЦ ИЗ ДОКУМЕНТА:\n{snippets_text}\n\n"
-                f"КАТАЛОГ ИЗОБРАЖЕНИЙ (id → страница → краткое описание):\n{catalog_text}\n\n"
-                f"Если для вывода нужны чертежи/схемы — запроси их через tool=request_images, используя image_ids из каталога."
-            )
+            # 1. Читаем и регистрируем MD файлы
+            full_md_text = ""
+            all_blocks = []
             
-            print(f"[GUI_AGENT] Инициализирован анализ-чат")
-            print(f"[GUI_AGENT] Размер контекста: {len(context)} символов")
-            print(f"[GUI_AGENT] Количество картинок: 0")
+            # Собираем список файлов для обработки
+            files_to_process = []
+            if self.md_files:
+                files_to_process = self.md_files
+            else:
+                markdown_path, _ = config.get_document_paths(self.data_root)
+                if Path(markdown_path).exists():
+                    files_to_process = [str(markdown_path)]
+
+            for md_path_str in files_to_process:
+                try:
+                    md_path = Path(md_path_str)
+                    self.sig_log.emit(f"Обработка: {md_path.name}")
+                    
+                    # Регистрация в S3/DB
+                    if self.db_chat_id:
+                        try:
+                            s3_doc_key = s3_storage.generate_s3_path(self.db_chat_id, "document", md_path.name)
+                            s3_url = asyncio.run(s3_storage.upload_file(str(md_path), s3_doc_key))
+                            asyncio.run(supabase_client.register_file(
+                                user_id="default_user",
+                                source_type="user_upload",
+                                filename=md_path.name,
+                                storage_path=s3_doc_key,
+                                external_url=s3_url
+                            ))
+                        except: pass
+
+                    # Чтение текста
+                    text = md_path.read_text(encoding="utf-8")
+                    full_md_text += text + "\n\n"
+                    
+                    # Парсинг блоков для RAG и поиска
+                    parser = MarkdownParser(md_path)
+                    all_blocks.extend(parser.parse())
+                except Exception as e:
+                    self.sig_log.emit(f"Ошибка файла {md_path_str}: {e}")
+
+            if not full_md_text.strip():
+                raise ValueError("Нет текста документов для анализа.")
+
+            # ===== ПОДГОТОВКА КОНТЕКСТА =====
             
-            # В историю сохраняем только запрос пользователя (без многосоттысячного контекста)
+            from .doc_index import build_index, retrieve_text_chunks, strip_json_blocks
+            doc_index = build_index(full_md_text)
+            
+            tail_n = 12 # Начальный размер истории
+            context = ""
+            
+            # Цикл формирования контекста с попыткой впихнуть максимум
+            while tail_n >= 0:
+                # Очищаем историю для новой попытки
+                llm_client.history = [{"role": "system", "content": analysis_prompt}]
+                if memory_path.exists():
+                    try:
+                        mem = memory_path.read_text(encoding="utf-8").strip()
+                        if mem: llm_client.history.append({"role": "system", "content": f"КРАТКАЯ ПАМЯТЬ: {mem}"})
+                    except: pass
+                
+                # Добавляем хвост истории
+                history_messages = self.chat_history_data.get("messages", [])
+                for msg in history_messages[-(tail_n if tail_n > 0 else 0):] if tail_n > 0 else []:
+                    llm_client.history.append({"role": msg.get("role", "user"), "content": msg.get("content", "")})
+
+                if self.md_mode == "full_md":
+                    self.sig_log.emit(f"Режим: Полный MD (history_n={tail_n})...")
+                    img_entries = sorted(doc_index.images.values(), key=lambda e: ((e.page or 0), e.image_id))
+                    catalog_text = "\n".join([f"- {e.image_id} (стр. {e.page}): {e.content_summary[:150]}" for e in img_entries])
+                    
+                    context = (
+                        f"ЗАПРОС ПОЛЬЗОВАТЕЛЯ:\n{self.query}\n\n"
+                        f"ПОЛНЫЙ ТЕКСТ ДОКУМЕНТА:\n{strip_json_blocks(full_md_text)}\n\n"
+                        f"КАТАЛОГ ИЗОБРАЖЕНИЙ:\n{catalog_text}\n\n"
+                        f"Используй tool=request_images и tool=zoom для работы с графикой."
+                    )
+                else:
+                    self.sig_log.emit(f"Режим: RAG (history_n={tail_n})...")
+                    text_snippets = retrieve_text_chunks(doc_index, self.query, top_k=10)
+                    self._save_gui_search_log(self.query, text_snippets, doc_index)
+                    
+                    img_entries = sorted(doc_index.images.values(), key=lambda e: ((e.page or 0), e.image_id))
+                    catalog_text = "\n".join([f"- {e.image_id} (стр. {e.page}): {e.content_summary[:180]}" for e in img_entries])
+                    snippets_text = "\n\n".join([f"[{cid}]\n{txt}" for cid, txt in text_snippets])
+                    
+                    context = (
+                        f"ЗАПРОС ПОЛЬЗОВАТЕЛЯ:\n{self.query}\n\n"
+                        f"РЕЛЕВАНТНЫЕ ФРАГМЕНТЫ:\n{snippets_text}\n\n"
+                        f"КАТАЛОГ ИЗОБРАЖЕНИЙ:\n{catalog_text}\n\n"
+                        f"Используй tool=request_images для просмотра чертежей."
+                    )
+
+                # Проверяем, влезает ли
+                temp_history = llm_client.history + [{"role": "user", "content": context}]
+                est = llm_client.build_context_report(temp_history, max_tokens=4000)
+                
+                if not est.get("will_overflow"):
+                    self.sig_log.emit(f"OK: Промпт ~{est.get('prompt_tokens_est')} токенов.")
+                    break
+                
+                if self.md_mode == "full_md" and tail_n == 0:
+                    self.sig_log.emit("⚠️ Даже без истории не влезает. Fallback в RAG...")
+                    self.md_mode = "rag"
+                    tail_n = 12 # Сбрасываем tail_n для RAG
+                    continue
+                
+                tail_n -= 3 # Уменьшаем историю и пробуем снова
+                self.sig_log.emit(f"⚠️ Переполнение. Сокращаю историю до {tail_n}...")
+
             self.save_message("user", self.query, images=None)
             
-            # После сохранения первого сообщения пользователя у нас есть message_id.
-            # Теперь можно сохранить блоки поиска ПАКЕТНО, привязав их к этому сообщению.
+            # Сохранение результатов поиска в БД (пакетно)
             if self.db_chat_id and hasattr(self, '_current_msg_id') and self._current_msg_id:
-                bulk_data = []
-                for block in all_blocks:
-                    bulk_data.append({
-                        "chat_id": self.db_chat_id,
-                        "message_id": self._current_msg_id,
-                        "block_id": block.block_id,
-                        "block_text": block.text[:1000]
-                    })
-                
+                bulk_data = [{"chat_id": self.db_chat_id, "message_id": self._current_msg_id, "block_id": b.block_id, "block_text": b.text[:1000]} for b in all_blocks]
                 if bulk_data:
-                    try:
-                        asyncio.run(supabase_client.add_search_results_bulk(bulk_data))
-                    except Exception as e:
-                        logger.error(f"Ошибка пакетного сохранения блоков: {e}")
+                    try: asyncio.run(supabase_client.add_search_results_bulk(bulk_data))
+                    except: pass
 
             llm_client.add_user_message(context, images=None)
             
@@ -447,29 +508,27 @@ class AgentWorker(QThread):
             
             while step < max_steps and self.is_running:
                 step += 1
-                print(f"[GUI_AGENT] === ШАГ {step} ===")
                 self.sig_log.emit(f"Шаг {step}...")
 
-                # Прогноз по контексту перед запросом (анализ)
+                # Прогноз по контексту
                 try:
                     est = llm_client.last_prompt_estimate or llm_client.build_context_report(llm_client.history, max_tokens=4000)
-                    if est:
-                        ctx = est.get("context_length")
-                        prompt_est = est.get("prompt_tokens_est")
-                        max_tokens = est.get("max_tokens")
-                        img_cnt = est.get("image_count")
-                        rem = est.get("remaining_after_max_completion")
-                        overflow = est.get("will_overflow")
-                        self.sig_log.emit(
-                            f"[Контекст/прогноз][анализ] prompt≈{prompt_est} tok (картинок: {img_cnt}), max={max_tokens}, "
-                            f"лимит={ctx if ctx is not None else 'неизв.'}, "
-                            f"остаток≈{rem if rem is not None else 'неизв.'}, "
-                            f"{'⚠️ риск лимита' if overflow else 'OK'}"
-                        )
-                except Exception:
-                    pass
+                    if est and est.get("will_overflow"):
+                        self.sig_log.emit("⚠️ Риск переполнения контекста на текущем шаге!")
+                except: pass
                 
-                response = llm_client.get_response()
+                try:
+                    response = llm_client.get_response()
+                except Exception as e:
+                    if "context_length" in str(e).lower():
+                        err = "Критическое переполнение контекста. Попробуйте режим RAG или другую модель."
+                        self.sig_log.emit(f"❌ {err}")
+                        self.save_message("system", err)
+                        raise ValueError(err)
+                    raise e
+                
+                # Дальше стандартная обработка response (request_images, zoom, и т.д.)
+                # ... (существующий код ниже) ...
                 print(f"[GUI_AGENT] Получен ответ длиной {len(response)} символов")
                 print(f"[GUI_AGENT] Первые 300 символов ответа: {response[:300]}")
 
