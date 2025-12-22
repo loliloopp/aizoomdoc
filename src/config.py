@@ -20,9 +20,13 @@ class Config:
         "OPENROUTER_BASE_URL", 
         "https://openrouter.ai/api/v1"
     )
+
+    # Google API
+    GOOGLE_API_KEY: str = os.getenv("GOOGLE_API_KEY", "")
+
     DEFAULT_MODEL: str = os.getenv(
         "DEFAULT_MODEL", 
-        "google/gemini-3-flash-preview"
+        "gemini-1.5-flash"
     )
     
     # Пути к данным
@@ -90,9 +94,9 @@ class Config:
     @classmethod
     def validate(cls) -> None:
         """Проверяет обязательные параметры конфигурации."""
-        if not cls.OPENROUTER_API_KEY:
+        if not cls.OPENROUTER_API_KEY and not cls.GOOGLE_API_KEY:
             raise ValueError(
-                "OPENROUTER_API_KEY не задан. Установите его в .env файле."
+                "Ни OPENROUTER_API_KEY, ни GOOGLE_API_KEY не заданы. Установите хотя бы один в .env файле."
             )
         
         # Проверка Supabase (если включена БД)

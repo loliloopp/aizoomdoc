@@ -31,10 +31,14 @@ from .utils import transliterate
 import asyncio
 
 MODELS = {
-    "Gemini 3 Flash (Default)": "google/gemini-3-flash-preview",
+    "Gemini 3 Flash": "gemini-1.5-flash",
+    "Gemini 3 Pro": "gemini-1.5-pro",
+    "Gemini 1.5 Flash (openrouter)": "google/gemini-flash-1.5",
+    "Gemini 1.5 Pro (openrouter)": "google/gemini-pro-1.5",
+    "Gemini 3 Flash (openrouter)": "google/gemini-3-flash-preview",
+    "Gemini 3 Pro (openrouter)": "google/gemini-3-pro-preview",
+    "Gemini 2.0 Flash (openrouter)": "google/gemini-2.0-flash-thinking-exp",
     "Qwen3 VL": "qwen/qwen3-vl-235b-a22b-thinking",
-    "Gemini 3 Pro": "google/gemini-3-pro-preview",
-    "Gemini 2.0 Flash": "google/gemini-2.0-flash-thinking-exp",
     "Claude 3.5 Sonnet": "anthropic/claude-3.5-sonnet"
 }
 

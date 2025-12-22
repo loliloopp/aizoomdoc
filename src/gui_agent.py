@@ -174,6 +174,62 @@ class AgentWorker(QThread):
         except Exception as e:
             logger.error(f"Критическая ошибка в _save_to_db: {e}", exc_info=True)
 
+    def _save_gui_search_log(self, query, text_snippets, doc_index):
+        """Сохраняет лог поиска для GUI-версии."""
+        import datetime
+        from .doc_index import tokenize_query
+        
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_path = self.data_root / f"search_log_gui_{timestamp}.md"
+        
+        try:
+            tokens = tokenize_query(query)
+            relevant_pages = sorted(list(set(
+                entry.page for entry in doc_index.images.values() 
+                if entry.page is not None and any(t in entry.searchable_text().lower() for t in tokens)
+            )))
+
+            with open(log_path, "w", encoding="utf-8") as f:
+                f.write(f"# Лог поиска (GUI): {query}\n\n")
+                
+                f.write("## 1. Запрос\n")
+                f.write(f"{query}\n\n")
+                
+                f.write("## 2. Ключевые слова-синонимы (токены)\n")
+                f.write(f"{', '.join(tokens)}\n\n")
+                
+                f.write("## 3. Список релевантных текстовых блоков\n")
+                if text_snippets:
+                    for i, (chunk_id, text) in enumerate(text_snippets, 1):
+                        f.write(f"### Блок {i} (ID: {chunk_id})\n")
+                        f.write(f"{text}\n\n")
+                else:
+                    f.write("Текстовые блоки не найдены.\n\n")
+                
+                f.write("## 4. Релевантные изображения из каталога\n")
+                # Ищем изображения, в которых есть токены запроса
+                found_images = False
+                for entry in doc_index.images.values():
+                    if any(t in entry.searchable_text().lower() for t in tokens):
+                        f.write(f"- **{entry.image_id}** (стр. {entry.page})\n")
+                        f.write(f"  - Описание: {entry.content_summary}\n")
+                        f.write(f"  - Ссылка: {entry.uri}\n")
+                        found_images = True
+                if not found_images:
+                    f.write("Релевантные изображения в каталоге не найдены.\n")
+                
+                f.write("\n## 5. Релевантные страницы (на основе поиска по каталогу)\n")
+                if relevant_pages:
+                    f.write(f"{', '.join(map(str, relevant_pages))}\n")
+                else:
+                    f.write("Релевантные страницы не определены.\n")
+            
+            logger.info(f"Лог поиска сохранен: {log_path.absolute()}")
+            print(f"--- SEARCH LOG SAVED: {log_path.absolute()} ---")
+            self.sig_log.emit(f"Лог поиска сохранен: {log_path.name}")
+        except Exception as e:
+            logger.error(f"Ошибка при сохранении лога поиска (GUI): {e}")
+
     def _save_to_disk(self):
         history_path = self.chat_dir / "history.json"
         with open(history_path, "w", encoding="utf-8") as f:
@@ -332,6 +388,9 @@ class AgentWorker(QThread):
 
             doc_index = build_index(full_text)
             text_snippets = retrieve_text_chunks(doc_index, self.query, top_k=10)
+
+            # Сохранение лога поиска для GUI
+            self._save_gui_search_log(self.query, text_snippets, doc_index)
 
             # Короткий каталог изображений (id + стр. + краткое описание), без URL.
             # Это позволяет модели запросить картинки по id через tool=request_images.

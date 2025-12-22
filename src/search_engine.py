@@ -132,6 +132,9 @@ class SearchEngine:
         # Убираем дубликаты страниц
         result.relevant_pages = sorted(list(set(result.relevant_pages)))
         
+        # Сохраняем лог поиска
+        self._save_search_log(query, result, self.VENTILATION_KEYWORDS)
+        
         logger.info(
             f"Найдено: текстовых блоков={len(result.text_blocks)}, "
             f"viewport-кропов={len(result.viewport_crops)}, "
@@ -139,6 +142,60 @@ class SearchEngine:
         )
         
         return result
+
+    def _save_search_log(self, query: str, result: SearchResult, keywords: List[str]):
+        """Сохраняет лог поиска в формате Markdown."""
+        import datetime
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_path = self.data_root / f"search_log_{timestamp}.md"
+        
+        try:
+            with open(log_path, "w", encoding="utf-8") as f:
+                f.write(f"# Лог поиска: {query}\n\n")
+                
+                f.write("## 1. Запрос\n")
+                f.write(f"{query}\n\n")
+                
+                f.write("## 2. Ключевые слова-синонимы\n")
+                f.write(f"{', '.join(keywords)}\n\n")
+                
+                f.write("## 3. Список текстовых блоков\n")
+                if result.text_blocks:
+                    for i, block in enumerate(result.text_blocks, 1):
+                        f.write(f"### Блок {i}\n")
+                        if block.block_id:
+                            f.write(f"**ID:** `{block.block_id}`\n")
+                        if block.section_context:
+                            f.write(f"**Секция:** {' > '.join(block.section_context)}\n")
+                        f.write(f"**Текст:**\n{block.text}\n\n")
+                else:
+                    f.write("Текстовые блоки не найдены.\n\n")
+                
+                f.write("## 4. Список созданных изображений\n")
+                if result.viewport_crops:
+                    for i, crop in enumerate(result.viewport_crops, 1):
+                        f.write(f"- **Изображение {i}**: Страница {crop.page_number}\n")
+                        if crop.image_path:
+                            # Делаем относительный путь для удобства просмотра
+                            try:
+                                rel_path = Path(crop.image_path).relative_to(self.data_root)
+                                f.write(f"  - Ссылка: [{rel_path}]({rel_path})\n")
+                            except ValueError:
+                                f.write(f"  - Ссылка: {crop.image_path}\n")
+                        f.write(f"  - Описание: {crop.description}\n")
+                else:
+                    f.write("Изображения не создавались.\n\n")
+                
+                f.write("\n## 5. Наиболее релевантные страницы\n")
+                if result.relevant_pages:
+                    f.write(f"{', '.join(map(str, result.relevant_pages))}\n")
+                else:
+                    f.write("Релевантные страницы не определены.\n")
+                    
+            logger.info(f"Лог поиска сохранен: {log_path.absolute()}")
+            print(f"--- SEARCH LOG SAVED: {log_path.absolute()} ---")
+        except Exception as e:
+            logger.error(f"Ошибка при сохранении лога поиска: {e}")
     
     def prepare_comparison(
         self,
@@ -261,6 +318,9 @@ class SearchEngine:
                     result.relevant_pages.append(page_num)
         
         result.relevant_pages = sorted(list(set(result.relevant_pages)))
+        
+        # Сохраняем лог поиска
+        self._save_search_log(", ".join(keywords), result, keywords)
         
         return result
 

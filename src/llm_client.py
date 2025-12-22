@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import List, Optional, Dict, Any
 
 import requests
+import google.generativeai as genai
 
 from .config import config
 from .models import ViewportCrop, ZoomRequest, ImageRequest, ImageSelection
@@ -195,6 +196,10 @@ class LLMClient:
         self.history: List[Dict[str, Any]] = [] 
         # Системный промт добавляется позже, в зависимости от режима
 
+        # Инициализация Google Gemini если нужно
+        if config.GOOGLE_API_KEY:
+            genai.configure(api_key=config.GOOGLE_API_KEY)
+
         # Контроль контекста / usage
         self._context_length_cache: Dict[str, int] = {}
         self.last_usage: Optional[Dict[str, int]] = None
@@ -202,11 +207,66 @@ class LLMClient:
         self.last_prompt_estimate: Optional[Dict[str, int]] = None
         self.last_prompt_estimate_selection: Optional[Dict[str, int]] = None
 
+    def _is_google_direct(self) -> bool:
+        """Проверяет, является ли модель прямой моделью Google."""
+        return self.model in ["gemini-1.5-flash", "gemini-1.5-pro"]
+
+    def _call_google_direct(self, messages: List[Dict[str, Any]], temperature: float = 0.2, max_tokens: int = 4000, response_json: bool = False) -> str:
+        """Вызов Google API напрямую."""
+        model = genai.GenerativeModel(self.model)
+        
+        # Конвертация сообщений из OpenAI формата в формат Google
+        google_messages = []
+        system_instruction = None
+        
+        for msg in messages:
+            role = msg["role"]
+            content = msg["content"]
+            
+            if role == "system":
+                system_instruction = content
+                continue
+            
+            parts = []
+            if isinstance(content, str):
+                parts.append(content)
+            elif isinstance(content, list):
+                for part in content:
+                    if part["type"] == "text":
+                        parts.append(part["text"])
+                    elif part["type"] == "image_url":
+                        # Извлекаем base64
+                        url = part["image_url"]["url"]
+                        if url.startswith("data:image"):
+                            b64_data = url.split(",")[1]
+                            image_data = base64.b64decode(b64_data)
+                            parts.append({"mime_type": "image/jpeg", "data": image_data})
+            
+            google_messages.append({
+                "role": "user" if role == "user" else "model",
+                "parts": parts
+            })
+        
+        # Если есть системная инструкция, пересоздаем модель с ней
+        if system_instruction:
+            model = genai.GenerativeModel(self.model, system_instruction=system_instruction)
+        
+        generation_config = genai.GenerationConfig(
+            temperature=temperature,
+            max_output_tokens=max_tokens,
+            response_mime_type="application/json" if response_json else "text/plain"
+        )
+        
+        response = model.generate_content(google_messages, generation_config=generation_config)
+        return response.text
+
     def get_model_context_length(self) -> Optional[int]:
         """
-        Пытается получить длину контекста выбранной модели через OpenRouter /models.
-        Кэширует результат.
+        Пытается получить длину контекста выбранной модели.
         """
+        if self._is_google_direct():
+            return 1000000 # 1M для Gemini 1.5
+            
         if self.model in self._context_length_cache:
             return self._context_length_cache[self.model]
 
@@ -278,7 +338,35 @@ class LLMClient:
         # Прогноз (очень грубо)
         self.last_prompt_estimate_selection = self.build_context_report(messages, max_tokens=800)
         
-        # Попытки повтора для выбора картинок
+        # Если модель прямая от Google
+        if self._is_google_direct():
+            try:
+                print(f"[SELECT_IMAGES] Прямой вызов Google API для {self.model}")
+                content = self._call_google_direct(
+                    messages, 
+                    temperature=0.1, 
+                    max_tokens=800, 
+                    response_json=True
+                )
+                
+                # Попытка парсинга
+                original_content = content
+                if "```json" in content:
+                    content = content.split("```json")[1].split("```")[0].strip()
+                elif "```" in content:
+                    content = content.split("```")[1].split("```")[0].strip()
+                
+                data = json.loads(content)
+                return ImageSelection(
+                    reasoning=data.get("reasoning", ""),
+                    needs_images=data.get("needs_images", False),
+                    image_urls=data.get("image_urls", [])
+                )
+            except Exception as e:
+                print(f"[SELECT_IMAGES] ⚠️ Ошибка прямого вызова Google: {e}")
+                # Проваливаемся в общую логику (хотя она тоже может не сработать если это не OpenRouter)
+
+        # Попытки повтора для выбора картинок (OpenRouter)
         max_retries = 3
         for attempt in range(max_retries):
             try:
@@ -374,7 +462,26 @@ class LLMClient:
     def get_response(self) -> str:
         print(f"[GET_RESPONSE] Отправляю запрос к модели {self.model}")
         
-        # Попытки повтора (Retries)
+        # Если модель прямая от Google
+        if self._is_google_direct():
+            try:
+                print(f"[GET_RESPONSE] Прямой вызов Google API для {self.model}")
+                answer = self._call_google_direct(
+                    self.history,
+                    temperature=0.2,
+                    max_tokens=4000
+                )
+                if not answer:
+                    raise ValueError("Пустой ответ от Google API")
+                
+                print(f"[GET_RESPONSE] ✓ Получен ответ длиной {len(answer)} символов")
+                self.add_assistant_message(answer)
+                return answer
+            except Exception as e:
+                print(f"[GET_RESPONSE] ⚠️ Ошибка прямого вызова Google: {e}")
+                raise
+
+        # Попытки повтора (Retries) для OpenRouter
         max_retries = 3
         for attempt in range(max_retries):
             try:
@@ -450,12 +557,20 @@ class LLMClient:
             "Верни ТОЛЬКО обновлённую память (plain text)."
         )
 
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_payload},
+        ]
+
+        if self._is_google_direct():
+            try:
+                return self._call_google_direct(messages, temperature=0.1, max_tokens=600).strip()
+            except Exception:
+                return (prev_summary or "").strip()
+
         payload = {
             "model": self.model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_payload},
-            ],
+            "messages": messages,
             "temperature": 0.1,
             "max_tokens": 600,
         }
