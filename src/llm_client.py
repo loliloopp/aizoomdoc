@@ -30,7 +30,7 @@ def _estimate_tokens_for_text(text: str) -> int:
     return max(1, int(len(text.encode("utf-8")) / 4))
 
 
-def estimate_prompt_tokens(messages: List[Dict[str, Any]], image_token_cost: int = 1200) -> Dict[str, int]:
+def estimate_prompt_tokens(messages: List[Dict[str, Any]], image_token_cost: int = 120) -> Dict[str, int]:
     """
     Грубая оценка prompt-токенов для messages в OpenAI-compatible chat формате.
 
@@ -127,38 +127,42 @@ def load_analysis_prompt(data_root: Optional[Path] = None) -> str:
     default_prompt = """Ты — эксперт-инженер. Твоя задача — анализировать документацию.
 
 ПОРЯДОК РАБОТЫ (ОБЯЗАТЕЛЬНО ПЕРЕД ОТВЕТОМ):
-1. Сначала тщательно изучи текстовую информацию и таблицы (включая спецификации и OCR‑текст).
-2. Затем внимательно изучи изображения и, при необходимости, запроси ZOOM и изучи зумы.
-3. Сопоставь данные из текста/таблиц и изображений/зумов и только после этого формулируй выводы и ответ.
+1. Изучи текстовую информацию и каталог изображений.
+2. Если для ответа нужны визуальные данные, ЗАПРОСИ изображения (tool: request_images).
+3. Изучи полученные изображения (тебе придут полные версии или превью).
+4. ТОЛЬКО ЕСЛИ на превью не видны детали — запроси ZOOM (tool: zoom).
+5. Сформулируй ответ на основе фактов.
 
 ИНСТРУКЦИЯ ПО РАБОТЕ С ИЗОБРАЖЕНИЯМИ:
-1. Тебе передают текстовые описания и ИЗОБРАЖЕНИЯ (превью).
-2. Каждое изображение имеет ID (Image ID) и информацию об оригинальном размере.
-3. То, что ты видишь — это уменьшенная версия (обычно до 2000px).
-4. Если тебе нужно рассмотреть детали, используй инструмент ZOOM.
+1. Изначально ты видишь только ОПИСАНИЯ в каталоге. Сами картинки не загружены.
+2. Чтобы увидеть чертеж/схему, используй `request_images` с `image_id` из каталога.
+3. Получив изображение, ты увидишь его целиком (или сжатое превью до 2000px).
+4. Если детали слишком мелкие, используй `zoom` для получения фрагмента в исходном качестве.
+5. НЕ используй `zoom` для просмотра всего листа целиком (например `coords_norm: [0,0,1,1]`). Для этого есть `request_images`.
+
+ФОРМАТ ЗАПРОСА ИЗОБРАЖЕНИЙ (JSON):
+```json
+{
+  "tool": "request_images",
+  "image_ids": ["image_id_1", "image_id_2"],
+  "reason": "Нужно изучить схему расположения"
+}
+```
 
 ФОРМАТ ЗАПРОСА ZOOM (JSON):
 ```json
 {
   "tool": "zoom",
-  "image_id": "uuid-строка-из-описания",
+  "image_id": "image_id_1",
   "coords_px": [1000, 2000, 1500, 2500],
-  "reason": "Хочу прочитать мелкий текст в центре"
-}
-```
-
-ФОРМАТ ЗАПРОСА ДОПОЛНИТЕЛЬНЫХ ИЗОБРАЖЕНИЙ (JSON):
-```json
-{
-  "tool": "request_images",
-  "image_ids": ["image_...","image_..."],
-  "reason": "Нужно проверить маркировку/узел/таблицу на чертеже"
+  "reason": "Неразборчивый текст в таблице"
 }
 ```
 
 ВАЖНО:
-- `image_id`/`image_ids` берутся из каталога изображений или из строк вида `IMAGE [ID: ...]`.
+- `image_id`/`image_ids` бери ТОЛЬКО из каталога.
 - Если нужно несколько запросов инструментов, можно вернуть список JSON-объектов.
+- Не выдумывай ID, которых нет в каталоге.
 
 ОТВЕТ:
 Если информации достаточно, отвечай обычным текстом. Ссылайся на источники."""
@@ -211,7 +215,7 @@ class LLMClient:
         """Проверяет, является ли модель прямой моделью Google."""
         return self.model in ["gemini-1.5-flash", "gemini-1.5-pro"]
 
-    def _call_google_direct(self, messages: List[Dict[str, Any]], temperature: float = 0.2, max_tokens: int = 4000, response_json: bool = False) -> str:
+    def _call_google_direct(self, messages: List[Dict[str, Any]], temperature: float = 0.2, max_tokens: int = 50000, response_json: bool = False) -> str:
         """Вызов Google API напрямую."""
         model = genai.GenerativeModel(self.model)
         
@@ -469,7 +473,7 @@ class LLMClient:
                 answer = self._call_google_direct(
                     self.history,
                     temperature=0.2,
-                    max_tokens=4000
+                    max_tokens=50000
                 )
                 if not answer:
                     raise ValueError("Пустой ответ от Google API")
@@ -489,7 +493,7 @@ class LLMClient:
                     "model": self.model,
                     "messages": self.history,
                     "temperature": 0.2,
-                    "max_tokens": 4000  # Увеличим лимит токенов
+                    "max_tokens": 50000  # Увеличим лимит токенов
                 }
 
                 # Прогноз (очень грубо)

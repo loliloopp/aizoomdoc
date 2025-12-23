@@ -504,7 +504,10 @@ class AgentWorker(QThread):
             llm_client.add_user_message(context, images=None)
             
             step = 0
-            max_steps = 5
+            max_steps = 10
+            # Какие изображения (full/preview) уже были отправлены модели в этом запуске.
+            # Нужно, чтобы ZOOM выполнялся только после того, как модель увидела базовую картинку.
+            sent_image_ids = set()
             
             while step < max_steps and self.is_running:
                 step += 1
@@ -564,6 +567,7 @@ class AgentWorker(QThread):
                                 req_ids.append(rid)
 
                     info_msg = f"🖼️ Запрошены изображения: {', '.join(req_ids[:15])}{' ...' if len(req_ids) > 15 else ''}"
+                    self.sig_log.emit(f"LLM запросила изображения: {req_ids}")
                     self.sig_message.emit("assistant", info_msg)
                     self.save_message("assistant", info_msg)
 
@@ -580,6 +584,13 @@ class AgentWorker(QThread):
                         crop_info = image_processor.download_and_process_pdf(entry.uri, image_id=rid)
                         if crop_info:
                             downloaded_imgs.append(crop_info)
+                            try:
+                                if crop_info.target_blocks:
+                                    sent_image_ids.add(str(crop_info.target_blocks[0]))
+                                else:
+                                    sent_image_ids.add(str(rid))
+                            except Exception:
+                                sent_image_ids.add(str(rid))
                             if crop_info.image_path:
                                 self.sig_image.emit(crop_info.image_path, f"Image ID: {rid}")
 
@@ -602,6 +613,88 @@ class AgentWorker(QThread):
                 print(f"[GUI_AGENT] Zoom запросов: {len(zoom_reqs)}")
                 
                 if zoom_reqs:
+                    # 0) Если модель просит ZOOM до того, как увидела базовую картинку (full/preview),
+                    # или просит "zoom на весь лист" (coords_norm 0..1), мы НЕ выполняем zoom.
+                    # Вместо этого сначала отправляем базовое изображение и просим уточнить координаты.
+                    need_base_ids = []
+                    need_refine_ids = []
+
+                    def _is_full_frame_norm(coords_norm) -> bool:
+                        try:
+                            if not coords_norm or len(coords_norm) != 4:
+                                return False
+                            x1, y1, x2, y2 = coords_norm
+                            # Толеранс, чтобы отлавливать [0,0,1,1] и близкие варианты.
+                            return (x1 <= 0.01 and y1 <= 0.01 and x2 >= 0.99 and y2 >= 0.99)
+                        except Exception:
+                            return False
+
+                    # Собираем, какие image_id требуют базового изображения и/или уточнения координат.
+                    for zr in zoom_reqs:
+                        img_id = getattr(zr, "image_id", None)
+                        if isinstance(img_id, str) and img_id.endswith(".pdf"):
+                            img_id = img_id[:-4]
+                            zr.image_id = img_id
+
+                        if not isinstance(img_id, str) or not img_id.strip():
+                            continue
+
+                        if img_id not in sent_image_ids:
+                            if img_id not in need_base_ids:
+                                need_base_ids.append(img_id)
+
+                        # Запрещаем "zoom на весь лист" — это по сути request_images.
+                        if _is_full_frame_norm(getattr(zr, "coords_norm", None)) or (not zr.coords_norm and not zr.coords_px):
+                            if img_id not in need_refine_ids:
+                                need_refine_ids.append(img_id)
+
+                    # Если не было базовой картинки — отправляем её и просим уточнить zoom.
+                    if need_base_ids:
+                        base_imgs = []
+                        missing_ids = []
+                        for img_id in need_base_ids:
+                            if not self.is_running:
+                                return
+                            entry = doc_index.images.get(img_id)
+                            if not entry:
+                                missing_ids.append(img_id)
+                                continue
+                            self.sig_log.emit(f"Подгружаю базовое изображение перед zoom: {img_id}")
+                            base_crop = image_processor.download_and_process_pdf(entry.uri, image_id=img_id)
+                            if base_crop:
+                                base_imgs.append(base_crop)
+                                sent_image_ids.add(img_id)
+                                if base_crop.image_path:
+                                    self.sig_image.emit(base_crop.image_path, f"Image ID: {img_id}")
+
+                        if missing_ids:
+                            warn = f"⚠️ Не найдено в каталоге (для zoom): {', '.join(missing_ids[:10])}{' ...' if len(missing_ids) > 10 else ''}"
+                            self.sig_log.emit(warn)
+                            self.save_message("assistant", warn)
+
+                        if base_imgs:
+                            note = (
+                                "🖼️ Подгружены базовые изображения (full/preview). "
+                                "Если нужны детали — запроси `tool=zoom` с КОНКРЕТНЫМИ координатами (лучше `coords_norm`). "
+                                "Запрос `coords_norm: [0,0,1,1]` не считается zoom."
+                            )
+                            self.save_message("assistant", note, images=base_imgs)
+                            llm_client.add_user_message(note, images=base_imgs)
+                            continue
+
+                        llm_client.add_user_message("Не удалось загрузить базовые изображения для zoom. Укажи другие image_id из каталога.")
+                        continue
+
+                    # Если базовые картинки уже были, но zoom некорректный — просим уточнить координаты.
+                    if need_refine_ids:
+                        msg = (
+                            "⚠️ Нужны уточнённые координаты для zoom. "
+                            "Укажи `coords_norm` как рамку вокруг интересующей зоны (меньше, чем весь лист)."
+                        )
+                        self.save_message("assistant", msg)
+                        llm_client.add_user_message(msg, images=None)
+                        continue
+
                     zoom_crops = []
                     for i, zr in enumerate(zoom_reqs):
                         zoom_msg = f"🔄 *Zoom [{i+1}/{len(zoom_reqs)}]:* {zr.reason}"
