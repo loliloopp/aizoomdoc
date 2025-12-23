@@ -10,7 +10,8 @@ from pathlib import Path
 from typing import List, Optional, Dict, Any
 
 import requests
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 from .config import config
 from .models import ViewportCrop, ZoomRequest, ImageRequest, ImageSelection
@@ -202,9 +203,10 @@ class LLMClient:
         self.history: List[Dict[str, Any]] = [] 
         # Системный промт добавляется позже, в зависимости от режима
 
-        # Инициализация Google Gemini если нужно
+        # Инициализация Google Gemini
+        self.google_client = None
         if config.GOOGLE_API_KEY:
-            genai.configure(api_key=config.GOOGLE_API_KEY)
+            self.google_client = genai.Client(api_key=config.GOOGLE_API_KEY)
 
         # Контроль контекста / usage
         self._context_length_cache: Dict[str, int] = {}
@@ -215,55 +217,56 @@ class LLMClient:
 
     def _is_google_direct(self) -> bool:
         """Проверяет, является ли модель прямой моделью Google."""
-        return self.model in ["gemini-1.5-flash", "gemini-1.5-pro"]
+        return self.model in ["gemini-3-flash-preview", "gemini-3-pro-preview"]
 
-    def _call_google_direct(self, messages: List[Dict[str, Any]], temperature: float = 0.2, max_tokens: int = 50000, response_json: bool = False) -> str:
-        """Вызов Google API напрямую."""
-        model = genai.GenerativeModel(self.model)
-        
-        # Конвертация сообщений из OpenAI формата в формат Google
-        google_messages = []
+    def _call_google_direct(self, messages: List[Dict[str, Any]], temperature: float = 0.2, max_tokens: int = 4000, response_json: bool = False) -> str:
+        """Вызов нового Google GenAI API."""
+        if not self.google_client:
+            raise ValueError("GOOGLE_API_KEY не настроен")
+
+        google_contents = []
         system_instruction = None
         
         for msg in messages:
-            role = msg["role"]
-            content = msg["content"]
-            
-            if role == "system":
-                system_instruction = content
+            if msg["role"] == "system":
+                system_instruction = msg["content"]
                 continue
             
             parts = []
+            content = msg["content"]
             if isinstance(content, str):
-                parts.append(content)
+                parts.append(types.Part.from_text(text=content))
             elif isinstance(content, list):
                 for part in content:
                     if part["type"] == "text":
-                        parts.append(part["text"])
+                        parts.append(types.Part.from_text(text=part["text"]))
                     elif part["type"] == "image_url":
                         # Извлекаем base64
                         url = part["image_url"]["url"]
                         if url.startswith("data:image"):
                             b64_data = url.split(",")[1]
                             image_data = base64.b64decode(b64_data)
-                            parts.append({"mime_type": "image/jpeg", "data": image_data})
+                            parts.append(types.Part.from_bytes(data=image_data, mime_type="image/jpeg"))
             
-            google_messages.append({
-                "role": "user" if role == "user" else "model",
-                "parts": parts
-            })
+            google_contents.append(types.Content(
+                role="user" if msg["role"] == "user" else "model", 
+                parts=parts
+            ))
         
-        # Если есть системная инструкция, пересоздаем модель с ней
+        config_params = {
+            "temperature": temperature,
+            "max_output_tokens": max_tokens,
+        }
         if system_instruction:
-            model = genai.GenerativeModel(self.model, system_instruction=system_instruction)
-        
-        generation_config = genai.GenerationConfig(
-            temperature=temperature,
-            max_output_tokens=max_tokens,
-            response_mime_type="application/json" if response_json else "text/plain"
+            config_params["system_instruction"] = system_instruction
+        if response_json:
+            config_params["response_mime_type"] = "application/json"
+
+        response = self.google_client.models.generate_content(
+            model=self.model,
+            contents=google_contents,
+            config=types.GenerateContentConfig(**config_params)
         )
-        
-        response = model.generate_content(google_messages, generation_config=generation_config)
         return response.text
 
     def get_model_context_length(self) -> Optional[int]:
