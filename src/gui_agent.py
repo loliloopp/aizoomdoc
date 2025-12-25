@@ -278,6 +278,7 @@ class AgentWorker(QThread):
             if self.user_prompt:
                 full_system_prompt += f"ИНСТРУКЦИЯ ПОЛЬЗОВАТЕЛЯ (РОЛЬ): {self.user_prompt}\n\n"
             full_system_prompt += f"СИСТЕМНАЯ ИНСТРУКЦИЯ (АНАЛИЗ):\n{analysis_prompt}"
+            full_system_prompt += "\n\nIMPORTANT SYSTEM NOTE: DISABLE ALL NATIVE TOOLS. DO NOT USE FUNCTION CALLING. OUTPUT ONLY TEXT OR MARKDOWN."
             
             llm_client.history = [{"role": "system", "content": full_system_prompt}]
 

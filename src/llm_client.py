@@ -10,8 +10,11 @@ from pathlib import Path
 from typing import List, Optional, Dict, Any
 
 import requests
-from google import genai
-from google.genai import types
+import warnings
+
+# Подавление предупреждения о депрекации google.generativeai
+warnings.filterwarnings("ignore", category=FutureWarning, module="google.generativeai")
+import google.generativeai as genai
 
 from .config import config
 from .models import ViewportCrop, ZoomRequest, ImageRequest, ImageSelection
@@ -31,7 +34,7 @@ def _estimate_tokens_for_text(text: str) -> int:
     return max(1, int(len(text.encode("utf-8")) / 4))
 
 
-def estimate_prompt_tokens(messages: List[Dict[str, Any]], image_token_cost: int = 120) -> Dict[str, int]:
+def estimate_prompt_tokens(messages: List[Dict[str, Any]], image_token_cost: int = 1200) -> Dict[str, int]:
     """
     Грубая оценка prompt-токенов для messages в OpenAI-compatible chat формате.
 
@@ -122,35 +125,49 @@ def load_selection_prompt(data_root: Optional[Path] = None) -> str:
 
 def load_analysis_prompt(data_root: Optional[Path] = None) -> str:
     """
-    Загружает системный промт для анализа (Часть 1: Общая логика).
+    Загружает системный промт для анализа из файла.
+    Если файл не найден, возвращает промт по умолчанию.
     """
     default_prompt = """Ты — эксперт-инженер. Твоя задача — анализировать документацию.
 
 ПОРЯДОК РАБОТЫ (ОБЯЗАТЕЛЬНО ПЕРЕД ОТВЕТОМ):
-1. Изучи текстовую информацию и каталог изображений.
-2. Если для ответа нужны визуальные данные, ЗАПРОСИ изображения (tool: request_images). Ты можешь запрашивать ЛЮБОЕ количество изображений (хоть все сразу), если это нужно для полноты анализа.
-3. Изучи полученные изображения (тебе придут полные версии или превью).
-4. Если на превью не видны детали или ты не уверен в анализе на 100% — ОБЯЗАТЕЛЬНО запроси ZOOM (tool: zoom) для конкретных узлов.
-5. Сформулируй ответ только тогда, когда изучил все критические данные.
+1. Сначала тщательно изучи текстовую информацию и таблицы (включая спецификации и OCR‑текст).
+2. Затем внимательно изучи изображения и, при необходимости, запроси ZOOM и изучи зумы.
+3. Сопоставь данные из текста/таблиц и изображений/зумов и только после этого формулируй выводы и ответ.
 
 ИНСТРУКЦИЯ ПО РАБОТЕ С ИЗОБРАЖЕНИЯМИ:
-1. Изначально ты видишь только ОПИСАНИЯ в каталоге. Сами картинки не загружены.
-2. Чтобы увидеть чертеж/схему, используй `request_images`. Количество `image_ids` не ограничено.
+1. Тебе передают текстовые описания и ИЗОБРАЖЕНИЯ (превью).
+2. Каждое изображение имеет ID (Image ID) и информацию об оригинальном размере.
+3. То, что ты видишь — это уменьшенная версия (обычно до 2000px).
+4. Если тебе нужно рассмотреть детали, используй инструмент ZOOM.
 
-ФОРМАТ ЗАПРОСА ИЗОБРАЖЕНИЙ (JSON):
+ФОРМАТ ЗАПРОСА ZOOM (JSON):
+```json
+{
+  "tool": "zoom",
+  "image_id": "uuid-строка-из-описания",
+  "coords_px": [1000, 2000, 1500, 2500],
+  "reason": "Хочу прочитать мелкий текст в центре"
+}
+```
+
+ФОРМАТ ЗАПРОСА ДОПОЛНИТЕЛЬНЫХ ИЗОБРАЖЕНИЙ (JSON):
 ```json
 {
   "tool": "request_images",
-  "image_ids": ["image_id_1", "image_id_2", "..."],
-  "reason": "Нужно изучить все листы принципиальных схем и планов для выявления нестыковок"
+  "image_ids": ["image_...","image_..."],
+  "reason": "Нужно проверить маркировку/узел/таблицу на чертеже"
 }
 ```
 
 ВАЖНО:
-- `image_id`/`image_ids` бери ТОЛЬКО из каталога.
-- Не выдумывай ID, которых нет в каталоге.
- Ссылайся на источники."""
+- `image_id`/`image_ids` берутся из каталога изображений или из строк вида `IMAGE [ID: ...]`.
+- Если нужно несколько запросов инструментов, можно вернуть список JSON-объектов.
+
+ОТВЕТ:
+Если информации достаточно, отвечай обычным текстом. Ссылайся на источники."""
     
+    # Пытаемся найти файл с промтом
     if data_root is None:
         data_root = Path.cwd() / "data"
     
@@ -161,33 +178,24 @@ def load_analysis_prompt(data_root: Optional[Path] = None) -> str:
             with open(prompt_file, "r", encoding="utf-8") as f:
                 content = f.read().strip()
                 if content:
+                    logger.info(f"Загружен пользовательский промт из {prompt_file}")
                     return content
         except Exception as e:
-            logger.warning(f"Ошибка чтения llm_system_prompt.txt: {e}")
+            logger.warning(f"Ошибка чтения файла промта: {e}. Используется промт по умолчанию.")
     
     return default_prompt
 
 def load_zoom_prompt(data_root: Optional[Path] = None) -> str:
     """
-    Загружает системный промт для ZOOM (Часть 2: Техническая инструкция).
+    Загружает промт для режима ZOOM из файла.
+    Если файл не найден, возвращает промт по умолчанию.
     """
-    default_prompt = """ИНСТРУКЦИЯ ПО ZOOM:
-1. Если на превью не видны детали или ты не уверен в анализе на 100% — ОБЯЗАТЕЛЬНО запроси ZOOM (tool: zoom).
-2. Если после первого ZOOM картина не ясна или нужно проверить соседний узел — запрашивай ZOOM ПОВТОРНО. Не делай окончательных выводов на основе догадок.
-3. Получив изображение, ты увидишь его целиком (или сжатое превью до 2000px).
-4. Если детали слишком мелкие или текст неразборчив, используй `zoom` для получения фрагмента в исходном качестве.
-5. НЕ используй `zoom` для просмотра всего листа целиком (например `coords_norm: [0,0,1,1]`). Для этого есть `request_images`.
-6. ТРЕБУЙ дополнительные зумы до тех пор, пока не будешь ТВЕРДО УБЕЖДЕН в своем анализе.
-
-ФОРМАТ ЗАПРОСА ZOOM (JSON):
-```json
-{
-  "tool": "zoom",
-  "image_id": "image_id_1",
-  "coords_px": [1000, 2000, 1500, 2500],
-  "reason": "Неразборчивый текст в таблице"
-}
-```"""
+    default_prompt = """Ты находишься в режиме анализа ZOOM-фрагмента (увеличенная часть изображения).
+Твоя задача:
+1. Внимательно изучить детали на этом фрагменте (текст, цифры, обозначения).
+2. Сопоставить увиденное с предыдущим контекстом.
+3. Ответить на вопрос пользователя.
+"""
     
     if data_root is None:
         data_root = Path.cwd() / "data"
@@ -199,11 +207,43 @@ def load_zoom_prompt(data_root: Optional[Path] = None) -> str:
             with open(prompt_file, "r", encoding="utf-8") as f:
                 content = f.read().strip()
                 if content:
+                    logger.info(f"Загружен пользовательский промт ZOOM из {prompt_file}")
                     return content
         except Exception as e:
-            logger.warning(f"Ошибка чтения zoom_prompt.txt: {e}")
+            logger.warning(f"Ошибка чтения файла промта ZOOM: {e}. Используется промт по умолчанию.")
     
     return default_prompt
+
+def extract_json_objects(text: str) -> List[Any]:
+    """
+    Пытается извлечь все JSON-объекты из текста,
+    даже если они смешаны с обычным текстом и не находятся в блоках кода.
+    """
+    results = []
+    decoder = json.JSONDecoder()
+    pos = 0
+    length = len(text)
+    
+    while pos < length:
+        # Ищем начало JSON ('{' или '[')
+        search_pos = pos
+        # Находим первый попавшийся символ { или [
+        # (упрощенно, ищем просто { так как нас интересуют объекты tools)
+        idx_brace = text.find('{', search_pos)
+        
+        if idx_brace == -1:
+            break
+            
+        # Пробуем распарсить
+        try:
+            obj, end_idx = decoder.raw_decode(text[idx_brace:])
+            results.append(obj)
+            pos = idx_brace + end_idx
+        except json.JSONDecodeError:
+            # Если не вышло, сдвигаемся на 1 символ
+            pos = idx_brace + 1
+            
+    return results
 
 class LLMClient:
     def __init__(self, model: Optional[str] = None, data_root: Optional[Path] = None):
@@ -220,10 +260,9 @@ class LLMClient:
         self.history: List[Dict[str, Any]] = [] 
         # Системный промт добавляется позже, в зависимости от режима
 
-        # Инициализация Google Gemini
-        self.google_client = None
+        # Инициализация Google Gemini если нужно
         if config.GOOGLE_API_KEY:
-            self.google_client = genai.Client(api_key=config.GOOGLE_API_KEY)
+            genai.configure(api_key=config.GOOGLE_API_KEY)
 
         # Контроль контекста / usage
         self._context_length_cache: Dict[str, int] = {}
@@ -234,80 +273,56 @@ class LLMClient:
 
     def _is_google_direct(self) -> bool:
         """Проверяет, является ли модель прямой моделью Google."""
-        return self.model in ["gemini-3-flash-preview", "gemini-3-pro-preview"]
+        return self.model in ["gemini-1.5-flash", "gemini-1.5-pro"]
 
-    def _call_google_direct(
-        self,
-        messages: List[Dict[str, Any]],
-        temperature: float = 0.2,
-        max_tokens: int = 4000,
-        response_json: bool = False,
-        model_override: Optional[str] = None,
-    ) -> str:
-        """Вызов нового Google GenAI API с обработкой лимитов (429)."""
-        if not self.google_client:
-            raise ValueError("GOOGLE_API_KEY не настроен")
-
-        import time
-        max_retries = 3
-        delay = 15 # Для бесплатного уровня Gemini нужно ждать заметно
-
-        for attempt in range(max_retries):
-            try:
-                google_contents = []
-                system_instruction = None
-                
-                for msg in messages:
-                    if msg["role"] == "system":
-                        system_instruction = msg["content"]
-                        continue
-                    
-                    parts = []
-                    content = msg["content"]
-                    if isinstance(content, str):
-                        parts.append(types.Part.from_text(text=content))
-                    elif isinstance(content, list):
-                        for part in content:
-                            if part["type"] == "text":
-                                parts.append(types.Part.from_text(text=part["text"]))
-                            elif part["type"] == "image_url":
-                                # Извлекаем base64
-                                url = part["image_url"]["url"]
-                                if url.startswith("data:image"):
-                                    b64_data = url.split(",")[1]
-                                    image_data = base64.b64decode(b64_data)
-                                    parts.append(types.Part.from_bytes(data=image_data, mime_type="image/jpeg"))
-                    
-                    google_contents.append(types.Content(
-                        role="user" if msg["role"] == "user" else "model", 
-                        parts=parts
-                    ))
-                
-                config_params = {
-                    "temperature": temperature,
-                    "max_output_tokens": max_tokens,
-                }
-                if system_instruction:
-                    config_params["system_instruction"] = system_instruction
-                if response_json:
-                    config_params["response_mime_type"] = "application/json"
-
-                response = self.google_client.models.generate_content(
-                    model=(model_override or self.model),
-                    contents=google_contents,
-                    config=types.GenerateContentConfig(**config_params)
-                )
-                return response.text
-            except Exception as e:
-                err_str = str(e).lower()
-                if "429" in err_str or "resource_exhausted" in err_str:
-                    if attempt < max_retries - 1:
-                        logger.warning(f"⚠️ Лимит Google API (429). Попытка {attempt+1}, жду {delay}с...")
-                        time.sleep(delay)
-                        continue
-                raise e
+    def _call_google_direct(self, messages: List[Dict[str, Any]], temperature: float = 0.2, max_tokens: int = 4000, response_json: bool = False) -> str:
+        """Вызов Google API напрямую."""
+        model = genai.GenerativeModel(self.model)
         
-        raise ValueError("Не удалось получить ответ от Google API после повторов")
+        # Конвертация сообщений из OpenAI формата в формат Google
+        google_messages = []
+        system_instruction = None
+        
+        for msg in messages:
+            role = msg["role"]
+            content = msg["content"]
+            
+            if role == "system":
+                system_instruction = content
+                continue
+            
+            parts = []
+            if isinstance(content, str):
+                parts.append(content)
+            elif isinstance(content, list):
+                for part in content:
+                    if part["type"] == "text":
+                        parts.append(part["text"])
+                    elif part["type"] == "image_url":
+                        # Извлекаем base64
+                        url = part["image_url"]["url"]
+                        if url.startswith("data:image"):
+                            b64_data = url.split(",")[1]
+                            image_data = base64.b64decode(b64_data)
+                            parts.append({"mime_type": "image/jpeg", "data": image_data})
+            
+            google_messages.append({
+                "role": "user" if role == "user" else "model",
+                "parts": parts
+            })
+        
+        # Если есть системная инструкция, пересоздаем модель с ней
+        if system_instruction:
+            model = genai.GenerativeModel(self.model, system_instruction=system_instruction)
+        
+        generation_config = genai.GenerationConfig(
+            temperature=temperature,
+            max_output_tokens=max_tokens,
+            response_mime_type="application/json" if response_json else "text/plain"
+        )
+        
+        response = model.generate_content(google_messages, generation_config=generation_config)
+        return response.text
 
     def get_model_context_length(self) -> Optional[int]:
         """
@@ -387,35 +402,7 @@ class LLMClient:
         # Прогноз (очень грубо)
         self.last_prompt_estimate_selection = self.build_context_report(messages, max_tokens=800)
         
-        # Если модель прямая от Google
-        if self._is_google_direct():
-            try:
-                print(f"[SELECT_IMAGES] Прямой вызов Google API для {self.model}")
-                content = self._call_google_direct(
-                    messages, 
-                    temperature=0.1, 
-                    max_tokens=800, 
-                    response_json=True
-                )
-                
-                # Попытка парсинга
-                original_content = content
-                if "```json" in content:
-                    content = content.split("```json")[1].split("```")[0].strip()
-                elif "```" in content:
-                    content = content.split("```")[1].split("```")[0].strip()
-                
-                data = json.loads(content)
-                return ImageSelection(
-                    reasoning=data.get("reasoning", ""),
-                    needs_images=data.get("needs_images", False),
-                    image_urls=data.get("image_urls", [])
-                )
-            except Exception as e:
-                print(f"[SELECT_IMAGES] ⚠️ Ошибка прямого вызова Google: {e}")
-                # Проваливаемся в общую логику (хотя она тоже может не сработать если это не OpenRouter)
-
-        # Попытки повтора для выбора картинок (OpenRouter)
+        # Попытки повтора для выбора картинок
         max_retries = 3
         for attempt in range(max_retries):
             try:
@@ -511,50 +498,32 @@ class LLMClient:
     def get_response(self) -> str:
         print(f"[GET_RESPONSE] Отправляю запрос к модели {self.model}")
         
-        # Если модель прямая от Google
-        if self._is_google_direct():
-            try:
-                print(f"[GET_RESPONSE] Прямой вызов Google API для {self.model}")
-                answer = self._call_google_direct(
-                    self.history,
-                    temperature=0.2,
-                    max_tokens=50000
-                )
-                if not answer:
-                    raise ValueError("Пустой ответ от Google API")
-                
-                print(f"[GET_RESPONSE] ✓ Получен ответ длиной {len(answer)} символов")
-                self.add_assistant_message(answer)
-                return answer
-            except Exception as e:
-                print(f"[GET_RESPONSE] ⚠️ Ошибка прямого вызова Google: {e}")
-                raise
-
-        # Попытки повтора (Retries) для OpenRouter
+        # Попытки повтора (Retries)
         max_retries = 3
         for attempt in range(max_retries):
             try:
+                # Подготовка payload
                 payload = {
                     "model": self.model,
                     "messages": self.history,
                     "temperature": 0.2,
-                    "max_tokens": 50000  # Увеличим лимит токенов
+                    "max_tokens": 4000,
                 }
                 
-                # ВАЖНО: у Gemini 3 в OpenRouter бывают нестабильности по провайдерам.
-                # По наблюдениям, "Google AI Studio" ведёт себя заметно стабильнее, чем "Google"
-                # (в т.ч. меньше случаев native_finish_reason=MALFORMED_FUNCTION_CALL).
-                try:
-                    m = str(self.model or "")
-                    if m.startswith("google/gemini-3-"):
-                        # 1-я попытка — жёстко фиксируем AI Studio без фолбэков.
-                        # Далее можно разрешить фолбэки, если захотим повысить живучесть.
-                        payload["provider"] = {
-                            "order": ["Google AI Studio"],
-                            "allow_fallbacks": False if attempt == 0 else True
-                        }
-                except Exception:
-                    pass
+                # Специфичный хак для Gemini 3 на OpenRouter
+                if "gemini-3" in self.model or "gemini-2" in self.model:
+                    # Пробуем разные варианты отключения тулов
+                    payload["tool_config"] = {"function_calling_config": {"mode": "NONE"}}
+                    payload["toolConfig"] = {"functionCallingConfig": {"mode": "NONE"}}
+                    # OpenAI standard
+                    payload["tool_choice"] = "none"
+                    # payload["tools"] = [] # Опасно без tool_choice, но с tool_choice может требоваться. Пока не рискуем.
+                    
+                    # Также попробуем добавить явный hint в сообщениях, если это не system
+                    # (но лучше не менять историю).
+                    
+                # Дополнительные поля, которые могут помочь
+                # payload["tools"] = [] # Опасно, может вызвать 400 если пустой список
 
                 # Прогноз (очень грубо)
                 self.last_prompt_estimate = self.build_context_report(self.history, max_tokens=payload["max_tokens"])
@@ -578,99 +547,12 @@ class LLMClient:
                 
                 if not response_data.get("choices"):
                     print(f"[GET_RESPONSE] ⚠️ Попытка {attempt+1}: Нет choices в ответе")
-                    print(f"[GET_RESPONSE] RAW RESPONSE: {response_data}")
-                    if attempt < max_retries - 1:
-                        print("[GET_RESPONSE] Жду 10 сек перед повтором...")
-                        import time
-                        time.sleep(10)
                     continue
                 
-                # OpenRouter иногда возвращает tool_calls/function_call с пустым content.
-                # Наш пайплайн ожидает текст, поэтому аккуратно "превращаем" tool-вызовы в JSON-текст.
-                choice0 = response_data["choices"][0] if isinstance(response_data["choices"], list) and response_data["choices"] else {}
-                msg = choice0.get("message", {}) if isinstance(choice0, dict) else {}
-                answer = msg.get("content", "") if isinstance(msg, dict) else ""
-
-                if not answer:
-                    tool_payloads: List[Dict[str, Any]] = []
-                    allowed_tools = {"request_images", "zoom"}
-
-                    # Новый формат: tool_calls (OpenAI-compatible)
-                    tool_calls = msg.get("tool_calls") if isinstance(msg, dict) else None
-                    if isinstance(tool_calls, list):
-                        for tc in tool_calls:
-                            if not isinstance(tc, dict):
-                                continue
-                            fn = tc.get("function") or {}
-                            if not isinstance(fn, dict):
-                                continue
-                            name = fn.get("name")
-                            args = fn.get("arguments")
-                            if not isinstance(name, str) or not name.strip():
-                                continue
-                            name = name.strip()
-                            # Игнорируем неизвестные/служебные tool'ы (например "thought:")
-                            if name not in allowed_tools:
-                                continue
-
-                            parsed_args: Dict[str, Any] = {}
-                            if isinstance(args, str) and args.strip():
-                                try:
-                                    parsed = json.loads(args)
-                                    if isinstance(parsed, dict):
-                                        parsed_args = parsed
-                                except Exception:
-                                    # Если не JSON, кладем как есть
-                                    parsed_args = {"arguments_raw": args}
-                            elif isinstance(args, dict):
-                                parsed_args = args
-
-                            tool_payloads.append({"tool": name, **(parsed_args or {})})
-
-                    # Старый формат: function_call
-                    if not tool_payloads:
-                        function_call = msg.get("function_call") if isinstance(msg, dict) else None
-                        if isinstance(function_call, dict):
-                            name = function_call.get("name")
-                            args = function_call.get("arguments")
-                            if isinstance(name, str) and name.strip():
-                                name = name.strip()
-                                if name not in allowed_tools:
-                                    # Не принимаем неизвестные function_call как валидный ответ
-                                    name = ""
-                                if not name:
-                                    # Оставляем tool_payloads пустым => сработает ретрай по "Пустой content"
-                                    pass
-                                parsed_args: Dict[str, Any] = {}
-                                if isinstance(args, str) and args.strip():
-                                    try:
-                                        parsed = json.loads(args)
-                                        if isinstance(parsed, dict):
-                                            parsed_args = parsed
-                                    except Exception:
-                                        parsed_args = {"arguments_raw": args}
-                                elif isinstance(args, dict):
-                                    parsed_args = args
-                                if name:
-                                    tool_payloads.append({"tool": name, **(parsed_args or {})})
-
-                    if tool_payloads:
-                        answer = "```json\n" + json.dumps(tool_payloads, ensure_ascii=False, indent=2) + "\n```"
-                        print(f"[GET_RESPONSE] ℹ️ Получен tool_call (content пустой). Конвертирую в JSON-текст, tools={len(tool_payloads)}")
+                answer = response_data["choices"][0]["message"].get("content", "")
                 
                 if not answer:
                     print(f"[GET_RESPONSE] ⚠️ Попытка {attempt+1}: Пустой content")
-                    try:
-                        # Доп.диагностика: что именно пришло в message
-                        if isinstance(msg, dict):
-                            keys = list(msg.keys())
-                            print(f"[GET_RESPONSE] message keys: {keys}")
-                            if "tool_calls" in msg:
-                                print(f"[GET_RESPONSE] tool_calls type: {type(msg.get('tool_calls'))}")
-                            if "function_call" in msg:
-                                print(f"[GET_RESPONSE] function_call type: {type(msg.get('function_call'))}")
-                    except Exception:
-                        pass
                     # Если пустой ответ - пробуем еще раз
                     continue
                 
@@ -684,28 +566,6 @@ class LLMClient:
                     logger.error(f"LLM Error after retries: {e}")
                     raise
         
-        # Последний шанс: если выбрана модель Gemini 3 через OpenRouter (google/...), а GOOGLE_API_KEY настроен,
-        # пробуем прямой вызов Google API (обходит нестабильности OpenRouter/провайдера).
-        try:
-            m = str(self.model or "")
-            if config.GOOGLE_API_KEY and m.startswith("google/gemini-3-"):
-                direct_model = m.split("/", 1)[1]
-                print(f"[GET_RESPONSE] ⚠️ OpenRouter не дал ответа. Пробую прямой Google API: {direct_model}")
-                answer = self._call_google_direct(
-                    self.history,
-                    temperature=0.2,
-                    max_tokens=50000,
-                    response_json=False,
-                    model_override=direct_model,
-                )
-                if answer:
-                    print(f"[GET_RESPONSE] ✓ Получен ответ длиной {len(answer)} символов (Google direct fallback)")
-                    self.add_assistant_message(answer)
-                    return answer
-        except Exception as _fallback_err:
-            # Если фолбэк тоже не сработал — возвращаем исходную ошибку ниже.
-            pass
-
         raise ValueError("Не удалось получить ответ от модели после 3 попыток")
 
     def update_memory_summary(self, prev_summary: str, user_message: str, assistant_message: str) -> str:
@@ -730,20 +590,12 @@ class LLMClient:
             "Верни ТОЛЬКО обновлённую память (plain text)."
         )
 
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_payload},
-        ]
-
-        if self._is_google_direct():
-            try:
-                return self._call_google_direct(messages, temperature=0.1, max_tokens=600).strip()
-            except Exception:
-                return (prev_summary or "").strip()
-
         payload = {
             "model": self.model,
-            "messages": messages,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_payload},
+            ],
             "temperature": 0.1,
             "max_tokens": 600,
         }
@@ -770,36 +622,26 @@ class LLMClient:
 
     def parse_zoom_request(self, response_text: str) -> List[ZoomRequest]:
         response_text = response_text.strip()
-        data = None
+        data_list = []
         
-        # Попытка найти JSON внутри текста, даже если он не в начале
-        json_start = response_text.find("```json")
-        if json_start != -1:
-            try:
-                json_str = response_text.split("```json")[1].split("```")[0].strip()
-                data = json.loads(json_str)
-            except Exception as e:
-                print(f"[ZOOM_PARSE] ⚠️ Ошибка в блоке ```json: {e}")
-        elif "```" in response_text: # Иногда модель забывает 'json'
-             try:
-                json_str = response_text.split("```")[1].split("```")[0].strip()
-                data = json.loads(json_str)
-             except Exception as e:
-                print(f"[ZOOM_PARSE] ⚠️ Ошибка в блоке ```: {e}")
-        elif response_text.startswith("{") or response_text.startswith("["):
-             try:
-                data = json.loads(response_text)
-             except Exception as e:
-                print(f"[ZOOM_PARSE] ⚠️ Ошибка raw JSON: {e}")
-            
-        # Превращаем в список, если это один объект
-        if isinstance(data, dict):
-            data_list = [data]
-        elif isinstance(data, list):
-            data_list = data
-        else:
-            return []
-            
+        # 1. Попытка извлечь из markdown блоков (для надежности)
+        # Ищем ```json ... ``` и просто ``` ... ```
+        code_blocks = re.findall(r"```(?:json)?\s*([\s\S]*?)\s*```", response_text, re.IGNORECASE)
+        for block in code_blocks:
+             extracted = extract_json_objects(block)
+             data_list.extend(extracted)
+
+        # 2. Если ничего не нашли или если модель пишет вне блоков, сканируем весь текст
+        # extract_json_objects достаточно умная, чтобы найти объекты в мусоре
+        all_objects = extract_json_objects(response_text)
+        
+        # Объединяем, убирая дубликаты (по контенту сложно, но объекты разные)
+        # Просто берем all_objects, так как он охватывает и то что внутри блоков
+        # Но чтобы сохранить приоритет блоков (если вдруг), можно оставить логику.
+        # Однако extract_json_objects(response_text) найдет ВСЁ, включая то что в блоках.
+        # Поэтому просто используем его.
+        data_list = all_objects
+
         zoom_requests = []
         for item in data_list:
             if isinstance(item, dict) and item.get("tool") == "zoom":
@@ -815,42 +657,13 @@ class LLMClient:
     def parse_image_requests(self, response_text: str) -> List[ImageRequest]:
         """
         Ищет в ответе JSON-команды tool=request_images и возвращает список ImageRequest.
-        Поддерживает:
-        - один объект
-        - список объектов
-        - JSON внутри ```json``` или ```...```
         """
         response_text = (response_text or "").strip()
         if not response_text:
             return []
 
-        data_list: List[dict] = []
-
-        # 1) JSON в fenced blocks
-        json_blocks = re.findall(r"```json\s*(\{.*?\}|\[.*?\])\s*```", response_text, re.DOTALL | re.IGNORECASE)
-        if not json_blocks:
-            json_blocks = re.findall(r"```\s*(\{.*?\}|\[.*?\])\s*```", response_text, re.DOTALL)
-
-        for block in json_blocks:
-            try:
-                parsed = json.loads(block)
-                if isinstance(parsed, dict):
-                    data_list.append(parsed)
-                elif isinstance(parsed, list):
-                    data_list.extend([x for x in parsed if isinstance(x, dict)])
-            except Exception as e:
-                print(f"[IMG_REQ_PARSE] ⚠️ Ошибка парсинга json блока: {e}", flush=True)
-
-        # 2) raw json (редко, но бывает)
-        if not data_list and (response_text.startswith("{") or response_text.startswith("[")):
-            try:
-                parsed = json.loads(response_text)
-                if isinstance(parsed, dict):
-                    data_list.append(parsed)
-                elif isinstance(parsed, list):
-                    data_list.extend([x for x in parsed if isinstance(x, dict)])
-            except Exception:
-                pass
+        # Используем универсальный экстрактор
+        data_list = extract_json_objects(response_text)
 
         requests_out: List[ImageRequest] = []
         for item in data_list:

@@ -26,7 +26,7 @@ class Config:
 
     DEFAULT_MODEL: str = os.getenv(
         "DEFAULT_MODEL", 
-        "gemini-3-flash-preview"
+        "gemini-1.5-flash"
     )
     
     # Пути к данным
