@@ -236,7 +236,14 @@ class LLMClient:
         """Проверяет, является ли модель прямой моделью Google."""
         return self.model in ["gemini-3-flash-preview", "gemini-3-pro-preview"]
 
-    def _call_google_direct(self, messages: List[Dict[str, Any]], temperature: float = 0.2, max_tokens: int = 4000, response_json: bool = False) -> str:
+    def _call_google_direct(
+        self,
+        messages: List[Dict[str, Any]],
+        temperature: float = 0.2,
+        max_tokens: int = 4000,
+        response_json: bool = False,
+        model_override: Optional[str] = None,
+    ) -> str:
         """Вызов нового Google GenAI API с обработкой лимитов (429)."""
         if not self.google_client:
             raise ValueError("GOOGLE_API_KEY не настроен")
@@ -286,7 +293,7 @@ class LLMClient:
                     config_params["response_mime_type"] = "application/json"
 
                 response = self.google_client.models.generate_content(
-                    model=self.model,
+                    model=(model_override or self.model),
                     contents=google_contents,
                     config=types.GenerateContentConfig(**config_params)
                 )
@@ -533,6 +540,21 @@ class LLMClient:
                     "temperature": 0.2,
                     "max_tokens": 50000  # Увеличим лимит токенов
                 }
+                
+                # ВАЖНО: у Gemini 3 в OpenRouter бывают нестабильности по провайдерам.
+                # По наблюдениям, "Google AI Studio" ведёт себя заметно стабильнее, чем "Google"
+                # (в т.ч. меньше случаев native_finish_reason=MALFORMED_FUNCTION_CALL).
+                try:
+                    m = str(self.model or "")
+                    if m.startswith("google/gemini-3-"):
+                        # 1-я попытка — жёстко фиксируем AI Studio без фолбэков.
+                        # Далее можно разрешить фолбэки, если захотим повысить живучесть.
+                        payload["provider"] = {
+                            "order": ["Google AI Studio"],
+                            "allow_fallbacks": False if attempt == 0 else True
+                        }
+                except Exception:
+                    pass
 
                 # Прогноз (очень грубо)
                 self.last_prompt_estimate = self.build_context_report(self.history, max_tokens=payload["max_tokens"])
@@ -563,10 +585,92 @@ class LLMClient:
                         time.sleep(10)
                     continue
                 
-                answer = response_data["choices"][0]["message"].get("content", "")
+                # OpenRouter иногда возвращает tool_calls/function_call с пустым content.
+                # Наш пайплайн ожидает текст, поэтому аккуратно "превращаем" tool-вызовы в JSON-текст.
+                choice0 = response_data["choices"][0] if isinstance(response_data["choices"], list) and response_data["choices"] else {}
+                msg = choice0.get("message", {}) if isinstance(choice0, dict) else {}
+                answer = msg.get("content", "") if isinstance(msg, dict) else ""
+
+                if not answer:
+                    tool_payloads: List[Dict[str, Any]] = []
+                    allowed_tools = {"request_images", "zoom"}
+
+                    # Новый формат: tool_calls (OpenAI-compatible)
+                    tool_calls = msg.get("tool_calls") if isinstance(msg, dict) else None
+                    if isinstance(tool_calls, list):
+                        for tc in tool_calls:
+                            if not isinstance(tc, dict):
+                                continue
+                            fn = tc.get("function") or {}
+                            if not isinstance(fn, dict):
+                                continue
+                            name = fn.get("name")
+                            args = fn.get("arguments")
+                            if not isinstance(name, str) or not name.strip():
+                                continue
+                            name = name.strip()
+                            # Игнорируем неизвестные/служебные tool'ы (например "thought:")
+                            if name not in allowed_tools:
+                                continue
+
+                            parsed_args: Dict[str, Any] = {}
+                            if isinstance(args, str) and args.strip():
+                                try:
+                                    parsed = json.loads(args)
+                                    if isinstance(parsed, dict):
+                                        parsed_args = parsed
+                                except Exception:
+                                    # Если не JSON, кладем как есть
+                                    parsed_args = {"arguments_raw": args}
+                            elif isinstance(args, dict):
+                                parsed_args = args
+
+                            tool_payloads.append({"tool": name, **(parsed_args or {})})
+
+                    # Старый формат: function_call
+                    if not tool_payloads:
+                        function_call = msg.get("function_call") if isinstance(msg, dict) else None
+                        if isinstance(function_call, dict):
+                            name = function_call.get("name")
+                            args = function_call.get("arguments")
+                            if isinstance(name, str) and name.strip():
+                                name = name.strip()
+                                if name not in allowed_tools:
+                                    # Не принимаем неизвестные function_call как валидный ответ
+                                    name = ""
+                                if not name:
+                                    # Оставляем tool_payloads пустым => сработает ретрай по "Пустой content"
+                                    pass
+                                parsed_args: Dict[str, Any] = {}
+                                if isinstance(args, str) and args.strip():
+                                    try:
+                                        parsed = json.loads(args)
+                                        if isinstance(parsed, dict):
+                                            parsed_args = parsed
+                                    except Exception:
+                                        parsed_args = {"arguments_raw": args}
+                                elif isinstance(args, dict):
+                                    parsed_args = args
+                                if name:
+                                    tool_payloads.append({"tool": name, **(parsed_args or {})})
+
+                    if tool_payloads:
+                        answer = "```json\n" + json.dumps(tool_payloads, ensure_ascii=False, indent=2) + "\n```"
+                        print(f"[GET_RESPONSE] ℹ️ Получен tool_call (content пустой). Конвертирую в JSON-текст, tools={len(tool_payloads)}")
                 
                 if not answer:
                     print(f"[GET_RESPONSE] ⚠️ Попытка {attempt+1}: Пустой content")
+                    try:
+                        # Доп.диагностика: что именно пришло в message
+                        if isinstance(msg, dict):
+                            keys = list(msg.keys())
+                            print(f"[GET_RESPONSE] message keys: {keys}")
+                            if "tool_calls" in msg:
+                                print(f"[GET_RESPONSE] tool_calls type: {type(msg.get('tool_calls'))}")
+                            if "function_call" in msg:
+                                print(f"[GET_RESPONSE] function_call type: {type(msg.get('function_call'))}")
+                    except Exception:
+                        pass
                     # Если пустой ответ - пробуем еще раз
                     continue
                 
@@ -580,6 +684,28 @@ class LLMClient:
                     logger.error(f"LLM Error after retries: {e}")
                     raise
         
+        # Последний шанс: если выбрана модель Gemini 3 через OpenRouter (google/...), а GOOGLE_API_KEY настроен,
+        # пробуем прямой вызов Google API (обходит нестабильности OpenRouter/провайдера).
+        try:
+            m = str(self.model or "")
+            if config.GOOGLE_API_KEY and m.startswith("google/gemini-3-"):
+                direct_model = m.split("/", 1)[1]
+                print(f"[GET_RESPONSE] ⚠️ OpenRouter не дал ответа. Пробую прямой Google API: {direct_model}")
+                answer = self._call_google_direct(
+                    self.history,
+                    temperature=0.2,
+                    max_tokens=50000,
+                    response_json=False,
+                    model_override=direct_model,
+                )
+                if answer:
+                    print(f"[GET_RESPONSE] ✓ Получен ответ длиной {len(answer)} символов (Google direct fallback)")
+                    self.add_assistant_message(answer)
+                    return answer
+        except Exception as _fallback_err:
+            # Если фолбэк тоже не сработал — возвращаем исходную ошибку ниже.
+            pass
+
         raise ValueError("Не удалось получить ответ от модели после 3 попыток")
 
     def update_memory_summary(self, prev_summary: str, user_message: str, assistant_message: str) -> str:
