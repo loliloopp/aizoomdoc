@@ -31,13 +31,15 @@ class AgentWorker(QThread):
     sig_usage = pyqtSignal(int, int) # used, remaining
     
     def __init__(self, data_root: Path, query: str, model: str, md_files: List[str] = None, 
-                 existing_chat_id: str = None, existing_db_chat_id: str = None, md_mode: str = "rag"):
+                 existing_chat_id: str = None, existing_db_chat_id: str = None, md_mode: str = "rag",
+                 user_prompt: str = None):
         super().__init__()
         self.data_root = data_root
         self.query = query
         self.model = model
         self.md_files = md_files or []
         self.md_mode = md_mode
+        self.user_prompt = user_prompt
         self.is_running = True
         
         if existing_chat_id:
@@ -267,9 +269,17 @@ class AgentWorker(QThread):
             llm_client = LLMClient(model=self.model, data_root=self.data_root)
             
             # Инициализируем диалог с историей, если она есть
-            from .llm_client import load_analysis_prompt
+            from .llm_client import load_analysis_prompt, load_zoom_prompt
             analysis_prompt = load_analysis_prompt(self.data_root)
-            llm_client.history = [{"role": "system", "content": analysis_prompt}]
+            zoom_prompt = load_zoom_prompt(self.data_root)
+            
+            # Формируем начальный системный промт: Пользовательский -> Системный 1
+            full_system_prompt = ""
+            if self.user_prompt:
+                full_system_prompt += f"ИНСТРУКЦИЯ ПОЛЬЗОВАТЕЛЯ (РОЛЬ): {self.user_prompt}\n\n"
+            full_system_prompt += f"СИСТЕМНАЯ ИНСТРУКЦИЯ (АНАЛИЗ):\n{analysis_prompt}"
+            
+            llm_client.history = [{"role": "system", "content": full_system_prompt}]
 
             # Краткая память диалога (устойчиво для длинных чатов)
             memory_path = self.chat_dir / "memory.txt"
@@ -436,7 +446,8 @@ class AgentWorker(QThread):
             # Цикл формирования контекста с попыткой впихнуть максимум
             while tail_n >= 0:
                 # Очищаем историю для новой попытки
-                llm_client.history = [{"role": "system", "content": analysis_prompt}]
+                llm_client.history = [{"role": "system", "content": full_system_prompt}]
+                
                 if memory_path.exists():
                     try:
                         mem = memory_path.read_text(encoding="utf-8").strip()
@@ -454,9 +465,9 @@ class AgentWorker(QThread):
                     catalog_text = "\n".join([f"- {e.image_id} (стр. {e.page}): {e.content_summary[:150]}" for e in img_entries])
                     
                     context = (
-                        f"ЗАПРОС ПОЛЬЗОВАТЕЛЯ:\n{self.query}\n\n"
                         f"ПОЛНЫЙ ТЕКСТ ДОКУМЕНТА:\n{strip_json_blocks(full_md_text)}\n\n"
                         f"КАТАЛОГ ИЗОБРАЖЕНИЙ:\n{catalog_text}\n\n"
+                        f"ЗАПРОС ПОЛЬЗОВАТЕЛЯ:\n{self.query}\n\n"
                         f"Используй tool=request_images и tool=zoom для работы с графикой."
                     )
                 else:
@@ -469,9 +480,9 @@ class AgentWorker(QThread):
                     snippets_text = "\n\n".join([f"[{cid}]\n{txt}" for cid, txt in text_snippets])
                     
                     context = (
-                        f"ЗАПРОС ПОЛЬЗОВАТЕЛЯ:\n{self.query}\n\n"
                         f"РЕЛЕВАНТНЫЕ ФРАГМЕНТЫ:\n{snippets_text}\n\n"
                         f"КАТАЛОГ ИЗОБРАЖЕНИЙ:\n{catalog_text}\n\n"
+                        f"ЗАПРОС ПОЛЬЗОВАТЕЛЯ:\n{self.query}\n\n"
                         f"Используй tool=request_images для просмотра чертежей."
                     )
 
@@ -613,6 +624,9 @@ class AgentWorker(QThread):
                 print(f"[GUI_AGENT] Zoom запросов: {len(zoom_reqs)}")
                 
                 if zoom_reqs:
+                    # При запросе зума добавляем системный промт 2 (ZOOM инструкции)
+                    llm_client.history.append({"role": "system", "content": f"ТЕХНИЧЕСКАЯ ИНСТРУКЦИЯ ПО ZOOM:\n{zoom_prompt}"})
+                    
                     # 0) Если модель просит ZOOM до того, как увидела базовую картинку (full/preview),
                     # или просит "zoom на весь лист" (coords_norm 0..1), мы НЕ выполняем zoom.
                     # Вместо этого сначала отправляем базовое изображение и просим уточнить координаты.

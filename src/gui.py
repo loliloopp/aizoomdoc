@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import (
     QListWidget, QListWidgetItem, QFrame, QScrollArea, QProgressBar,
     QFileDialog, QMenuBar, QMenu, QDialog, QDialogButtonBox, QMessageBox,
     QGroupBox, QSizePolicy, QTreeView, QButtonGroup, QInputDialog,
-    QHeaderView
+    QHeaderView, QTabWidget
 )
 from PyQt6.QtCore import Qt, QUrl, QSize
 from PyQt6.QtGui import (
@@ -61,9 +61,18 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         print("[DEBUG] Инициализация SettingsDialog (Simplified)")
         self.setWindowTitle("Настройки")
-        self.setMinimumWidth(600)
+        self.setMinimumWidth(700)
+        self.setMinimumHeight(500)
         
         layout = QVBoxLayout(self)
+        
+        # Используем вкладки для разделения настроек
+        self.tabs = QTabWidget()
+        layout.addWidget(self.tabs)
+        
+        # --- ВКЛАДКА: ОБЩИЕ ---
+        general_tab = QWidget()
+        general_layout = QVBoxLayout(general_tab)
         
         # 1. Группа "Папка с данными"
         gb_data = QGroupBox("Данные")
@@ -83,9 +92,30 @@ class SettingsDialog(QDialog):
         path_layout.addWidget(btn_browse)
         gb_layout.addLayout(path_layout)
         
-        layout.addWidget(gb_data)
+        general_layout.addWidget(gb_data)
         
-        # 2. Группа "Промты AI"
+        # 1.1. Выбор модели по умолчанию
+        gb_model = QGroupBox("Модель по умолчанию")
+        model_layout = QVBoxLayout(gb_model)
+        self.combo_default_model = QComboBox()
+        for name, mid in MODELS.items():
+            self.combo_default_model.addItem(name, mid)
+        
+        # Загружаем текущую модель по умолчанию
+        if config.USE_DATABASE and supabase_client.is_connected():
+            try:
+                def_model = asyncio.run(supabase_client.get_default_model())
+                if def_model:
+                    idx = self.combo_default_model.findData(def_model)
+                    if idx >= 0:
+                        self.combo_default_model.setCurrentIndex(idx)
+            except Exception as e:
+                print(f"Ошибка загрузки модели по умолчанию: {e}")
+        
+        model_layout.addWidget(self.combo_default_model)
+        general_layout.addWidget(gb_model)
+        
+        # 2. Группа "Системные Промты AI"
         gb_prompts = QGroupBox("AI Ассистент - Системные Промты")
         prompts_layout_main = QVBoxLayout(gb_prompts)
         
@@ -124,10 +154,20 @@ class SettingsDialog(QDialog):
         analysis_file_layout.addWidget(btn_edit_analysis)
         prompts_layout_main.addLayout(analysis_file_layout)
         
-        layout.addWidget(gb_prompts)
+        general_layout.addWidget(gb_prompts)
+        general_layout.addStretch()
+        
+        self.tabs.addTab(general_tab, "Общие")
+        
+        # --- ВКЛАДКА: ПОЛЬЗОВАТЕЛЬСКИЕ ПРОМТЫ ---
+        prompts_tab = QWidget()
+        prompts_tab_layout = QVBoxLayout(prompts_tab)
+        self.prompts_manager = UserPromptsSettingsWidget()
+        prompts_tab_layout.addWidget(self.prompts_manager)
+        
+        self.tabs.addTab(prompts_tab, "Промты")
         
         # Кнопки
-        layout.addStretch()
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
@@ -264,6 +304,9 @@ class SettingsDialog(QDialog):
     def get_data_root(self):
         return self.path_edit.text()
 
+    def get_default_model(self):
+        return self.combo_default_model.currentData()
+
 
 class PromptEditDialog(QDialog):
     """Диалог редактирования системного промта."""
@@ -303,6 +346,117 @@ class PromptEditDialog(QDialog):
                 self.accept()
         except Exception as e:
             QMessageBox.critical(self, "Ошибка", f"Ошибка при сохранении: {e}")
+
+
+class UserPromptEditDialog(QDialog):
+    """Диалог добавления/редактирования пользовательского промта."""
+    def __init__(self, parent=None, name="", content=""):
+        super().__init__(parent)
+        self.setWindowTitle("Пользовательский промт")
+        self.setMinimumWidth(500)
+        
+        layout = QVBoxLayout(self)
+        
+        layout.addWidget(QLabel("Название:"))
+        self.name_edit = QLineEdit(name)
+        layout.addWidget(self.name_edit)
+        
+        layout.addWidget(QLabel("Промт:"))
+        self.content_edit = QTextEdit(content)
+        self.content_edit.setMinimumHeight(200)
+        layout.addWidget(self.content_edit)
+        
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        
+    def get_data(self):
+        return self.name_edit.text().strip(), self.content_edit.toPlainText().strip()
+
+
+class UserPromptsSettingsWidget(QWidget):
+    """Виджет управления пользовательскими промтами в настройках."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.layout = QVBoxLayout(self)
+        
+        self.btn_add = QPushButton("+ Добавить промт")
+        self.btn_add.clicked.connect(self.add_prompt)
+        self.layout.addWidget(self.btn_add)
+        
+        self.list_prompts = QListWidget()
+        self.layout.addWidget(self.list_prompts)
+        
+        # Контейнер для кнопок управления выбранным промтом
+        actions_layout = QHBoxLayout()
+        self.btn_edit = QPushButton("Редактировать")
+        self.btn_edit.clicked.connect(self.edit_prompt)
+        self.btn_delete = QPushButton("Удалить")
+        self.btn_delete.clicked.connect(self.delete_prompt)
+        
+        actions_layout.addWidget(self.btn_edit)
+        actions_layout.addWidget(self.btn_delete)
+        self.layout.addLayout(actions_layout)
+        
+        self.load_prompts()
+        
+    def load_prompts(self):
+        self.list_prompts.clear()
+        if not supabase_client.is_connected():
+            return
+            
+        try:
+            # Используем asyncio.run для синхронного вызова в GUI (упрощенно)
+            prompts = asyncio.run(supabase_client.get_user_prompts())
+            for p in prompts:
+                item = QListWidgetItem(p["name"])
+                item.setData(Qt.ItemDataRole.UserRole, p)
+                self.list_prompts.addItem(item)
+        except Exception as e:
+            print(f"Ошибка загрузки промтов: {e}")
+
+    def add_prompt(self):
+        dialog = UserPromptEditDialog(self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            name, content = dialog.get_data()
+            if name and content:
+                try:
+                    asyncio.run(supabase_client.create_user_prompt(name, content))
+                    self.load_prompts()
+                except Exception as e:
+                    QMessageBox.critical(self, "Ошибка", f"Не удалось создать промт: {e}")
+
+    def edit_prompt(self):
+        item = self.list_prompts.currentItem()
+        if not item:
+            return
+            
+        data = item.data(Qt.ItemDataRole.UserRole)
+        dialog = UserPromptEditDialog(self, name=data["name"], content=data["content"])
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            name, content = dialog.get_data()
+            if name and content:
+                try:
+                    asyncio.run(supabase_client.update_user_prompt(data["id"], name, content))
+                    self.load_prompts()
+                except Exception as e:
+                    QMessageBox.critical(self, "Ошибка", f"Не удалось обновить промт: {e}")
+
+    def delete_prompt(self):
+        item = self.list_prompts.currentItem()
+        if not item:
+            return
+            
+        data = item.data(Qt.ItemDataRole.UserRole)
+        reply = QMessageBox.question(self, "Удаление", f"Удалить промт '{data['name']}'?",
+                                   QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply == QMessageBox.StandardButton.Yes:
+            try:
+                asyncio.run(supabase_client.delete_user_prompt(data["id"]))
+                self.load_prompts()
+            except Exception as e:
+                QMessageBox.critical(self, "Ошибка", f"Не удалось удалить промт: {e}")
 
 
 class DragDropTextEdit(QTextEdit):
@@ -845,6 +999,13 @@ class MainWindow(QMainWindow):
         self.txt_input.setPlaceholderText("Введите сообщение... (Enter - отправить, Shift+Enter - новая строка)")
         input_layout.addWidget(self.txt_input, 1)
         
+        # Выпадающий список пользовательских промтов
+        self.combo_user_prompts = QComboBox()
+        self.combo_user_prompts.setFixedWidth(150)
+        self.combo_user_prompts.setToolTip("Выберите пользовательский промт")
+        self.load_user_prompts()
+        input_layout.addWidget(self.combo_user_prompts, 0, Qt.AlignmentFlag.AlignBottom)
+        
         # Индикатор файлов (кликабельный)
         self.lbl_file_count = QLabel("")
         self.lbl_file_count.setVisible(False)
@@ -952,11 +1113,39 @@ class MainWindow(QMainWindow):
         # Загружаем настройки режима MD из БД
         self.load_md_mode()
         
+        # Загружаем модель по умолчанию из БД
+        self.load_default_model()
+        
         self.refresh_history_list()
+
+    def load_default_model(self):
+        """Загружает модель по умолчанию из БД."""
+        if config.USE_DATABASE and supabase_client.is_connected():
+            try:
+                def_model = self.run_async(supabase_client.get_default_model())
+                if def_model:
+                    idx = self.combo_models.findData(def_model)
+                    if idx >= 0:
+                        self.combo_models.setCurrentIndex(idx)
+            except Exception as e:
+                print(f"Ошибка загрузки модели по умолчанию: {e}")
 
     def open_settings(self):
         dialog = SettingsDialog(self)
         if dialog.exec():
+            # 1. Сохраняем модель по умолчанию в БД
+            new_model = dialog.get_default_model()
+            if config.USE_DATABASE and supabase_client.is_connected():
+                try:
+                    self.run_async(supabase_client.set_default_model(new_model))
+                    # Обновляем текущий выбор в главном окне
+                    idx = self.combo_models.findData(new_model)
+                    if idx >= 0:
+                        self.combo_models.setCurrentIndex(idx)
+                except Exception as e:
+                    print(f"Ошибка сохранения модели по умолчанию: {e}")
+
+            self.load_user_prompts() # Перезагружаем промты после настроек
             new_path = dialog.get_data_root()
             if new_path:
                 self.data_root = Path(new_path)
@@ -966,6 +1155,21 @@ class MainWindow(QMainWindow):
                 self.lbl_data_root.setText(f"📁 {self.data_root}")
                 self.refresh_history_list()
                 QMessageBox.information(self, "Настройки", f"Папка обновлена:\n{self.data_root}")
+
+    def load_user_prompts(self):
+        """Загружает список пользовательских промтов в выпадающий список."""
+        self.combo_user_prompts.clear()
+        self.combo_user_prompts.addItem("Без промта", None)
+        
+        if config.USE_DATABASE and supabase_client.is_connected():
+            try:
+                prompts = self.run_async(supabase_client.get_user_prompts())
+                for p in prompts:
+                    # Избегаем дублирования системного пункта "Без промта"
+                    if p["name"] != "Без промта":
+                        self.combo_user_prompts.addItem(p["name"], p["content"])
+            except Exception as e:
+                print(f"Ошибка загрузки пользовательских промтов: {e}")
 
     def on_attach_clicked(self):
         """Обработчик клика по кнопке прикрепления файлов."""
@@ -1342,6 +1546,7 @@ class MainWindow(QMainWindow):
         
         mid = self.combo_models.currentData()
         md_mode = self.combo_md_mode.currentData()
+        user_prompt = self.combo_user_prompts.currentData()
         
         # Передаем сохраненные md файлы и текущие ID чата в воркера
         self.current_worker = AgentWorker(
@@ -1351,7 +1556,8 @@ class MainWindow(QMainWindow):
             md_files=files_to_use,
             existing_chat_id=self.current_chat_id,
             existing_db_chat_id=self.current_db_chat_id,
-            md_mode=md_mode
+            md_mode=md_mode,
+            user_prompt=user_prompt
         )
         self.current_worker.sig_log.connect(self.log)
         self.current_worker.sig_message.connect(self.add_chat_message)
@@ -1986,6 +2192,16 @@ class MainWindow(QMainWindow):
                     background-color: #3d3d3d;
                     color: #ececec;
                     selection-background-color: #4d4d4f;
+                    selection-color: #ececec;
+                    outline: none;
+                }
+                QComboBox::item {
+                    color: #ececec;
+                    background-color: #3d3d3d;
+                }
+                QComboBox::item:selected {
+                    background-color: #4d4d4f;
+                    color: #ececec;
                 }
             """)
 
@@ -2008,10 +2224,20 @@ class MainWindow(QMainWindow):
                     background-color: #3d3d3d;
                     color: #ececec;
                     selection-background-color: #4d4d4f;
+                    selection-color: #ececec;
                     outline: none;
+                }
+                QComboBox::item {
+                    color: #ececec;
+                    background-color: #3d3d3d;
+                }
+                QComboBox::item:selected {
+                    background-color: #4d4d4f;
+                    color: #ececec;
                 }
             """
             self.combo_md_mode.setStyleSheet(md_combo_style_dark)
+            self.combo_user_prompts.setStyleSheet(md_combo_style_dark)
             
             self.lbl_data_root.setStyleSheet("""
                 color: #8e8ea0;
@@ -2364,6 +2590,16 @@ class MainWindow(QMainWindow):
                     background-color: white;
                     color: #2d333a;
                     selection-background-color: #f3f4f6;
+                    selection-color: #2d333a;
+                    outline: none;
+                }
+                QComboBox::item {
+                    color: #2d333a;
+                    background-color: #ffffff;
+                }
+                QComboBox::item:selected {
+                    background-color: #f3f4f6;
+                    color: #2d333a;
                 }
             """)
 
@@ -2382,8 +2618,24 @@ class MainWindow(QMainWindow):
                 QComboBox::drop-down {
                     border: none;
                 }
+                QComboBox QAbstractItemView {
+                    background-color: #ffffff;
+                    color: #2d333a;
+                    selection-background-color: #f3f4f6;
+                    selection-color: #2d333a;
+                    outline: none;
+                }
+                QComboBox::item {
+                    color: #2d333a;
+                    background-color: #ffffff;
+                }
+                QComboBox::item:selected {
+                    background-color: #f3f4f6;
+                    color: #2d333a;
+                }
             """
             self.combo_md_mode.setStyleSheet(md_combo_style_light)
+            self.combo_user_prompts.setStyleSheet(md_combo_style_light)
             
             self.lbl_data_root.setStyleSheet("""
                 color: #6e6e80;

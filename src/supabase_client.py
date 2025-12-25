@@ -153,6 +153,15 @@ class SupabaseClient:
             return False
         return await self.update_page_settings(page_key=page_key, patch={"md_processing_mode": mode}, user_id=user_id)
 
+    async def get_default_model(self, user_id: str = "default_user", page_key: str = "main_window") -> Optional[str]:
+        """Получить модель по умолчанию из настроек."""
+        page = await self.get_page_settings(page_key=page_key, user_id=user_id)
+        return page.get("default_model")
+
+    async def set_default_model(self, model_id: str, user_id: str = "default_user", page_key: str = "main_window") -> bool:
+        """Сохранить модель по умолчанию в настройки."""
+        return await self.update_page_settings(page_key=page_key, patch={"default_model": model_id}, user_id=user_id)
+
     # ===== Folder & File Operations (V2) =====
     
     async def create_folder(self, name: str, user_id: str = "default_user", parent_id: Optional[str] = None, slug: Optional[str] = None) -> Optional[str]:
@@ -486,6 +495,49 @@ class SupabaseClient:
             return True
         except Exception as e:
             logger.error(f"❌ Ошибка удаления чата {chat_id} из БД: {e}")
+            return False
+
+    # ===== User Prompts Operations =====
+
+    async def get_user_prompts(self, user_id: str = "default_user") -> List[Dict[str, Any]]:
+        """Получить список пользовательских промтов."""
+        if not self.is_connected(): return []
+        try:
+            return self.client.table("user_prompts").select("*").eq("user_id", user_id).order("name").execute().data or []
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения промтов: {e}")
+            return []
+
+    async def create_user_prompt(self, name: str, content: str, user_id: str = "default_user") -> Optional[Dict[str, Any]]:
+        """Создать новый пользовательский промт."""
+        if not self.is_connected(): return None
+        try:
+            data = {"name": name, "content": content, "user_id": user_id}
+            response = self.client.table("user_prompts").insert(data).execute()
+            return response.data[0] if response.data else None
+        except Exception as e:
+            logger.error(f"❌ Ошибка создания промта: {e}")
+            return None
+
+    async def update_user_prompt(self, prompt_id: int, name: str, content: str) -> bool:
+        """Обновить пользовательский промт."""
+        if not self.is_connected(): return False
+        try:
+            data = {"name": name, "content": content, "updated_at": datetime.utcnow().isoformat()}
+            self.client.table("user_prompts").update(data).eq("id", prompt_id).execute()
+            return True
+        except Exception as e:
+            logger.error(f"❌ Ошибка обновления промта: {e}")
+            return False
+
+    async def delete_user_prompt(self, prompt_id: int) -> bool:
+        """Удалить пользовательский промт."""
+        if not self.is_connected(): return False
+        try:
+            self.client.table("user_prompts").delete().eq("id", prompt_id).execute()
+            return True
+        except Exception as e:
+            logger.error(f"❌ Ошибка удаления промта: {e}")
             return False
     
     async def get_message_images(self, message_id: str) -> List[Dict[str, Any]]:

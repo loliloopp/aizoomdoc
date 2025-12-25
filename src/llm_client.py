@@ -122,8 +122,7 @@ def load_selection_prompt(data_root: Optional[Path] = None) -> str:
 
 def load_analysis_prompt(data_root: Optional[Path] = None) -> str:
     """
-    Загружает системный промт для анализа из файла.
-    Если файл не найден, возвращает промт по умолчанию.
+    Загружает системный промт для анализа (Часть 1: Общая логика).
     """
     default_prompt = """Ты — эксперт-инженер. Твоя задача — анализировать документацию.
 
@@ -132,16 +131,11 @@ def load_analysis_prompt(data_root: Optional[Path] = None) -> str:
 2. Если для ответа нужны визуальные данные, ЗАПРОСИ изображения (tool: request_images). Ты можешь запрашивать ЛЮБОЕ количество изображений (хоть все сразу), если это нужно для полноты анализа.
 3. Изучи полученные изображения (тебе придут полные версии или превью).
 4. Если на превью не видны детали или ты не уверен в анализе на 100% — ОБЯЗАТЕЛЬНО запроси ZOOM (tool: zoom) для конкретных узлов.
-5. Если после первого ZOOM картина не ясна или нужно проверить соседний узел — запрашивай ZOOM ПОВТОРНО. Не делай окончательных выводов на основе догадок.
-6. Сформулируй ответ только тогда, когда изучил все критические узлы.
+5. Сформулируй ответ только тогда, когда изучил все критические данные.
 
 ИНСТРУКЦИЯ ПО РАБОТЕ С ИЗОБРАЖЕНИЯМИ:
 1. Изначально ты видишь только ОПИСАНИЯ в каталоге. Сами картинки не загружены.
 2. Чтобы увидеть чертеж/схему, используй `request_images`. Количество `image_ids` не ограничено.
-3. Получив изображение, ты увидишь его целиком (или сжатое превью до 2000px).
-4. Если детали слишком мелкие или текст неразборчив, используй `zoom` для получения фрагмента в исходном качестве.
-5. НЕ используй `zoom` для просмотра всего листа целиком (например `coords_norm: [0,0,1,1]`). Для этого есть `request_images`.
-6. ТРЕБУЙ дополнительные изображения и зумы до тех пор, пока не будешь ТВЕРДО УБЕЖДЕН в своем анализе.
 
 ФОРМАТ ЗАПРОСА ИЗОБРАЖЕНИЙ (JSON):
 ```json
@@ -152,25 +146,11 @@ def load_analysis_prompt(data_root: Optional[Path] = None) -> str:
 }
 ```
 
-ФОРМАТ ЗАПРОСА ZOOM (JSON):
-```json
-{
-  "tool": "zoom",
-  "image_id": "image_id_1",
-  "coords_px": [1000, 2000, 1500, 2500],
-  "reason": "Неразборчивый текст в таблице"
-}
-```
-
 ВАЖНО:
 - `image_id`/`image_ids` бери ТОЛЬКО из каталога.
-- Если нужно несколько запросов инструментов, можно вернуть список JSON-объектов.
 - Не выдумывай ID, которых нет в каталоге.
-
-ОТВЕТ:
-Если информации достаточно, отвечай обычным текстом. Ссылайся на источники."""
+ Ссылайся на источники."""
     
-    # Пытаемся найти файл с промтом
     if data_root is None:
         data_root = Path.cwd() / "data"
     
@@ -181,10 +161,47 @@ def load_analysis_prompt(data_root: Optional[Path] = None) -> str:
             with open(prompt_file, "r", encoding="utf-8") as f:
                 content = f.read().strip()
                 if content:
-                    logger.info(f"Загружен пользовательский промт из {prompt_file}")
                     return content
         except Exception as e:
-            logger.warning(f"Ошибка чтения файла промта: {e}. Используется промт по умолчанию.")
+            logger.warning(f"Ошибка чтения llm_system_prompt.txt: {e}")
+    
+    return default_prompt
+
+def load_zoom_prompt(data_root: Optional[Path] = None) -> str:
+    """
+    Загружает системный промт для ZOOM (Часть 2: Техническая инструкция).
+    """
+    default_prompt = """ИНСТРУКЦИЯ ПО ZOOM:
+1. Если на превью не видны детали или ты не уверен в анализе на 100% — ОБЯЗАТЕЛЬНО запроси ZOOM (tool: zoom).
+2. Если после первого ZOOM картина не ясна или нужно проверить соседний узел — запрашивай ZOOM ПОВТОРНО. Не делай окончательных выводов на основе догадок.
+3. Получив изображение, ты увидишь его целиком (или сжатое превью до 2000px).
+4. Если детали слишком мелкие или текст неразборчив, используй `zoom` для получения фрагмента в исходном качестве.
+5. НЕ используй `zoom` для просмотра всего листа целиком (например `coords_norm: [0,0,1,1]`). Для этого есть `request_images`.
+6. ТРЕБУЙ дополнительные зумы до тех пор, пока не будешь ТВЕРДО УБЕЖДЕН в своем анализе.
+
+ФОРМАТ ЗАПРОСА ZOOM (JSON):
+```json
+{
+  "tool": "zoom",
+  "image_id": "image_id_1",
+  "coords_px": [1000, 2000, 1500, 2500],
+  "reason": "Неразборчивый текст в таблице"
+}
+```"""
+    
+    if data_root is None:
+        data_root = Path.cwd() / "data"
+    
+    prompt_file = Path(data_root) / "zoom_prompt.txt"
+    
+    if prompt_file.exists():
+        try:
+            with open(prompt_file, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+                if content:
+                    return content
+        except Exception as e:
+            logger.warning(f"Ошибка чтения zoom_prompt.txt: {e}")
     
     return default_prompt
 
@@ -220,54 +237,70 @@ class LLMClient:
         return self.model in ["gemini-3-flash-preview", "gemini-3-pro-preview"]
 
     def _call_google_direct(self, messages: List[Dict[str, Any]], temperature: float = 0.2, max_tokens: int = 4000, response_json: bool = False) -> str:
-        """Вызов нового Google GenAI API."""
+        """Вызов нового Google GenAI API с обработкой лимитов (429)."""
         if not self.google_client:
             raise ValueError("GOOGLE_API_KEY не настроен")
 
-        google_contents = []
-        system_instruction = None
-        
-        for msg in messages:
-            if msg["role"] == "system":
-                system_instruction = msg["content"]
-                continue
-            
-            parts = []
-            content = msg["content"]
-            if isinstance(content, str):
-                parts.append(types.Part.from_text(text=content))
-            elif isinstance(content, list):
-                for part in content:
-                    if part["type"] == "text":
-                        parts.append(types.Part.from_text(text=part["text"]))
-                    elif part["type"] == "image_url":
-                        # Извлекаем base64
-                        url = part["image_url"]["url"]
-                        if url.startswith("data:image"):
-                            b64_data = url.split(",")[1]
-                            image_data = base64.b64decode(b64_data)
-                            parts.append(types.Part.from_bytes(data=image_data, mime_type="image/jpeg"))
-            
-            google_contents.append(types.Content(
-                role="user" if msg["role"] == "user" else "model", 
-                parts=parts
-            ))
-        
-        config_params = {
-            "temperature": temperature,
-            "max_output_tokens": max_tokens,
-        }
-        if system_instruction:
-            config_params["system_instruction"] = system_instruction
-        if response_json:
-            config_params["response_mime_type"] = "application/json"
+        import time
+        max_retries = 3
+        delay = 15 # Для бесплатного уровня Gemini нужно ждать заметно
 
-        response = self.google_client.models.generate_content(
-            model=self.model,
-            contents=google_contents,
-            config=types.GenerateContentConfig(**config_params)
-        )
-        return response.text
+        for attempt in range(max_retries):
+            try:
+                google_contents = []
+                system_instruction = None
+                
+                for msg in messages:
+                    if msg["role"] == "system":
+                        system_instruction = msg["content"]
+                        continue
+                    
+                    parts = []
+                    content = msg["content"]
+                    if isinstance(content, str):
+                        parts.append(types.Part.from_text(text=content))
+                    elif isinstance(content, list):
+                        for part in content:
+                            if part["type"] == "text":
+                                parts.append(types.Part.from_text(text=part["text"]))
+                            elif part["type"] == "image_url":
+                                # Извлекаем base64
+                                url = part["image_url"]["url"]
+                                if url.startswith("data:image"):
+                                    b64_data = url.split(",")[1]
+                                    image_data = base64.b64decode(b64_data)
+                                    parts.append(types.Part.from_bytes(data=image_data, mime_type="image/jpeg"))
+                    
+                    google_contents.append(types.Content(
+                        role="user" if msg["role"] == "user" else "model", 
+                        parts=parts
+                    ))
+                
+                config_params = {
+                    "temperature": temperature,
+                    "max_output_tokens": max_tokens,
+                }
+                if system_instruction:
+                    config_params["system_instruction"] = system_instruction
+                if response_json:
+                    config_params["response_mime_type"] = "application/json"
+
+                response = self.google_client.models.generate_content(
+                    model=self.model,
+                    contents=google_contents,
+                    config=types.GenerateContentConfig(**config_params)
+                )
+                return response.text
+            except Exception as e:
+                err_str = str(e).lower()
+                if "429" in err_str or "resource_exhausted" in err_str:
+                    if attempt < max_retries - 1:
+                        logger.warning(f"⚠️ Лимит Google API (429). Попытка {attempt+1}, жду {delay}с...")
+                        time.sleep(delay)
+                        continue
+                raise e
+        
+        raise ValueError("Не удалось получить ответ от Google API после повторов")
 
     def get_model_context_length(self) -> Optional[int]:
         """
@@ -523,6 +556,11 @@ class LLMClient:
                 
                 if not response_data.get("choices"):
                     print(f"[GET_RESPONSE] ⚠️ Попытка {attempt+1}: Нет choices в ответе")
+                    print(f"[GET_RESPONSE] RAW RESPONSE: {response_data}")
+                    if attempt < max_retries - 1:
+                        print("[GET_RESPONSE] Жду 10 сек перед повтором...")
+                        import time
+                        time.sleep(10)
                     continue
                 
                 answer = response_data["choices"][0]["message"].get("content", "")
