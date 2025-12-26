@@ -37,7 +37,8 @@ ENV/
 .env
 
 # Data files
-data/
+data/chats/
+data/projects/
 temp/
 # *.jpg
 # *.png
