@@ -736,11 +736,20 @@ class AgentWorker(QThread):
                 print(f"[GUI_AGENT] Zoom запросов: {len(zoom_reqs)}")
                 
                 if zoom_reqs:
-                    self._append_app_log(f"Запрошен Zoom: {len(zoom_reqs)} зон")
+                    self._append_app_log(f"LLM Tool Call: Zoom ({len(zoom_reqs)} requests)")
                     
                     # Логирование деталей зума для отладки
                     for i, zr in enumerate(zoom_reqs):
-                        detail_log = f"Zoom Request #{i+1}: ImageID={zr.image_id}, "
+                        is_full = False
+                        try:
+                            if zr.coords_norm:
+                                x1, y1, x2, y2 = zr.coords_norm
+                                if x1 <= 0.01 and y1 <= 0.01 and x2 >= 0.99 and y2 >= 0.99:
+                                    is_full = True
+                        except: pass
+
+                        type_str = "Full Image" if is_full else "Crop"
+                        detail_log = f"Request #{i+1} ({type_str}): ImageID={zr.image_id}, "
                         if zr.coords_norm:
                             detail_log += f"Coords(Norm)={zr.coords_norm}, "
                         if zr.coords_px:

@@ -77,6 +77,7 @@ SELECTION_PROMPT = """Ты — ассистент по анализу техни
 2. Каждый блок содержит:
    - `doc_metadata`: метаданные (имя файла, номер страницы).
    - `image`: объект с полем `uri` — ПРЯМАЯ ССЫЛКА на изображение.
+   - `raw_pdfplumber_text`: основной текст со страницы.
    - `analysis`: объект с результатами анализа, содержащий вложенный объект `analysis`:
      - `content_summary`: краткое описание.
      - `detailed_description`: подробное описание.
@@ -86,7 +87,7 @@ SELECTION_PROMPT = """Ты — ассистент по анализу техни
 ИНСТРУКЦИЯ:
 1. Прочитай запрос пользователя.
 2. Найди в тексте блоки JSON, которые релевантны запросу.
-   - Используй `content_summary`, `detailed_description`, `clean_ocr_text` и `doc_metadata.page` для поиска.
+   - Используй `analysis.analysis.content_summary`, `analysis.analysis.detailed_description`, `analysis.analysis.clean_ocr_text` и `doc_metadata.page` для поиска.
 3. Извлеки URL изображения из поля `image.uri` внутри найденного JSON блока.
 4. Верни JSON:
 ```json
