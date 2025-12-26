@@ -710,18 +710,15 @@ class AgentWorker(QThread):
                             continue
                         self.sig_log.emit(f"Скачивание (по id): {rid}")
                         self._append_app_log(f"Скачивание (по id): {rid}")
-                        crop_info = image_processor.download_and_process_pdf(entry.uri, image_id=rid)
-                        if crop_info:
-                            downloaded_imgs.append(crop_info)
-                            try:
-                                if crop_info.target_blocks:
-                                    sent_image_ids.add(str(crop_info.target_blocks[0]))
-                                else:
-                                    sent_image_ids.add(str(rid))
-                            except Exception:
-                                sent_image_ids.add(str(rid))
-                            if crop_info.image_path:
-                                self.sig_image.emit(crop_info.image_path, f"Image ID: {rid}")
+                        
+                        # Получаем список (превью + возможные авто-зумы)
+                        crops = image_processor.download_and_process_pdf(entry.uri, image_id=rid)
+                        if crops:
+                            downloaded_imgs.extend(crops)
+                            sent_image_ids.add(str(rid))
+                            for c in crops:
+                                if c.image_path:
+                                    self.sig_image.emit(c.image_path, f"Image ID: {rid}")
 
                     if missing_ids:
                         warn = f"⚠️ Не найдено в каталоге: {', '.join(missing_ids[:10])}{' ...' if len(missing_ids) > 10 else ''}"
@@ -730,8 +727,38 @@ class AgentWorker(QThread):
                         self.save_message("assistant", warn)
 
                     if downloaded_imgs:
-                        self.save_message("assistant", "🖼️ Загружены изображения по запросу модели.", images=downloaded_imgs)
-                        llm_client.add_user_message("Запрошенные изображения:", images=downloaded_imgs)
+                        # SAFETY FILTER: Ограничиваем количество изображений в одном запросе
+                        # Gemini Flash может падать (503) при отправке слишком большого количества картинок (особенно с высоким разрешением)
+                        MAX_IMAGES_PER_TURN = 8
+                        
+                        safe_imgs = []
+                        previews = [img for img in downloaded_imgs if not getattr(img, 'is_zoom_request', False)]
+                        zooms = [img for img in downloaded_imgs if getattr(img, 'is_zoom_request', False)]
+                        
+                        # Всегда оставляем превью (обзорные)
+                        safe_imgs.extend(previews)
+                        
+                        # Добавляем зумы, пока влезают
+                        dropped_zooms_count = 0
+                        remaining_slots = MAX_IMAGES_PER_TURN - len(safe_imgs)
+                        
+                        if remaining_slots > 0:
+                            safe_imgs.extend(zooms[:remaining_slots])
+                            dropped_zooms_count = len(zooms) - remaining_slots
+                        else:
+                            dropped_zooms_count = len(zooms)
+
+                        # Формируем сообщение
+                        msg_text = "🖼️ Загружены изображения по запросу модели."
+                        if dropped_zooms_count > 0:
+                             msg_text += (
+                                 f"\n⚠️ СИСТЕМНОЕ СООБЩЕНИЕ: {dropped_zooms_count} автоматических зум-фрагментов было пропущено "
+                                 "из-за ограничений на размер запроса. Используй PREVIEW для навигации и запрашивай ZOOM "
+                                 "вручную для конкретных важных зон."
+                             )
+
+                        self.save_message("assistant", msg_text, images=safe_imgs)
+                        llm_client.add_user_message(msg_text, images=safe_imgs)
                         # Продолжаем цикл — модель увидит картинки и сможет запросить zoom/сделать выводы
                         continue
                     else:
@@ -826,12 +853,15 @@ class AgentWorker(QThread):
                                 continue
                             self.sig_log.emit(f"Подгружаю базовое изображение перед zoom: {img_id}")
                             self._append_app_log(f"Подгружаю базовое изображение перед zoom: {img_id}")
-                            base_crop = image_processor.download_and_process_pdf(entry.uri, image_id=img_id)
-                            if base_crop:
-                                base_imgs.append(base_crop)
+                            
+                            # Получаем список (превью + возможные авто-зумы)
+                            crops = image_processor.download_and_process_pdf(entry.uri, image_id=img_id)
+                            if crops:
+                                base_imgs.extend(crops)
                                 sent_image_ids.add(img_id)
-                                if base_crop.image_path:
-                                    self.sig_image.emit(base_crop.image_path, f"Image ID: {img_id}")
+                                for c in crops:
+                                    if c.image_path:
+                                        self.sig_image.emit(c.image_path, f"Image ID: {img_id}")
 
                         if missing_ids:
                             warn = f"⚠️ Не найдено в каталоге (для zoom): {', '.join(missing_ids[:10])}{' ...' if len(missing_ids) > 10 else ''}"

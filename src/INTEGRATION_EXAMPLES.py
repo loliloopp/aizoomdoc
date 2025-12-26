@@ -187,9 +187,9 @@ async def run_agent_loop_with_chat(
             if link.url.endswith(".pdf") and link.url not in processed_urls:
                 processed_urls.add(link.url)
                 logger.info(f"Processing: {link.url}")
-                crop_info = image_processor.download_and_process_pdf(link.url)
-                if crop_info:
-                    external_images.append(crop_info)
+                crops = image_processor.download_and_process_pdf(link.url)
+                if crops:
+                    external_images.extend(crops)
     
     # Формируем контекст
     context_text = f"ЗАПРОС: {user_query}\n\nНАЙДЕННЫЙ ТЕКСТ:\n"
