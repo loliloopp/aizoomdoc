@@ -619,21 +619,28 @@ class AgentWorker(QThread):
                 # но очищаем от JSON-блоков инструментов, чтобы не засорять чат.
                 import re
                 def clean_response_text(text: str) -> str:
-                    # Удаляем блоки ```json ... ```
-                    # Используем более универсальный regex, который ловит и многострочные блоки
-                    text = re.sub(r"```json\s*[\s\S]*?```", "", text)
-                    # Также удаляем просто ``` ... ``` если там json (модель иногда забывает язык)
-                    # Но это опасно, если там код. 
-                    # Попробуем удалить только если внутри есть "tool"
-                    def replacer(match):
+                    # 1. Удаляем блоки кода ```json ... ``` или ``` ... ``` если там есть "tool"
+                    def code_block_replacer(match):
+                        content = match.group(0)
+                        if '"tool"' in content or "'tool'" in content or "```json" in content.lower():
+                            return ""
+                        return content
+                    
+                    text = re.sub(r"```[\s\S]*?```", code_block_replacer, text)
+                    
+                    # 2. Удаляем "сырой" JSON (если модель забыла про блоки кода)
+                    # Ищем объекты { ... "tool": ... }
+                    # Используем нежадный поиск и проверяем наличие "tool" внутри
+                    def raw_json_replacer(match):
                         content = match.group(0)
                         if '"tool"' in content or "'tool'" in content:
                             return ""
                         return content
+
+                    # Поиск паттернов, похожих на JSON объекты
+                    text = re.sub(r"\{\s*[\s\S]*?\}", raw_json_replacer, text)
                     
-                    text = re.sub(r"```[\s\S]*?```", replacer, text)
-                    
-                    # Удаляем лишние пустые строки, возникшие после удаления блоков
+                    # 3. Удаляем лишние пустые строки
                     text = re.sub(r"\n{3,}", "\n\n", text)
                     return text.strip()
 
@@ -878,9 +885,28 @@ class AgentWorker(QThread):
                         except Exception as e:
                             self.sig_log.emit(f"Не удалось подготовить изображение для zoom: {e}")
                         
+                        # Определяем имя файла. Если кроп будет больше 2000px, помечаем как preview.
+                        prefix = "zoom_step"
+                        try:
+                            if img_id and img_id in image_processor._image_sizes:
+                                w_full, h_full = image_processor._image_sizes[img_id]
+                                if zr.coords_norm:
+                                    nx1, ny1, nx2, ny2 = zr.coords_norm
+                                    cw = abs(nx2 - nx1) * w_full
+                                    ch = abs(ny2 - ny1) * h_full
+                                    if max(cw, ch) > 2000:
+                                        prefix = "zoom_preview_step"
+                                elif zr.coords_px:
+                                    x1, y1, x2, y2 = zr.coords_px
+                                    cw = abs(x2 - x1)
+                                    ch = abs(y2 - y1)
+                                    if max(cw, ch) > 2000:
+                                        prefix = "zoom_preview_step"
+                        except: pass
+
                         zoom_crop = image_processor.process_zoom_request(
                             zr,
-                            output_path=self.images_dir / f"zoom_step_{step}_{i}.png"
+                            output_path=self.images_dir / f"{prefix}_{step}_{i}.png"
                         )
                         
                         if zoom_crop:

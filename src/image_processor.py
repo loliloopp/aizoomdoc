@@ -223,18 +223,25 @@ class ImageProcessor:
         
         # Ресайз кропа если огромный
         h_c, w_c = crop.shape[:2]
+        was_scaled = False
         if max(h_c, w_c) > 2000:
             scale = 2000 / max(h_c, w_c)
             crop = cv2.resize(crop, (int(w_c*scale), int(h_c*scale)))
+            was_scaled = True
             
         if output_path:
             output_path.parent.mkdir(parents=True, exist_ok=True)
             cv2.imwrite(str(output_path), crop)
             
+        desc = f"Zoom {x1},{y1}-{x2},{y2}"
+        if was_scaled:
+            h_new, w_new = crop.shape[:2]
+            desc = f"⚠️ ZOOM PREVIEW: Crop {w_c}x{h_c}px → Scaled to {w_new}x{h_new}px. If details are not clear, request ZOOM again inside this area."
+
         return ViewportCrop(
             page_number=request.page_number,
             crop_coords=(x1, y1, x2, y2),
             image_path=str(output_path),
-            description=f"Zoom {x1},{y1}-{x2},{y2}",
+            description=desc,
             is_zoom_request=True
         )
