@@ -55,7 +55,12 @@ class AgentWorker(QThread):
         self.images_dir = self.chat_dir / "images"
         self.chat_dir.mkdir(parents=True, exist_ok=True)
         self.images_dir.mkdir(parents=True, exist_ok=True)
-        self.full_log_path = self.chat_dir / "full_log.txt"
+        
+        # Определяем имя файла лога с инкрементальным индексом для каждого запроса
+        log_idx = 1
+        while (self.chat_dir / f"full_log_{log_idx}.txt").exists():
+            log_idx += 1
+        self.full_log_path = self.chat_dir / f"full_log_{log_idx}.txt"
         
         self.db_chat_id = existing_db_chat_id
         
@@ -722,6 +727,17 @@ class AgentWorker(QThread):
                 
                 if zoom_reqs:
                     self._append_app_log(f"Запрошен Zoom: {len(zoom_reqs)} зон")
+                    
+                    # Логирование деталей зума для отладки
+                    for i, zr in enumerate(zoom_reqs):
+                        detail_log = f"Zoom Request #{i+1}: ImageID={zr.image_id}, "
+                        if zr.coords_norm:
+                            detail_log += f"Coords(Norm)={zr.coords_norm}, "
+                        if zr.coords_px:
+                            detail_log += f"Coords(Px)={zr.coords_px}, "
+                        detail_log += f"Reason={zr.reason}"
+                        self._append_app_log(detail_log)
+
                     # При запросе зума добавляем системный промт 2 (ZOOM инструкции)
                     llm_client.history.append({"role": "system", "content": f"ТЕХНИЧЕСКАЯ ИНСТРУКЦИЯ ПО ZOOM:\n{zoom_prompt}"})
                     
