@@ -7,6 +7,7 @@ import logging
 import json
 import uuid
 import asyncio
+import copy
 from pathlib import Path
 from datetime import datetime
 from typing import List
@@ -54,6 +55,7 @@ class AgentWorker(QThread):
         self.images_dir = self.chat_dir / "images"
         self.chat_dir.mkdir(parents=True, exist_ok=True)
         self.images_dir.mkdir(parents=True, exist_ok=True)
+        self.full_log_path = self.chat_dir / "full_log.txt"
         
         self.db_chat_id = existing_db_chat_id
         
@@ -239,8 +241,37 @@ class AgentWorker(QThread):
             json.dump(self.chat_history_data, f, indent=2, ensure_ascii=False)
         self.sig_history_saved.emit(self.chat_id, self.query)
 
+    def _log_full(self, header: str, content: object):
+        try:
+            with open(self.full_log_path, "a", encoding="utf-8") as f:
+                f.write(f"\n{'='*20} {header} {'='*20}\n")
+                if isinstance(content, (dict, list)):
+                    f.write(json.dumps(content, indent=2, ensure_ascii=False))
+                else:
+                    f.write(str(content))
+                f.write("\n")
+        except Exception as e:
+            logger.error(f"Failed to write full log: {e}")
+
+    def _append_app_log(self, text: str):
+        try:
+            with open(self.full_log_path, "a", encoding="utf-8") as f:
+                f.write(f"{text}\n")
+        except: pass
+
     def run(self):
         try:
+            # 0. Инициализация (лог файлов)
+            attached_files_info = "Нет прикрепленных файлов."
+            if self.md_files:
+                attached_files_info = "Прикрепленные файлы:\n" + "\n".join([str(Path(p).name) for p in self.md_files])
+            elif Path(config.get_document_paths(self.data_root)[0]).exists():
+                 p = Path(config.get_document_paths(self.data_root)[0])
+                 attached_files_info = f"Прикрепленный файл (auto): {p.name}"
+
+            self._log_full("ИНФОРМАЦИЯ О ФАЙЛАХ", attached_files_info)
+            self._log_full("Запрос пользователя", self.query)
+            
             self.sig_log.emit(f"Старт чата {self.chat_id}...")
             self._current_msg_id = None # Для привязки блоков к сообщению
             
@@ -266,7 +297,39 @@ class AgentWorker(QThread):
             image_processor = ImageProcessor(self.data_root)
             image_processor.temp_dir = self.images_dir
             
-            llm_client = LLMClient(model=self.model, data_root=self.data_root)
+            self.current_step = 0
+
+            def llm_log_callback(phase, data):
+                log_data = data
+                try:
+                    # Санитизация для логов: скрываем огромный текст файлов
+                    if phase == "request" and isinstance(data, dict) and "messages" in data:
+                        log_data = copy.deepcopy(data)
+                        for msg in log_data.get("messages", []):
+                            content = msg.get("content", "")
+                            if isinstance(content, str) and len(content) > 2000:
+                                msg["content"] = f"<{len(content)} chars truncated. See attached files list at the beginning of the log...>"
+                            elif isinstance(content, list): # Multimodal
+                                for part in content:
+                                    if isinstance(part, dict) and part.get("type") == "text":
+                                        txt = part.get("text", "")
+                                        if len(txt) > 2000:
+                                            part["text"] = f"<{len(txt)} chars truncated. See attached files list...>"
+                                    elif isinstance(part, dict) and part.get("type") == "image_url":
+                                        # Можно также сократить base64 если он там есть
+                                        url = part.get("image_url", {}).get("url", "")
+                                        if len(url) > 500:
+                                            part["image_url"]["url"] = f"<{len(url)} chars base64 truncated>"
+                except Exception as e:
+                    logger.warning(f"Ошибка санитизации лога: {e}")
+
+                if phase == "request":
+                    self._log_full(f"Запрос к LLM №{self.current_step}", log_data)
+                elif phase == "response":
+                    self._log_full(f"Ответный запрос от LLM №{self.current_step}", log_data)
+                    self._append_app_log(f"\n{'='*20} Ответ от приложения №{self.current_step} {'='*20}")
+
+            llm_client = LLMClient(model=self.model, data_root=self.data_root, log_callback=llm_log_callback)
             
             # Инициализируем диалог с историей, если она есть
             from .llm_client import load_analysis_prompt, load_zoom_prompt
@@ -523,6 +586,7 @@ class AgentWorker(QThread):
             
             while step < max_steps and self.is_running:
                 step += 1
+                self.current_step = step
                 self.sig_log.emit(f"Шаг {step}...")
 
                 # Прогноз по контексту
@@ -543,9 +607,25 @@ class AgentWorker(QThread):
                     raise e
                 
                 # Дальше стандартная обработка response (request_images, zoom, и т.д.)
-                # ... (существующий код ниже) ...
                 print(f"[GUI_AGENT] Получен ответ длиной {len(response)} символов")
                 print(f"[GUI_AGENT] Первые 300 символов ответа: {response[:300]}")
+
+                # ВАЖНО: Сначала сохраняем текст ответа (включая рассуждения),
+                # но очищаем от JSON-блоков инструментов, чтобы не засорять чат.
+                import re
+                def clean_response_text(text: str) -> str:
+                    # Удаляем блоки ```json ... ```
+                    text = re.sub(r"```json\s*\{.*?\}\s*```", "", text, flags=re.DOTALL)
+                    text = re.sub(r"```json\s*\[.*?\]\s*```", "", text, flags=re.DOTALL)
+                    # Удаляем одиночные JSON объекты, если они не в блоках (простая эвристика)
+                    # Но аккуратно, чтобы не удалить что-то нужное.
+                    # Лучше ограничиться удалением code blocks, так как модель мы просим писать в них.
+                    return text.strip()
+
+                cleaned_response = clean_response_text(response)
+                if cleaned_response:
+                    self.sig_message.emit("assistant", cleaned_response)
+                    self.save_message("assistant", cleaned_response)
 
                 # Факт по usage (анализ)
                 try:
@@ -565,6 +645,19 @@ class AgentWorker(QThread):
                 except Exception:
                     pass
                 
+                # 0) Обрабатываем запросы документации (просто уведомляем пользователя)
+                doc_reqs = llm_client.parse_document_requests(response)
+                if doc_reqs:
+                    for dr in doc_reqs:
+                        docs_str = ", ".join(dr.documents)
+                        info_msg = f"📂 **Модель запрашивает дополнительные документы:**\n- {docs_str}\n\n*Причина:* {dr.reason}\n\n*Пожалуйста, прикрепите эти файлы (если они есть) для более точного анализа.*"
+                        self.sig_log.emit(f"Запрос документации: {docs_str}")
+                        self._append_app_log(f"Запрос документации: {docs_str}")
+                        # Отправляем сообщение как от системы/ассистента, чтобы пользователь увидел
+                        self.sig_message.emit("assistant", info_msg)
+                        # Сохраняем в историю
+                        self.save_message("assistant", info_msg)
+
                 # 1) Обрабатываем запросы на подгрузку изображений
                 img_reqs = llm_client.parse_image_requests(response)
                 if img_reqs:
@@ -580,6 +673,7 @@ class AgentWorker(QThread):
 
                     info_msg = f"🖼️ Запрошены изображения: {', '.join(req_ids[:15])}{' ...' if len(req_ids) > 15 else ''}"
                     self.sig_log.emit(f"LLM запросила изображения: {req_ids}")
+                    self._append_app_log(f"Запрошены изображения: {req_ids}")
                     self.sig_message.emit("assistant", info_msg)
                     self.save_message("assistant", info_msg)
 
@@ -593,6 +687,7 @@ class AgentWorker(QThread):
                             missing_ids.append(rid)
                             continue
                         self.sig_log.emit(f"Скачивание (по id): {rid}")
+                        self._append_app_log(f"Скачивание (по id): {rid}")
                         crop_info = image_processor.download_and_process_pdf(entry.uri, image_id=rid)
                         if crop_info:
                             downloaded_imgs.append(crop_info)
@@ -609,6 +704,7 @@ class AgentWorker(QThread):
                     if missing_ids:
                         warn = f"⚠️ Не найдено в каталоге: {', '.join(missing_ids[:10])}{' ...' if len(missing_ids) > 10 else ''}"
                         self.sig_log.emit(warn)
+                        self._append_app_log(warn)
                         self.save_message("assistant", warn)
 
                     if downloaded_imgs:
@@ -625,6 +721,7 @@ class AgentWorker(QThread):
                 print(f"[GUI_AGENT] Zoom запросов: {len(zoom_reqs)}")
                 
                 if zoom_reqs:
+                    self._append_app_log(f"Запрошен Zoom: {len(zoom_reqs)} зон")
                     # При запросе зума добавляем системный промт 2 (ZOOM инструкции)
                     llm_client.history.append({"role": "system", "content": f"ТЕХНИЧЕСКАЯ ИНСТРУКЦИЯ ПО ZOOM:\n{zoom_prompt}"})
                     
@@ -655,6 +752,16 @@ class AgentWorker(QThread):
                             continue
 
                         if img_id not in sent_image_ids:
+                            # Проверяем, нужно ли скачивать базовую картинку
+                            # Но НЕ добавляем в need_base_ids, если мы уже собираемся делать zoom сейчас.
+                            # Вместо этого просто убеждаемся, что она скачана, чтобы process_zoom_request сработал.
+                            
+                            # Логика need_base_ids была нужна для того, чтобы ПОКАЗАТЬ пользователю и модели
+                            # общий план ПЕРЕД тем, как показывать зумы. Это полезно.
+                            # Но continue прерывает выполнение зумов.
+                            # Изменим так: если нужны базовые картинки, мы их скачиваем, ПОКАЗЫВАЕМ,
+                            # но НЕ прерываем цикл, а идем дальше к зумам.
+                            
                             if img_id not in need_base_ids:
                                 need_base_ids.append(img_id)
 
@@ -663,7 +770,8 @@ class AgentWorker(QThread):
                             if img_id not in need_refine_ids:
                                 need_refine_ids.append(img_id)
 
-                    # Если не было базовой картинки — отправляем её и просим уточнить zoom.
+                    # Если не было базовой картинки — отправляем её.
+                    # Раньше тут был continue, который прерывал зумы. Убираем его.
                     if need_base_ids:
                         base_imgs = []
                         missing_ids = []
@@ -675,6 +783,7 @@ class AgentWorker(QThread):
                                 missing_ids.append(img_id)
                                 continue
                             self.sig_log.emit(f"Подгружаю базовое изображение перед zoom: {img_id}")
+                            self._append_app_log(f"Подгружаю базовое изображение перед zoom: {img_id}")
                             base_crop = image_processor.download_and_process_pdf(entry.uri, image_id=img_id)
                             if base_crop:
                                 base_imgs.append(base_crop)
@@ -690,15 +799,15 @@ class AgentWorker(QThread):
                         if base_imgs:
                             note = (
                                 "🖼️ Подгружены базовые изображения (full/preview). "
-                                "Если нужны детали — запроси `tool=zoom` с КОНКРЕТНЫМИ координатами (лучше `coords_norm`). "
-                                "Запрос `coords_norm: [0,0,1,1]` не считается zoom."
+                                "Ниже следуют запрошенные детальные фрагменты (Zoom)."
                             )
+                            # Сохраняем сообщение с базовыми картинками
                             self.save_message("assistant", note, images=base_imgs)
+                            # Добавляем в контекст модели, чтобы она знала, что они есть
                             llm_client.add_user_message(note, images=base_imgs)
-                            continue
-
-                        llm_client.add_user_message("Не удалось загрузить базовые изображения для zoom. Укажи другие image_id из каталога.")
-                        continue
+                            
+                            # УБРАЛИ continue: идем выполнять зумы сразу же!
+                            # continue 
 
                     # Если базовые картинки уже были, но zoom некорректный — просим уточнить координаты.
                     if need_refine_ids:
@@ -714,6 +823,7 @@ class AgentWorker(QThread):
                     for i, zr in enumerate(zoom_reqs):
                         zoom_msg = f"🔄 *Zoom [{i+1}/{len(zoom_reqs)}]:* {zr.reason}"
                         self.sig_log.emit(zoom_msg)
+                        self._append_app_log(zoom_msg)
                         self.sig_message.emit("assistant", zoom_msg)
 
                         # Если модель просит zoom по image_id, но базовая картинка ещё не загружена —
@@ -740,23 +850,26 @@ class AgentWorker(QThread):
                         
                         if zoom_crop:
                             zoom_crops.append(zoom_crop)
+                            self._append_app_log(f"Zoom {i+1} OK: {zoom_crop.image_path}")
                             if zoom_crop.image_path:
                                 self.sig_image.emit(zoom_crop.image_path, f"Zoom {i+1}")
                         else:
                             self.sig_log.emit(f"Ошибка Zoom {i+1}")
+                            self._append_app_log(f"Ошибка Zoom {i+1}")
 
                     if zoom_crops:
                         # Сохраняем в историю и БД ОДНИМ сообщением со всеми картинками
-                        reasons = " | ".join([zr.reason for zr in zoom_reqs])
-                        self.save_message("assistant", f"🔎 Выполнен Zoom:\n{reasons}", images=zoom_crops)
+                        # Текст рассуждений уже сохранен выше (в response), здесь только фиксируем факт Zoom и картинки.
+                        self.save_message("assistant", "🔎 Выполнен Zoom (см. изображения)", images=zoom_crops)
                         llm_client.add_user_message("Результаты Zoom:", images=zoom_crops)
                     else:
                         self.sig_log.emit("Ошибка Zoom: не удалось получить фрагменты.")
+                        self._append_app_log("Ошибка Zoom: не удалось получить фрагменты.")
                         self.save_message("assistant", "⚠️ Ошибка Zoom: не удалось получить фрагменты.")
                 else:
-                    self.sig_message.emit("assistant", response)
-                    self.save_message("assistant", response)
-
+                    self._append_app_log("Финальный ответ получен.")
+                    # Ответ уже сохранен в начале цикла
+                    
                     # Обновляем краткую память диалога (для устойчивых длинных чатов)
                     try:
                         prev_mem = ""

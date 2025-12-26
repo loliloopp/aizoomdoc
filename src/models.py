@@ -105,6 +105,12 @@ class ImageRequest:
     reason: str = ""
 
 @dataclass
+class DocumentRequest:
+    """Запрос от LLM на подгрузку дополнительной документации."""
+    documents: List[str] = field(default_factory=list)
+    reason: str = ""
+
+@dataclass
 class MarkdownBlock:
     text: str
     block_id: Optional[str] = None

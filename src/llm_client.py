@@ -17,7 +17,7 @@ warnings.filterwarnings("ignore", category=FutureWarning, module="google.generat
 import google.generativeai as genai
 
 from .config import config
-from .models import ViewportCrop, ZoomRequest, ImageRequest, ImageSelection
+from .models import ViewportCrop, ZoomRequest, ImageRequest, ImageSelection, DocumentRequest
 
 logger = logging.getLogger(__name__)
 
@@ -160,6 +160,16 @@ def load_analysis_prompt(data_root: Optional[Path] = None) -> str:
 }
 ```
 
+ФОРМАТ ЗАПРОСА ДОПОЛНИТЕЛЬНОЙ ДОКУМЕНТАЦИИ (JSON):
+Если ты понимаешь, что для ответа не хватает других томов документации (например, смежных разделов ВК, ОВ, КР, или ПЗ), верни JSON:
+```json
+{
+  "tool": "request_documents",
+  "documents": ["133/23-ГК-АР2", "Раздел ОВ", "ПЗ"],
+  "reason": "Нужно проверить коллизии с вентиляцией"
+}
+```
+
 ВАЖНО:
 - `image_id`/`image_ids` берутся из каталога изображений или из строк вида `IMAGE [ID: ...]`.
 - Если нужно несколько запросов инструментов, можно вернуть список JSON-объектов.
@@ -246,11 +256,12 @@ def extract_json_objects(text: str) -> List[Any]:
     return results
 
 class LLMClient:
-    def __init__(self, model: Optional[str] = None, data_root: Optional[Path] = None):
+    def __init__(self, model: Optional[str] = None, data_root: Optional[Path] = None, log_callback: Optional[callable] = None):
         self.api_key = config.OPENROUTER_API_KEY
         self.base_url = config.OPENROUTER_BASE_URL
         self.model = model or config.DEFAULT_MODEL
         self.data_root = data_root or Path.cwd() / "data"
+        self.log_callback = log_callback
         self.headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -528,6 +539,12 @@ class LLMClient:
                 # Прогноз (очень грубо)
                 self.last_prompt_estimate = self.build_context_report(self.history, max_tokens=payload["max_tokens"])
                 
+                if self.log_callback:
+                    try:
+                        self.log_callback("request", payload)
+                    except Exception as e:
+                        print(f"Log callback error (request): {e}")
+
                 resp = requests.post(
                     f"{self.base_url}/chat/completions",
                     headers=self.headers,
@@ -543,6 +560,13 @@ class LLMClient:
                 
                 resp.raise_for_status()
                 response_data = resp.json()
+
+                if self.log_callback:
+                    try:
+                        self.log_callback("response", response_data)
+                    except Exception as e:
+                        print(f"Log callback error (response): {e}")
+
                 self.last_usage = response_data.get("usage") if isinstance(response_data, dict) else None
                 
                 if not response_data.get("choices"):
@@ -680,5 +704,36 @@ class LLMClient:
             if not ids:
                 continue
             requests_out.append(ImageRequest(image_ids=ids, reason=str(item.get("reason") or "")))
+
+        return requests_out
+
+    def parse_document_requests(self, response_text: str) -> List[DocumentRequest]:
+        """
+        Ищет в ответе JSON-команды tool=request_documents и возвращает список DocumentRequest.
+        """
+        response_text = (response_text or "").strip()
+        if not response_text:
+            return []
+
+        data_list = extract_json_objects(response_text)
+        requests_out: List[DocumentRequest] = []
+        
+        for item in data_list:
+            if not isinstance(item, dict):
+                continue
+            if item.get("tool") != "request_documents":
+                continue
+            
+            docs = item.get("documents") or item.get("docs") or []
+            if isinstance(docs, str):
+                docs = [docs]
+            if not isinstance(docs, list):
+                docs = []
+            
+            docs = [str(x) for x in docs if x]
+            if not docs:
+                continue
+                
+            requests_out.append(DocumentRequest(documents=docs, reason=str(item.get("reason") or "")))
 
         return requests_out
