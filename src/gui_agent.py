@@ -890,18 +890,19 @@ class AgentWorker(QThread):
                         try:
                             if img_id and img_id in image_processor._image_sizes:
                                 w_full, h_full = image_processor._image_sizes[img_id]
+                                cw, ch = 0, 0
                                 if zr.coords_norm:
                                     nx1, ny1, nx2, ny2 = zr.coords_norm
                                     cw = abs(nx2 - nx1) * w_full
                                     ch = abs(ny2 - ny1) * h_full
-                                    if max(cw, ch) > 2000:
-                                        prefix = "zoom_preview_step"
                                 elif zr.coords_px:
                                     x1, y1, x2, y2 = zr.coords_px
                                     cw = abs(x2 - x1)
                                     ch = abs(y2 - y1)
-                                    if max(cw, ch) > 2000:
-                                        prefix = "zoom_preview_step"
+                                
+                                if max(cw, ch) > 2000:
+                                    scale_factor = max(cw, ch) / 2000
+                                    prefix = f"zoom_preview_{scale_factor:.1f}_step"
                         except: pass
 
                         zoom_crop = image_processor.process_zoom_request(

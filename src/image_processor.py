@@ -65,7 +65,6 @@ class ImageProcessor:
             # - переиспользовать уже скачанные изображения в длинном диалоге
             img_id = image_id or str(uuid.uuid5(uuid.NAMESPACE_URL, url))
             cache_path = self.temp_dir / f"{img_id}_full.png"
-            preview_path = self.temp_dir / f"{img_id}_preview.png"
 
             # Если уже есть кэш на диске — не скачиваем заново.
             if cache_path.exists():
@@ -75,21 +74,20 @@ class ImageProcessor:
                     self._image_cache[img_id] = cache_path
                     self._image_sizes[img_id] = (w, h)
 
-                    # Preview может отсутствовать (например, если раньше max_side был другой)
-                    if not preview_path.exists() and max(h, w) > max_side:
-                        scale = max_side / max(h, w)
-                        new_w, new_h = int(w * scale), int(h * scale)
-                        img_preview = cv2.resize(img_bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
-                        cv2.imwrite(str(preview_path), img_preview)
-                        desc = f"⚠️ CACHED + SCALED PREVIEW: Original {w}x{h}px → {new_w}x{new_h}px. Use ZOOM to verify details."
+                    if max(h, w) > max_side:
+                        scale = max(h, w) / max_side
+                        new_w, new_h = int(w / scale), int(h / scale)
+                        preview_path = self.temp_dir / f"{img_id}_preview_{scale:.1f}.png"
+                        
+                        if not preview_path.exists():
+                            img_preview = cv2.resize(img_bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                            cv2.imwrite(str(preview_path), img_preview)
+                        
+                        desc = f"⚠️ SCALED PREVIEW (factor {scale:.1f}x): Original {w}x{h}px → Scaled to {new_w}x{new_h}px. Use ZOOM to verify details."
                         img_path = preview_path
                     else:
-                        if max(h, w) > max_side and preview_path.exists():
-                            desc = f"⚠️ CACHED SCALED PREVIEW available. Use ZOOM to verify details."
-                            img_path = preview_path
-                        else:
-                            desc = f"✓ CACHED FULL RESOLUTION IMAGE: {w}x{h}px"
-                            img_path = cache_path
+                        desc = f"✓ CACHED FULL RESOLUTION IMAGE: {w}x{h}px"
+                        img_path = cache_path
 
                     return ViewportCrop(
                         page_number=0,
@@ -143,14 +141,13 @@ class ImageProcessor:
                 # Создаем ПРЕВЬЮ только если изображение больше max_side
                 if max(h, w) > max_side:
                     # Изображение большое - создаем уменьшенный preview
-                    scale = max_side / max(h, w)
-                    new_w, new_h = int(w * scale), int(h * scale)
+                    scale = max(h, w) / max_side
+                    new_w, new_h = int(w / scale), int(h / scale)
                     img_preview = cv2.resize(img_bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
-                    scale_percent = int(scale * 100)
-                    desc = f"⚠️ SCALED PREVIEW: Original {w}x{h}px → Scaled to {new_w}x{new_h}px ({scale_percent}%). Use ZOOM to verify details."
+                    desc = f"⚠️ SCALED PREVIEW (factor {scale:.1f}x): Original {w}x{h}px → Scaled to {new_w}x{new_h}px. Use ZOOM to verify details."
                     
-                    # Сохраняем preview в PNG
-                    # preview_path уже вычислен выше
+                    # Сохраняем preview в PNG с коэффициентом в названии
+                    preview_path = self.temp_dir / f"{img_id}_preview_{scale:.1f}.png"
                     if not preview_path.exists():
                         cv2.imwrite(str(preview_path), img_preview)
                 else:
@@ -224,9 +221,10 @@ class ImageProcessor:
         # Ресайз кропа если огромный
         h_c, w_c = crop.shape[:2]
         was_scaled = False
+        scale_val = 1.0
         if max(h_c, w_c) > 2000:
-            scale = 2000 / max(h_c, w_c)
-            crop = cv2.resize(crop, (int(w_c*scale), int(h_c*scale)))
+            scale_val = max(h_c, w_c) / 2000
+            crop = cv2.resize(crop, (int(w_c/scale_val), int(h_c/scale_val)))
             was_scaled = True
             
         if output_path:
@@ -236,7 +234,7 @@ class ImageProcessor:
         desc = f"Zoom {x1},{y1}-{x2},{y2}"
         if was_scaled:
             h_new, w_new = crop.shape[:2]
-            desc = f"⚠️ ZOOM PREVIEW: Crop {w_c}x{h_c}px → Scaled to {w_new}x{h_new}px. If details are not clear, request ZOOM again inside this area."
+            desc = f"⚠️ ZOOM PREVIEW (factor {scale_val:.1f}x): Crop {w_c}x{h_c}px → Scaled to {w_new}x{h_new}px. If details are not clear, request ZOOM again inside this area."
 
         return ViewportCrop(
             page_number=request.page_number,
