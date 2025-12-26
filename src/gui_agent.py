@@ -149,7 +149,10 @@ class AgentWorker(QThread):
                     
                     # Загружаем в S3
                     try:
-                        s3_url = await s3_storage.upload_file(img.image_path, s3_key)
+                        if getattr(img, 's3_url', None):
+                            s3_url = img.s3_url
+                        else:
+                            s3_url = await s3_storage.upload_file(img.image_path, s3_key)
                         
                         if s3_url:
                             # Регистрируем в БД (это также создает запись в storage_files)
@@ -239,6 +242,36 @@ class AgentWorker(QThread):
             self.sig_log.emit(f"Лог поиска сохранен: {log_path.name}")
         except Exception as e:
             logger.error(f"Ошибка при сохранении лога поиска (GUI): {e}")
+
+    def _upload_images_to_s3(self, images: List):
+        """Синхронная обертка для загрузки списка картинок в S3 для LLM."""
+        if not s3_storage.is_connected():
+            return
+            
+        async def _upload_all():
+            tasks = []
+            for img in images:
+                if img.image_path and Path(img.image_path).exists() and not getattr(img, 's3_url', None):
+                    img_type = "zoom_crop" if getattr(img, 'is_zoom_request', False) else "viewport"
+                    filename = Path(img.image_path).name
+                    chat_id_for_path = self.db_chat_id or self.chat_id
+                    s3_key = s3_storage.generate_s3_path(chat_id_for_path, img_type, filename)
+                    tasks.append((img, s3_storage.upload_file(img.image_path, s3_key)))
+            
+            if not tasks:
+                return
+
+            # Загружаем параллельно для скорости
+            for img, task in tasks:
+                url = await task
+                if url:
+                    img.s3_url = url
+                    logger.info(f"Изображение {Path(img.image_path).name} загружено в S3: {url}")
+
+        try:
+            asyncio.run(_upload_all())
+        except Exception as e:
+            logger.error(f"Ошибка массовой загрузки в S3: {e}")
 
     def _save_to_disk(self):
         history_path = self.chat_dir / "history.json"
@@ -727,38 +760,23 @@ class AgentWorker(QThread):
                         self.save_message("assistant", warn)
 
                     if downloaded_imgs:
-                        # SAFETY FILTER: Ограничиваем количество изображений в одном запросе
-                        # Gemini Flash может падать (503) при отправке слишком большого количества картинок (особенно с высоким разрешением)
-                        MAX_IMAGES_PER_TURN = 8
-                        
-                        safe_imgs = []
-                        previews = [img for img in downloaded_imgs if not getattr(img, 'is_zoom_request', False)]
-                        zooms = [img for img in downloaded_imgs if getattr(img, 'is_zoom_request', False)]
-                        
-                        # Всегда оставляем превью (обзорные)
-                        safe_imgs.extend(previews)
-                        
-                        # Добавляем зумы, пока влезают
-                        dropped_zooms_count = 0
-                        remaining_slots = MAX_IMAGES_PER_TURN - len(safe_imgs)
-                        
-                        if remaining_slots > 0:
-                            safe_imgs.extend(zooms[:remaining_slots])
-                            dropped_zooms_count = len(zooms) - remaining_slots
-                        else:
-                            dropped_zooms_count = len(zooms)
+                        # Загружаем в S3 для LLM (чтобы избежать 503 и лимитов на размер запроса)
+                        self._upload_images_to_s3(downloaded_imgs)
 
                         # Формируем сообщение
                         msg_text = "🖼️ Загружены изображения по запросу модели."
-                        if dropped_zooms_count > 0:
-                             msg_text += (
-                                 f"\n⚠️ СИСТЕМНОЕ СООБЩЕНИЕ: {dropped_zooms_count} автоматических зум-фрагментов было пропущено "
-                                 "из-за ограничений на размер запроса. Используй PREVIEW для навигации и запрашивай ZOOM "
-                                 "вручную для конкретных важных зон."
-                             )
+                        
+                        # Теперь мы можем отправлять все изображения без жесткого лимита 8 шт, 
+                        # так как отправляем только ссылки. Однако, все равно стоит ограничить разумным пределом (например, 20),
+                        # чтобы модель не "захлебнулась" в визуальном контексте.
+                        MAX_TOTAL_IMAGES = 20
+                        final_imgs = downloaded_imgs[:MAX_TOTAL_IMAGES]
+                        
+                        if len(downloaded_imgs) > MAX_TOTAL_IMAGES:
+                             msg_text += f"\n⚠️ Внимание: {len(downloaded_imgs) - MAX_TOTAL_IMAGES} изображений были пропущены для экономии контекста."
 
-                        self.save_message("assistant", msg_text, images=safe_imgs)
-                        llm_client.add_user_message(msg_text, images=safe_imgs)
+                        self.save_message("assistant", msg_text, images=final_imgs)
+                        llm_client.add_user_message(msg_text, images=final_imgs)
                         # Продолжаем цикл — модель увидит картинки и сможет запросить zoom/сделать выводы
                         continue
                     else:
@@ -950,6 +968,9 @@ class AgentWorker(QThread):
                             self._append_app_log(f"Ошибка Zoom {i+1}")
 
                     if zoom_crops:
+                        # Загружаем в S3 для LLM
+                        self._upload_images_to_s3(zoom_crops)
+                        
                         # Сохраняем в историю и БД ОДНИМ сообщением со всеми картинками
                         # Текст рассуждений уже сохранен выше (в response), здесь только фиксируем факт Zoom и картинки.
                         self.save_message("assistant", "🔎 Выполнен Zoom (см. изображения)", images=zoom_crops)

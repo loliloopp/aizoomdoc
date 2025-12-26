@@ -126,6 +126,7 @@ class ViewportCrop:
     description: str
     target_blocks: List[str] = field(default_factory=list) # Здесь храним ID изображения для внешних ссылок
     is_zoom_request: bool = False
+    s3_url: Optional[str] = None # Публичный URL для LLM
 
 @dataclass
 class SearchResult:

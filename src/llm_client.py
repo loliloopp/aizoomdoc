@@ -487,20 +487,28 @@ class LLMClient:
         
         if images:
             for img in images:
-                if img.image_path and Path(img.image_path).exists():
+                # Определяем ID изображения
+                img_id = img.target_blocks[0] if img.target_blocks else "unknown"
+                desc = f"IMAGE [ID: {img_id}]. {img.description}"
+                content.append({"type": "text", "text": desc})
+
+                # Пытаемся использовать S3 URL если он есть
+                if img.s3_url:
+                    content.append({
+                        "type": "image_url",
+                        "image_url": {"url": img.s3_url}
+                    })
+                elif img.image_path and Path(img.image_path).exists():
                     try:
                         b64 = self.encode_image(img.image_path)
-                        img_id = img.target_blocks[0] if img.target_blocks else "unknown"
-                        
-                        desc = f"IMAGE [ID: {img_id}]. {img.description}"
-                        content.append({"type": "text", "text": desc})
-                        
                         content.append({
                             "type": "image_url",
                             "image_url": {"url": f"data:image/jpeg;base64,{b64}"}
                         })
                     except Exception as e:
-                        logger.error(f"Ошибка img: {e}")
+                        logger.error(f"Ошибка кодирования картинки {img_id}: {e}")
+                else:
+                    logger.warning(f"Изображение {img_id} не имеет ни S3 URL, ни локального пути")
 
         self.history.append({"role": "user", "content": content})
 
