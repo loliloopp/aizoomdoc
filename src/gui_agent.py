@@ -620,11 +620,21 @@ class AgentWorker(QThread):
                 import re
                 def clean_response_text(text: str) -> str:
                     # Удаляем блоки ```json ... ```
-                    text = re.sub(r"```json\s*\{.*?\}\s*```", "", text, flags=re.DOTALL)
-                    text = re.sub(r"```json\s*\[.*?\]\s*```", "", text, flags=re.DOTALL)
-                    # Удаляем одиночные JSON объекты, если они не в блоках (простая эвристика)
-                    # Но аккуратно, чтобы не удалить что-то нужное.
-                    # Лучше ограничиться удалением code blocks, так как модель мы просим писать в них.
+                    # Используем более универсальный regex, который ловит и многострочные блоки
+                    text = re.sub(r"```json\s*[\s\S]*?```", "", text)
+                    # Также удаляем просто ``` ... ``` если там json (модель иногда забывает язык)
+                    # Но это опасно, если там код. 
+                    # Попробуем удалить только если внутри есть "tool"
+                    def replacer(match):
+                        content = match.group(0)
+                        if '"tool"' in content or "'tool'" in content:
+                            return ""
+                        return content
+                    
+                    text = re.sub(r"```[\s\S]*?```", replacer, text)
+                    
+                    # Удаляем лишние пустые строки, возникшие после удаления блоков
+                    text = re.sub(r"\n{3,}", "\n\n", text)
                     return text.strip()
 
                 cleaned_response = clean_response_text(response)
