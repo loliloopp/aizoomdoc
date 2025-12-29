@@ -375,11 +375,31 @@ class AgentWorker(QThread):
             analysis_prompt = load_analysis_prompt(self.data_root)
             zoom_prompt = load_zoom_prompt(self.data_root)
             
-            # Формируем начальный системный промт: Пользовательский -> Системный 1
+            # Формируем начальный системный промт: Пользовательский -> Системный 1 -> JSON -> HTML
             full_system_prompt = ""
             if self.user_prompt:
                 full_system_prompt += f"ИНСТРУКЦИЯ ПОЛЬЗОВАТЕЛЯ (РОЛЬ): {self.user_prompt}\n\n"
             full_system_prompt += f"СИСТЕМНАЯ ИНСТРУКЦИЯ (АНАЛИЗ):\n{analysis_prompt}"
+            
+            # Добавляем промты для JSON и HTML файлов
+            json_prompt_path = self.data_root / "json_annotation_prompt.txt"
+            if json_prompt_path.exists():
+                try:
+                    json_prompt = json_prompt_path.read_text(encoding="utf-8")
+                    full_system_prompt += f"\n\n{json_prompt}"
+                    self.sig_log.emit("Загружен промт для JSON")
+                except Exception as e:
+                    logger.error(f"Ошибка загрузки json_annotation_prompt.txt: {e}")
+            
+            html_prompt_path = self.data_root / "html_ocr_prompt.txt"
+            if html_prompt_path.exists():
+                try:
+                    html_prompt = html_prompt_path.read_text(encoding="utf-8")
+                    full_system_prompt += f"\n\n{html_prompt}"
+                    self.sig_log.emit("Загружен промт для HTML")
+                except Exception as e:
+                    logger.error(f"Ошибка загрузки html_ocr_prompt.txt: {e}")
+            
             full_system_prompt += "\n\nIMPORTANT SYSTEM NOTE: DISABLE ALL NATIVE TOOLS. DO NOT USE FUNCTION CALLING. OUTPUT ONLY TEXT OR MARKDOWN."
             
             llm_client.history = [{"role": "system", "content": full_system_prompt}]

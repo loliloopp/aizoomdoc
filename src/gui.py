@@ -154,6 +154,40 @@ class SettingsDialog(QDialog):
         analysis_file_layout.addWidget(btn_edit_analysis)
         prompts_layout_main.addLayout(analysis_file_layout)
         
+        prompts_layout_main.addSpacing(10)
+        
+        # 2.3. Промт для JSON файлов
+        prompts_layout_main.addWidget(QLabel("📌 ДОПОЛНИТЕЛЬНО: JSON аннотации (json_annotation_prompt.txt):"))
+        
+        json_file_layout = QHBoxLayout()
+        self.json_prompt_label = QLineEdit()
+        self.json_prompt_label.setReadOnly(True)
+        self.json_prompt_label.setText(str(data_root / "json_annotation_prompt.txt"))
+        
+        btn_edit_json = QPushButton("Редактировать...")
+        btn_edit_json.clicked.connect(self.edit_json_prompt)
+        
+        json_file_layout.addWidget(self.json_prompt_label)
+        json_file_layout.addWidget(btn_edit_json)
+        prompts_layout_main.addLayout(json_file_layout)
+        
+        prompts_layout_main.addSpacing(10)
+        
+        # 2.4. Промт для HTML файлов
+        prompts_layout_main.addWidget(QLabel("📌 ДОПОЛНИТЕЛЬНО: HTML OCR (html_ocr_prompt.txt):"))
+        
+        html_file_layout = QHBoxLayout()
+        self.html_prompt_label = QLineEdit()
+        self.html_prompt_label.setReadOnly(True)
+        self.html_prompt_label.setText(str(data_root / "html_ocr_prompt.txt"))
+        
+        btn_edit_html = QPushButton("Редактировать...")
+        btn_edit_html.clicked.connect(self.edit_html_prompt)
+        
+        html_file_layout.addWidget(self.html_prompt_label)
+        html_file_layout.addWidget(btn_edit_html)
+        prompts_layout_main.addLayout(html_file_layout)
+        
         general_layout.addWidget(gb_prompts)
         general_layout.addStretch()
         
@@ -300,6 +334,32 @@ class SettingsDialog(QDialog):
         dialog = PromptEditDialog(self, prompt_file)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             QMessageBox.information(self, "Сохранено", f"Промт анализа сохранён в:\n{prompt_file}")
+    
+    def edit_json_prompt(self):
+        """Редактирование промта для JSON аннотаций"""
+        prompt_file = Path(self.json_prompt_label.text())
+        
+        if not prompt_file.exists():
+            QMessageBox.warning(self, "Файл не найден", 
+                f"Файл {prompt_file} не найден.\nОн должен быть создан в папке data/")
+            return
+        
+        dialog = PromptEditDialog(self, prompt_file)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            QMessageBox.information(self, "Сохранено", f"Промт для JSON сохранён в:\n{prompt_file}")
+    
+    def edit_html_prompt(self):
+        """Редактирование промта для HTML OCR"""
+        prompt_file = Path(self.html_prompt_label.text())
+        
+        if not prompt_file.exists():
+            QMessageBox.warning(self, "Файл не найден", 
+                f"Файл {prompt_file} не найден.\nОн должен быть создан в папке data/")
+            return
+        
+        dialog = PromptEditDialog(self, prompt_file)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            QMessageBox.information(self, "Сохранено", f"Промт для HTML сохранён в:\n{prompt_file}")
     
     def get_data_root(self):
         return self.path_edit.text()
