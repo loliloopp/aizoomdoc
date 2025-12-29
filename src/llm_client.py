@@ -678,13 +678,41 @@ class LLMClient:
         zoom_requests = []
         for item in data_list:
             if isinstance(item, dict) and item.get("tool") == "zoom":
-                zoom_requests.append(ZoomRequest(
-                    page_number=item.get("page_number", 0),
-                    image_id=item.get("image_id"),
-                    coords_norm=item.get("coords_norm"),
-                    coords_px=item.get("coords_px"),
-                    reason=item.get("reason", "")
-                ))
+                coords_norm = item.get("coords_norm")
+                coords_px = item.get("coords_px")
+                
+                # Проверяем, является ли coords_norm массивом массивов (множественные зумы)
+                if coords_norm and isinstance(coords_norm, list) and len(coords_norm) > 0:
+                    # Если первый элемент - список, значит это массив зумов
+                    if isinstance(coords_norm[0], list):
+                        # Создаем отдельный ZoomRequest для каждого набора координат
+                        for coord_set in coords_norm:
+                            if isinstance(coord_set, list) and len(coord_set) == 4:
+                                zoom_requests.append(ZoomRequest(
+                                    page_number=item.get("page_number", 0),
+                                    image_id=item.get("image_id"),
+                                    coords_norm=coord_set,
+                                    coords_px=None,
+                                    reason=item.get("reason", "")
+                                ))
+                    else:
+                        # Обычный одиночный зум
+                        zoom_requests.append(ZoomRequest(
+                            page_number=item.get("page_number", 0),
+                            image_id=item.get("image_id"),
+                            coords_norm=coords_norm,
+                            coords_px=coords_px,
+                            reason=item.get("reason", "")
+                        ))
+                else:
+                    # Нет coords_norm, может быть coords_px
+                    zoom_requests.append(ZoomRequest(
+                        page_number=item.get("page_number", 0),
+                        image_id=item.get("image_id"),
+                        coords_norm=coords_norm,
+                        coords_px=coords_px,
+                        reason=item.get("reason", "")
+                    ))
         return zoom_requests
 
     def parse_image_requests(self, response_text: str) -> List[ImageRequest]:

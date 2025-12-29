@@ -144,11 +144,11 @@ class ImageProcessor:
                     
                     crop = img_bgr[y1:y2, x1:x2]
                     
-                    # Ресайз кропа если он все еще огромный (больше 1600)
+                    # Ресайз кропа если он все еще огромный (больше 2000)
                     ch, cw = crop.shape[:2]
                     crop_scale = 1.0
-                    if max(ch, cw) > 1600:
-                        crop_scale = max(ch, cw) / 1600
+                    if max(ch, cw) > 2000:
+                        crop_scale = max(ch, cw) / 2000
                         crop = cv2.resize(crop, (int(cw/crop_scale), int(ch/crop_scale)), interpolation=cv2.INTER_AREA)
 
                     q_filename = f"{img_id}_autozoom_{suffix}.png"
