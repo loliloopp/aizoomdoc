@@ -17,6 +17,7 @@ from .config import config
 from .llm_client import LLMClient
 from .image_processor import ImageProcessor
 from .markdown_parser import MarkdownParser
+from .file_processor import FileProcessor
 from .supabase_client import supabase_client
 from .s3_storage import s3_storage
 
@@ -409,48 +410,67 @@ class AgentWorker(QThread):
             # ВАЖНО: Если мы продолжаем чат, нам все равно нужен текст документа в контексте.
             # Для варианта A мы просто заново читаем файлы.
             if self.md_files:
-                self.sig_log.emit(f"Используются выбранные MD файлы: {len(self.md_files)}")
-                for md_path_str in self.md_files:
+                self.sig_log.emit(f"Используются выбранные файлы: {len(self.md_files)}")
+                
+                # Список для изображений, которые нужно передать в LLM
+                attached_images = []
+                
+                for file_path_str in self.md_files:
                     try:
-                        md_path = Path(md_path_str)
-                        self.sig_log.emit(f"Читаю: {md_path}")
+                        file_path = Path(file_path_str)
+                        self.sig_log.emit(f"Читаю: {file_path}")
                         
-                        # Загружаем MD в S3 и регистрируем в БД
+                        # Загружаем файл в S3 и регистрируем в БД
                         if self.db_chat_id:
                             try:
-                                s3_doc_key = s3_storage.generate_s3_path(self.db_chat_id, "document", md_path.name)
-                                s3_url = asyncio.run(s3_storage.upload_file(str(md_path), s3_doc_key))
+                                s3_doc_key = s3_storage.generate_s3_path(self.db_chat_id, "document", file_path.name)
+                                s3_url = asyncio.run(s3_storage.upload_file(str(file_path), s3_doc_key))
                                 
                                 asyncio.run(supabase_client.register_file(
                                     user_id="default_user",
                                     source_type="user_upload",
-                                    filename=md_path.name,
+                                    filename=file_path.name,
                                     storage_path=s3_doc_key,
                                     external_url=s3_url
                                 ))
                             except Exception as e:
-                                logger.error(f"Ошибка загрузки/регистрации MD: {e}")
+                                logger.error(f"Ошибка загрузки/регистрации файла: {e}")
 
-                        parser = MarkdownParser(md_path)
-                        blocks = parser.parse()
-                        all_blocks.extend(blocks)
+                        # Обрабатываем файл в зависимости от типа
+                        text, blocks, image = FileProcessor.process_file(file_path, self.db_chat_id)
                         
-                        self.sig_log.emit(f"Прочитано блоков: {len(blocks)}")
-                        for block in blocks:
-                            full_text += block.text + "\n\n"
+                        # Добавляем текст в контекст
+                        full_text += text
+                        
+                        # Добавляем блоки (для .md файлов)
+                        if blocks:
+                            all_blocks.extend(blocks)
+                            self.sig_log.emit(f"Прочитано блоков: {len(blocks)}")
+                        
+                        # Для изображений - добавляем в список для передачи в LLM
+                        if image:
+                            # Загружаем изображение в S3
+                            if self.db_chat_id:
+                                try:
+                                    s3_img_key = s3_storage.generate_s3_path(
+                                        self.db_chat_id, 
+                                        "document", 
+                                        file_path.name
+                                    )
+                                    s3_img_url = asyncio.run(s3_storage.upload_file(
+                                        str(file_path), 
+                                        s3_img_key,
+                                        content_type=f"image/{file_path.suffix[1:]}"
+                                    ))
+                                    image.s3_url = s3_img_url
+                                except Exception as e:
+                                    logger.error(f"Ошибка загрузки изображения в S3: {e}")
                             
-                        # Сохраняем блоки в search_results
-                        if self.db_chat_id:
-                            try:
-                                # Для варианта A привязываем блоки к чату.
-                                # Если в БД message_id обязателен, то для первичного индекса 
-                                # мы пока пропускаем или привязываем к будущему сообщению.
-                                pass
-                            except Exception as e:
-                                logger.error(f"Ошибка сохранения блока: {e}")
+                            attached_images.append(image)
+                            self.sig_log.emit(f"Изображение добавлено: {file_path.name}")
 
                     except Exception as e:
-                        self.sig_log.emit(f"Ошибка чтения {md_path_str}: {e}")
+                        self.sig_log.emit(f"Ошибка чтения {file_path_str}: {e}")
                         import traceback
                         self.sig_log.emit(traceback.format_exc())
             else:
@@ -490,7 +510,7 @@ class AgentWorker(QThread):
                             except: pass
             
             if not full_text.strip():
-                raise ValueError("В чате нет прикрепленных документов для анализа. Прикрепите .md файлы.")
+                raise ValueError("В чате нет прикрепленных документов для анализа. Прикрепите файлы (md, jpg, png, html, json).")
 
             # 1. Читаем и регистрируем MD файлы
             full_md_text = ""
@@ -614,7 +634,8 @@ class AgentWorker(QThread):
                     try: asyncio.run(supabase_client.add_search_results_bulk(bulk_data))
                     except: pass
 
-            llm_client.add_user_message(context, images=None)
+            # Передаём прикреплённые изображения (если есть) вместе с контекстом
+            llm_client.add_user_message(context, images=attached_images if 'attached_images' in locals() else None)
             
             step = 0
             max_steps = 10

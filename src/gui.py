@@ -1208,9 +1208,9 @@ class MainWindow(QMainWindow):
     def browse_md_files(self):
         files, _ = QFileDialog.getOpenFileNames(
             self, 
-            "Выберите файлы Markdown", 
+            "Выберите файлы", 
             str(self.data_root), 
-            "Markdown Files (*.md)"
+            "Поддерживаемые файлы (*.md *.jpg *.png *.html *.json);;Все файлы (*)"
         )
         if files:
             # Добавляем новые файлы к существующим
