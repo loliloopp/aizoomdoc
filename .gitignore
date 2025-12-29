@@ -38,6 +38,7 @@ ENV/
 
 # Data files
 data/chats/
+data/example/
 data/projects/
 temp/
 # *.jpg
