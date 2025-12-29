@@ -559,8 +559,32 @@ class AgentWorker(QThread):
 
             # ===== ПОДГОТОВКА КОНТЕКСТА =====
             
-            from .doc_index import build_index, retrieve_text_chunks, strip_json_blocks
+            from .doc_index import build_index, retrieve_text_chunks, strip_json_blocks, ImageCatalogEntry
+            from .json_annotation_processor import JsonAnnotationProcessor
             doc_index = build_index(full_md_text)
+            
+            # Добавляем изображения из JSON файлов в каталог
+            for md_path_str in files_to_process:
+                md_path = Path(md_path_str)
+                if md_path.suffix.lower() == '.json':
+                    try:
+                        _, annotation = JsonAnnotationProcessor.process(md_path)
+                        if annotation:
+                            for img_block in annotation.image_blocks:
+                                # Добавляем ID из JSON в каталог изображений
+                                entry = ImageCatalogEntry(
+                                    image_id=img_block.block_id,
+                                    page=img_block.page_number,
+                                    uri=img_block.crop_url or "",
+                                    content_summary=img_block.content_summary or "",
+                                    detailed_description=img_block.detailed_description or "",
+                                    clean_ocr_text=img_block.ocr_text or "",
+                                    key_entities=img_block.key_entities or []
+                                )
+                                doc_index.images[img_block.block_id] = entry
+                            self.sig_log.emit(f"Добавлено {len(annotation.image_blocks)} изображений из JSON в каталог")
+                    except Exception as e:
+                        logger.error(f"Ошибка добавления изображений из JSON {md_path}: {e}")
             
             tail_n = 12 # Начальный размер истории
             context = ""
@@ -642,6 +666,11 @@ class AgentWorker(QThread):
             # Какие изображения (full/preview) уже были отправлены модели в этом запуске.
             # Нужно, чтобы ZOOM выполнялся только после того, как модель увидела базовую картинку.
             sent_image_ids = set()
+            
+            # Отслеживание повторных запросов одних и тех же несуществующих ID
+            last_missing_ids = set()
+            missing_repeat_count = 0
+            max_missing_repeats = 3
             
             while step < max_steps and self.is_running:
                 step += 1
@@ -775,6 +804,29 @@ class AgentWorker(QThread):
                                     self.sig_image.emit(c.image_path, f"Image ID: {rid}")
 
                     if missing_ids:
+                        # Проверяем, повторяются ли те же ID
+                        current_missing = set(missing_ids)
+                        if current_missing == last_missing_ids:
+                            missing_repeat_count += 1
+                            if missing_repeat_count >= max_missing_repeats:
+                                err_msg = f"⚠️ Модель {max_missing_repeats} раза запрашивает несуществующие ID: {', '.join(sorted(current_missing)[:10])}. Прерываю цикл."
+                                self.sig_log.emit(err_msg)
+                                self._append_app_log(err_msg)
+                                
+                                # Отправляем финальное сообщение с объяснением
+                                final_msg = (
+                                    f"{err_msg}\n\n"
+                                    f"**Доступные изображения в каталоге:**\n"
+                                    f"{chr(10).join([f'- {img_id}' for img_id in sorted(doc_index.images.keys())[:20]])}"
+                                    f"{chr(10)}... всего {len(doc_index.images)} изображений"
+                                )
+                                self.sig_message.emit("system", final_msg)
+                                self.save_message("system", final_msg)
+                                break  # Выходим из цикла
+                        else:
+                            last_missing_ids = current_missing
+                            missing_repeat_count = 1
+                        
                         warn = f"⚠️ Не найдено в каталоге: {', '.join(missing_ids[:10])}{' ...' if len(missing_ids) > 10 else ''}"
                         self.sig_log.emit(warn)
                         self._append_app_log(warn)

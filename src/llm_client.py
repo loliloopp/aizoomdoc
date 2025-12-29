@@ -433,7 +433,7 @@ class LLMClient:
                 )
                 
                 if resp.status_code == 429:
-                    print(f"[SELECT_IMAGES] ⚠️ 429 Too Many Requests. Жду 5 сек...")
+                    print(f"[SELECT_IMAGES] WARNING: 429 Too Many Requests. Жду 5 сек...")
                     import time
                     time.sleep(5)
                     continue
@@ -465,7 +465,7 @@ class LLMClient:
                         image_urls=data.get("image_urls", [])
                     )
                 except json.JSONDecodeError as e:
-                    print(f"[SELECT_IMAGES] ⚠️ Ошибка JSON парсинга: {e}")
+                    print(f"[SELECT_IMAGES] WARNING: Ошибка JSON парсинга: {e}")
                     print(f"[SELECT_IMAGES] RAW CONTENT:\n{original_content}")
                     print(f"[SELECT_IMAGES] CLEANED CONTENT:\n{content}")
                     continue
@@ -562,7 +562,7 @@ class LLMClient:
                 )
                 
                 if resp.status_code == 429:
-                    print(f"[GET_RESPONSE] ⚠️ Ошибка 429 (Too Many Requests). Жду 5 секунд...")
+                    print(f"[GET_RESPONSE] WARNING: Ошибка 429 (Too Many Requests). Жду 5 секунд...")
                     import time
                     time.sleep(5)
                     continue
@@ -579,17 +579,17 @@ class LLMClient:
                 self.last_usage = response_data.get("usage") if isinstance(response_data, dict) else None
                 
                 if not response_data.get("choices"):
-                    print(f"[GET_RESPONSE] ⚠️ Попытка {attempt+1}: Нет choices в ответе")
+                    print(f"[GET_RESPONSE] WARNING: Попытка {attempt+1}: Нет choices в ответе")
                     continue
                 
                 answer = response_data["choices"][0]["message"].get("content", "")
                 
                 if not answer:
-                    print(f"[GET_RESPONSE] ⚠️ Попытка {attempt+1}: Пустой content")
+                    print(f"[GET_RESPONSE] WARNING: Попытка {attempt+1}: Пустой content")
                     # Если пустой ответ - пробуем еще раз
                     continue
                 
-                print(f"[GET_RESPONSE] ✓ Получен ответ длиной {len(answer)} символов")
+                print(f"[GET_RESPONSE] OK: Получен ответ длиной {len(answer)} символов")
                 self.add_assistant_message(answer)
                 return answer
                 

@@ -197,8 +197,11 @@ class JsonAnnotationProcessor:
             lines.append("(Полный текст доступен в HTML файле)\n")
         
         # Инструкция для LLM
-        lines.append("## ИНСТРУКЦИЯ")
-        lines.append("Для запроса изображений используй crop_url указанных блоков.")
+        lines.append("## ИНСТРУКЦИЯ ДЛЯ ЗАПРОСА ИЗОБРАЖЕНИЙ")
+        lines.append("Используй tool=request_images с указанием block_id (ID) из списка выше:")
+        lines.append('Пример: {"tool": "request_images", "image_ids": ["4K6U-6QR7-499", "6XAM-AFDQ-DU7"], "reason": "Запрос планов"}')
+        lines.append("Для ZOOM используй тот же block_id и нормализованные координаты:")
+        lines.append('Пример: {"tool": "zoom", "image_id": "4K6U-6QR7-499", "coords_norm": [0.2, 0.3, 0.5, 0.7], "reason": "Анализ узла"}')
         lines.append("Для поиска связанных элементов используй group_name.")
         lines.append("Для идентификации листа используй stamp_data (номер листа, шифр).\n")
         

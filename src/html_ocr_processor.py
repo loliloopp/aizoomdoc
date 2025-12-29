@@ -191,9 +191,22 @@ class HtmlOcrProcessor:
             # Парсим JSON
             try:
                 data = json.loads(json_text)
-            except json.JSONDecodeError:
-                logger.warning(f"Не удалось распарсить JSON в блоке {block_id}")
-                return None
+            except json.JSONDecodeError as json_err:
+                logger.warning(f"Не удалось распарсить JSON в блоке {block_id}: {json_err}")
+                # Возвращаем блок без JSON данных, но с crop_url если есть
+                crop_url = None
+                link_elem = content_div.find('a', string=re.compile(r'Открыть изображение'))
+                if link_elem and link_elem.get('href'):
+                    crop_url = link_elem['href']
+                
+                return HtmlBlock(
+                    block_id=block_id,
+                    block_number=block_number,
+                    page_number=page_number,
+                    block_type='image',
+                    content=json_text,
+                    crop_url=crop_url
+                )
             
             # Обрабатываем структуру (может быть с оберткой "analysis" или без)
             if 'analysis' in data:

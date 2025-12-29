@@ -1020,6 +1020,14 @@ class MainWindow(QMainWindow):
         self.btn_send.clicked.connect(self.start_agent)
         input_layout.addWidget(self.btn_send, 0, Qt.AlignmentFlag.AlignBottom)
         
+        # Кнопка остановки
+        self.btn_stop = QPushButton("■")
+        self.btn_stop.setFixedSize(28, 28)
+        self.btn_stop.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_stop.setVisible(False)  # Скрыта по умолчанию
+        self.btn_stop.clicked.connect(self.stop_agent)
+        input_layout.addWidget(self.btn_stop, 0, Qt.AlignmentFlag.AlignBottom)
+        
         # Центральная часть (90%)
         input_center_layout.addWidget(self.input_frame, 18)
         
@@ -1541,6 +1549,8 @@ class MainWindow(QMainWindow):
         self.txt_input.clear()
         self.txt_input.setEnabled(False)
         self.btn_send.setEnabled(False)
+        self.btn_send.setVisible(False)  # Скрываем кнопку отправки
+        self.btn_stop.setVisible(True)   # Показываем кнопку остановки
         self.btn_attach.setEnabled(False)
         self.progress.setVisible(True)
         
@@ -1566,6 +1576,20 @@ class MainWindow(QMainWindow):
         self.current_worker.sig_history_saved.connect(self.on_history_saved)
         self.current_worker.sig_usage.connect(self.update_usage)
         self.current_worker.start()
+    
+    def stop_agent(self):
+        """Останавливает текущий воркер."""
+        if self.current_worker:
+            self.log("⚠️ Остановка диалога...")
+            self.current_worker.stop()
+            # Не ждем завершения, просто возвращаем интерфейс
+            self.txt_input.setEnabled(True)
+            self.btn_send.setEnabled(True)
+            self.btn_send.setVisible(True)
+            self.btn_stop.setVisible(False)
+            self.btn_attach.setEnabled(True)
+            self.progress.setVisible(False)
+            self.log("Диалог остановлен.")
 
     def on_history_saved(self, chat_id, title):
         """Обновляет текущие ID чата после первого сохранения."""
@@ -1578,6 +1602,8 @@ class MainWindow(QMainWindow):
     def on_finished(self):
         self.txt_input.setEnabled(True)
         self.btn_send.setEnabled(True)
+        self.btn_send.setVisible(True)
+        self.btn_stop.setVisible(False)
         self.btn_attach.setEnabled(True)
         self.progress.setVisible(False)
         self.log("Готово.")
@@ -2158,6 +2184,20 @@ class MainWindow(QMainWindow):
                 }
             """)
             
+            self.btn_stop.setStyleSheet("""
+                QPushButton {
+                    background-color: #ef4444;
+                    color: white;
+                    border: none;
+                    border-radius: 14px;
+                    font-size: 14px;
+                    font-weight: bold;
+                }
+                QPushButton:hover {
+                    background-color: #dc2626;
+                }
+            """)
+            
             # Правая панель
             self.right_panel.setStyleSheet("""
                 QFrame {
@@ -2553,6 +2593,20 @@ class MainWindow(QMainWindow):
                 }
                 QPushButton:disabled {
                     background-color: #d0d0d0;
+                }
+            """)
+            
+            self.btn_stop.setStyleSheet("""
+                QPushButton {
+                    background-color: #ef4444;
+                    color: white;
+                    border: none;
+                    border-radius: 14px;
+                    font-size: 14px;
+                    font-weight: bold;
+                }
+                QPushButton:hover {
+                    background-color: #dc2626;
                 }
             """)
             
