@@ -399,7 +399,8 @@ class SupabaseClient:
         chat_id: str,
         role: str,
         content: str,
-        message_type: str = "text"
+        message_type: str = "text",
+        model: Optional[str] = None
     ) -> Optional[str]:
         """Добавить сообщение в чат с поддержкой повторных попыток."""
         if not self.is_connected():
@@ -412,6 +413,9 @@ class SupabaseClient:
                 "content": content,
                 "message_type": message_type
             }
+            if model:
+                data["model"] = model
+                
             return self.client.table("chat_messages").insert(data).execute()
 
         try:

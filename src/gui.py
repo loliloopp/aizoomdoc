@@ -601,7 +601,7 @@ class DragDropTextEdit(QTextEdit):
 
 
 class ChatMessageWidget(QFrame):
-    def __init__(self, role: str, text: str, parent=None, is_dark_theme=True):
+    def __init__(self, role: str, text: str, parent=None, is_dark_theme=True, model: str = None):
         super().__init__(parent)
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.role = role
@@ -615,11 +615,12 @@ class ChatMessageWidget(QFrame):
         self.content_widget = QWidget()
         content_layout = QHBoxLayout(self.content_widget)
         content_layout.setContentsMargins(24, 16, 24, 16)
+        content_layout.setAlignment(Qt.AlignmentFlag.AlignTop) # Выравнивание по верху
         
         # Иконка/аватар
         icon_label = QLabel()
         icon_label.setFixedSize(32, 32)
-        icon_label.setAlignment(Qt.AlignmentFlag.AlignTop)
+        icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter) # Центрируем иконку
         
         if role == "user":
             icon_label.setText("👤")
@@ -628,7 +629,7 @@ class ChatMessageWidget(QFrame):
                 border-radius: 16px;
                 color: white;
                 font-size: 18px;
-                padding: 6px;
+                padding: 4px;
             """)
         else:
             icon_label.setText("🤖")
@@ -637,11 +638,8 @@ class ChatMessageWidget(QFrame):
                 border-radius: 16px;
                 color: white;
                 font-size: 18px;
-                padding: 6px;
+                padding: 4px;
             """)
-        
-        content_layout.addWidget(icon_label)
-        content_layout.addSpacing(16)
         
         # Текст сообщения
         text_widget = QWidget()
@@ -649,12 +647,43 @@ class ChatMessageWidget(QFrame):
         text_layout.setContentsMargins(0, 0, 0, 0)
         text_layout.setSpacing(4)
         
+        # Если есть модель и роль assistant - добавляем лейбл модели
+        if role == "assistant" and model:
+            lbl_model = QLabel(model)
+            lbl_model.setStyleSheet("""
+                color: #8e8ea0;
+                font-size: 11px;
+                font-weight: bold;
+                margin-bottom: 2px;
+            """)
+            text_layout.addWidget(lbl_model)
+        
         self.lbl_text = QLabel(text)
         self.lbl_text.setWordWrap(True)
         self.lbl_text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         
         text_layout.addWidget(self.lbl_text)
-        content_layout.addWidget(text_widget, 1)
+        
+        # Компоновка в зависимости от роли
+        if role == "user":
+            # Пользователь: Текст слева, Аватар справа
+            # Можно добавить spacer слева, чтобы сообщение не растягивалось на всю ширину, если текста мало
+            # Но для стиля ChatGPT обычно всё растягивается.
+            # Если нужно выравнивание как в мессенджерах (пузыри), это сложнее.
+            # Здесь просто меняем порядок элементов.
+            
+            # Добавим выравнивание текста вправо для красоты? 
+            # Обычно в ChatGPT текст пользователя выровнен влево, но сам блок сообщения может быть где угодно.
+            # Оставим текст выровненным влево внутри блока, но блок разместим слева от аватара.
+            
+            content_layout.addWidget(text_widget, 1)
+            content_layout.addSpacing(16)
+            content_layout.addWidget(icon_label)
+        else:
+            # Ассистент: Аватар слева, Текст справа
+            content_layout.addWidget(icon_label)
+            content_layout.addSpacing(16)
+            content_layout.addWidget(text_widget, 1)
         
         main_layout.addWidget(self.content_widget)
         
@@ -1366,8 +1395,8 @@ class MainWindow(QMainWindow):
         self.lbl_used.setText(f"Использовано: {used:,}".replace(",", " "))
         self.lbl_remaining.setText(f"Осталось: {remaining:,}".replace(",", " "))
 
-    def add_chat_message(self, role, text):
-        w = ChatMessageWidget(role, text, is_dark_theme=self.is_dark_theme)
+    def add_chat_message(self, role, text, model=None):
+        w = ChatMessageWidget(role, text, is_dark_theme=self.is_dark_theme, model=model)
         self.chat_layout.insertWidget(self.chat_layout.count()-1, w)
         QApplication.processEvents()
         self.scroll_area.verticalScrollBar().setValue(self.scroll_area.verticalScrollBar().maximum())
@@ -1586,7 +1615,8 @@ class MainWindow(QMainWindow):
                 self.update_file_indicator()
                 
                 for msg in data.get("messages", []):
-                    self.add_chat_message(msg["role"], msg["content"])
+                    model = msg.get("model") # Извлекаем модель если есть
+                    self.add_chat_message(msg["role"], msg["content"], model=model)
                     if "images" in msg:
                         for img_path in msg["images"]:
                             if Path(img_path).exists():

@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 class AgentWorker(QThread):
     sig_log = pyqtSignal(str)
-    sig_message = pyqtSignal(str, str)
+    sig_message = pyqtSignal(str, str, str)  # role, content, model
     sig_image = pyqtSignal(str, str)
     sig_finished = pyqtSignal()
     sig_error = pyqtSignal(str)
@@ -99,6 +99,11 @@ class AgentWorker(QThread):
             "content": content,
             "timestamp": datetime.now().isoformat()
         }
+        
+        # Сохраняем модель для сообщений ассистента
+        if role == "assistant":
+            msg["model"] = self.model
+            
         if images:
             msg["images"] = [img.image_path for img in images if img.image_path]
         
@@ -108,11 +113,13 @@ class AgentWorker(QThread):
         # Сохранение в БД и S3
         if config.USE_DATABASE:
             try:
-                asyncio.run(self._save_to_db(role, content, images))
+                # В БД модель пока не сохраняем (нет поля в схеме), 
+                # но она есть в metadata чата (общая для чата)
+                asyncio.run(self._save_to_db(role, content, images, model=msg.get("model")))
             except Exception as e:
                 logger.error(f"Ошибка сохранения в БД: {e}")
 
-    async def _save_to_db(self, role: str, content: str, images: list = None):
+    async def _save_to_db(self, role: str, content: str, images: list = None, model: str = None):
         """Асинхронное сохранение сообщения и картинок в Supabase и S3."""
         try:
             if not self.db_chat_id:
@@ -123,7 +130,8 @@ class AgentWorker(QThread):
             msg_id = await supabase_client.add_message(
                 chat_id=self.db_chat_id,
                 role=role,
-                content=content
+                content=content,
+                model=model
             )
             
             if not msg_id:
@@ -749,7 +757,7 @@ class AgentWorker(QThread):
 
                 cleaned_response = clean_response_text(response)
                 if cleaned_response:
-                    self.sig_message.emit("assistant", cleaned_response)
+                    self.sig_message.emit("assistant", cleaned_response, self.model)
                     self.save_message("assistant", cleaned_response)
 
                 # Факт по usage (анализ)
@@ -779,7 +787,7 @@ class AgentWorker(QThread):
                         self.sig_log.emit(f"Запрос документации: {docs_str}")
                         self._append_app_log(f"Запрос документации: {docs_str}")
                         # Отправляем сообщение как от системы/ассистента, чтобы пользователь увидел
-                        self.sig_message.emit("assistant", info_msg)
+                        self.sig_message.emit("assistant", info_msg, self.model)
                         # Сохраняем в историю
                         self.save_message("assistant", info_msg)
 
@@ -799,7 +807,7 @@ class AgentWorker(QThread):
                     info_msg = f"🖼️ Запрошены изображения: {', '.join(req_ids[:15])}{' ...' if len(req_ids) > 15 else ''}"
                     self.sig_log.emit(f"LLM запросила изображения: {req_ids}")
                     self._append_app_log(f"Запрошены изображения: {req_ids}")
-                    self.sig_message.emit("assistant", info_msg)
+                    self.sig_message.emit("assistant", info_msg, self.model)
                     self.save_message("assistant", info_msg)
 
                     downloaded_imgs = []
@@ -840,7 +848,7 @@ class AgentWorker(QThread):
                                     f"{chr(10).join([f'- {img_id}' for img_id in sorted(doc_index.images.keys())[:20]])}"
                                     f"{chr(10)}... всего {len(doc_index.images)} изображений"
                                 )
-                                self.sig_message.emit("system", final_msg)
+                                self.sig_message.emit("system", final_msg, None)
                                 self.save_message("system", final_msg)
                                 break  # Выходим из цикла
                         else:
@@ -999,7 +1007,7 @@ class AgentWorker(QThread):
                         zoom_msg = f"🔄 *Zoom [{i+1}/{len(zoom_reqs)}]:* {zr.reason}"
                         self.sig_log.emit(zoom_msg)
                         self._append_app_log(zoom_msg)
-                        self.sig_message.emit("assistant", zoom_msg)
+                        self.sig_message.emit("assistant", zoom_msg, self.model)
 
                         # Если модель просит zoom по image_id, но базовая картинка ещё не загружена —
                         # подгружаем её автоматически по каталогу (устойчивость).
