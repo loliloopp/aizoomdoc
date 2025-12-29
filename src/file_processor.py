@@ -12,6 +12,7 @@ from bs4 import BeautifulSoup
 from .models import MarkdownBlock, ViewportCrop
 from .markdown_parser import MarkdownParser
 from .json_annotation_processor import JsonAnnotationProcessor
+from .html_ocr_processor import HtmlOcrProcessor
 
 logger = logging.getLogger(__name__)
 
@@ -93,12 +94,20 @@ class FileProcessor:
     
     @staticmethod
     def _process_html(file_path: Path) -> Tuple[str, List, None]:
-        """Парсит HTML и извлекает текст."""
+        """Парсит HTML файл."""
         try:
+            # Проверяем, является ли это HTML OCR файлом
             with open(file_path, 'r', encoding='utf-8') as f:
-                html_content = f.read()
+                content = f.read()
             
-            soup = BeautifulSoup(html_content, 'html.parser')
+            # Признаки HTML OCR файла: class="block block-type-*"
+            if 'class="block block-type-' in content:
+                logger.info(f"Обнаружен HTML OCR файл: {file_path.name}")
+                llm_text, document = HtmlOcrProcessor.process(file_path)
+                return llm_text, [], None
+            
+            # Иначе - обычный HTML, парсим BeautifulSoup
+            soup = BeautifulSoup(content, 'html.parser')
             
             # Удаляем script и style теги
             for script in soup(["script", "style"]):
