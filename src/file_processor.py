@@ -11,6 +11,7 @@ from bs4 import BeautifulSoup
 
 from .models import MarkdownBlock, ViewportCrop
 from .markdown_parser import MarkdownParser
+from .json_annotation_processor import JsonAnnotationProcessor
 
 logger = logging.getLogger(__name__)
 
@@ -122,12 +123,18 @@ class FileProcessor:
     def _process_json(file_path: Path) -> Tuple[str, List, None]:
         """Читает и форматирует JSON файл."""
         try:
+            # Проверяем, является ли это JSON аннотацией чертежей
             with open(file_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             
-            # Форматируем JSON для читаемости
-            formatted_json = json.dumps(data, indent=2, ensure_ascii=False)
+            # Если есть структура с pages и blocks - это аннотация
+            if 'pages' in data and isinstance(data.get('pages'), list):
+                logger.info(f"Обнаружен JSON файл аннотации чертежей: {file_path.name}")
+                llm_text, annotation = JsonAnnotationProcessor.process(file_path)
+                return llm_text, [], None
             
+            # Иначе - обычный JSON
+            formatted_json = json.dumps(data, indent=2, ensure_ascii=False)
             result = f"[JSON файл: {file_path.name}]\n\n```json\n{formatted_json}\n```\n\n"
             return result, [], None
             
