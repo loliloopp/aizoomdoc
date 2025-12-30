@@ -188,11 +188,96 @@ class HtmlOcrProcessor:
             # Декодируем HTML entities
             json_text = html_module.unescape(pre_elem.get_text())
             
+            # Очистка от Markdown блоков кода
+            json_text = re.sub(r'^```[a-zA-Z]*\s*', '', json_text, flags=re.MULTILINE)
+            json_text = re.sub(r'^```\s*', '', json_text, flags=re.MULTILINE)
+            json_text = json_text.strip()
+            
+            data = None
+            
             # Парсим JSON
             try:
                 data = json.loads(json_text)
-            except json.JSONDecodeError as json_err:
-                logger.warning(f"Не удалось распарсить JSON в блоке {block_id}: {json_err}")
+            except json.JSONDecodeError:
+                # Попытка распарсить несколько JSON-объектов подряд (например, "Extra data")
+                try:
+                    results = []
+                    decoder = json.JSONDecoder()
+                    pos = 0
+                    while pos < len(json_text):
+                        # Пропускаем пробелы
+                        while pos < len(json_text) and json_text[pos].isspace():
+                            pos += 1
+                        if pos >= len(json_text):
+                            break
+                        
+                        try:
+                            obj, idx = decoder.raw_decode(json_text, pos)
+                            results.append(obj)
+                            pos = idx
+                        except json.JSONDecodeError:
+                            # Если не удалось декодировать с текущей позиции, пробуем найти следующую скобку {
+                            next_brace = json_text.find('{', pos + 1)
+                            if next_brace != -1:
+                                pos = next_brace
+                            else:
+                                break
+                    
+                    if results:
+                        # Если нашли несколько объектов, пытаемся их объединить
+                        if len(results) == 1:
+                            data = results[0]
+                        else:
+                            # Объединяем analysis из нескольких объектов
+                            merged_analysis = {
+                                "content_summary": [],
+                                "detailed_description": [],
+                                "clean_ocr_text": [],
+                                "key_entities": [],
+                                "location": {}
+                            }
+                            
+                            has_analysis = False
+                            for res in results:
+                                an = res.get('analysis', res if 'content_summary' in res else None)
+                                if an:
+                                    has_analysis = True
+                                    if an.get("content_summary"):
+                                        merged_analysis["content_summary"].append(an.get("content_summary"))
+                                    if an.get("detailed_description"):
+                                        merged_analysis["detailed_description"].append(an.get("detailed_description"))
+                                    
+                                    ocr = an.get("clean_ocr_text") or an.get("ocr_text")
+                                    if ocr:
+                                        merged_analysis["clean_ocr_text"].append(ocr)
+                                        
+                                    if an.get("key_entities"):
+                                        merged_analysis["key_entities"].extend(an.get("key_entities", []))
+                                    
+                                    if an.get("location"):
+                                        merged_analysis["location"].update(an.get("location"))
+                            
+                            if has_analysis:
+                                data = {
+                                    "analysis": {
+                                        "content_summary": " ".join(merged_analysis["content_summary"]),
+                                        "detailed_description": " ".join(merged_analysis["detailed_description"]),
+                                        "clean_ocr_text": " ".join(merged_analysis["clean_ocr_text"]),
+                                        "key_entities": list(set(merged_analysis["key_entities"])), # unique
+                                        "location": merged_analysis["location"]
+                                    }
+                                }
+                            else:
+                                # Если структуры analysis нет, берем первый успешный объект
+                                data = results[0]
+
+                except Exception as merge_err:
+                     logger.warning(f"Ошибка восстановления JSON (merge) в блоке {block_id}: {merge_err}")
+            
+            if data is None:
+                # Если все попытки провалились
+                logger.warning(f"Не удалось распарсить JSON в блоке {block_id}")
+                
                 # Возвращаем блок без JSON данных, но с crop_url если есть
                 crop_url = None
                 link_elem = content_div.find('a', string=re.compile(r'Открыть изображение'))

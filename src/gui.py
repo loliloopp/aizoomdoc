@@ -31,11 +31,8 @@ from .utils import transliterate
 import asyncio
 
 MODELS = {
-    "Gemini 3 Flash": "gemini-3-flash-preview",
-    "Gemini 3 Pro": "gemini-3-pro-preview",
     "Gemini 3 Flash (openrouter)": "google/gemini-3-flash-preview",
-    "Gemini 3 Pro (openrouter)": "google/gemini-3-pro-preview",
-    "Qwen3 VL": "qwen/qwen3-vl-235b-a22b-thinking"
+    "Gemini 3 Pro (openrouter)": "google/gemini-3-pro-preview"
 }
 
 CONFIG_PATH = Path.home() / ".aizoomdoc_config.json"

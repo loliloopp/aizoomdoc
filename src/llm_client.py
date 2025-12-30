@@ -287,7 +287,7 @@ class LLMClient:
         """Проверяет, является ли модель прямой моделью Google."""
         return self.model in ["gemini-1.5-flash", "gemini-1.5-pro"]
 
-    def _call_google_direct(self, messages: List[Dict[str, Any]], temperature: float = 0.2, max_tokens: int = 4000, response_json: bool = False) -> str:
+    def _call_google_direct(self, messages: List[Dict[str, Any]], temperature: float = 0.2, max_tokens: int = config.MAX_TOKENS, response_json: bool = False) -> str:
         """Вызов Google API напрямую."""
         model = genai.GenerativeModel(self.model)
         
@@ -527,20 +527,18 @@ class LLMClient:
                     "model": self.model,
                     "messages": self.history,
                     "temperature": 0.2,
-                    "max_tokens": 4000,
+                    "max_tokens": config.MAX_TOKENS,
                 }
                 
-                # Специфичный хак для Gemini 3 на OpenRouter
-                if "gemini-3" in self.model or "gemini-2" in self.model:
-                    # Пробуем разные варианты отключения тулов
-                    payload["tool_config"] = {"function_calling_config": {"mode": "NONE"}}
-                    payload["toolConfig"] = {"functionCallingConfig": {"mode": "NONE"}}
-                    # OpenAI standard
-                    payload["tool_choice"] = "none"
-                    # payload["tools"] = [] # Опасно без tool_choice, но с tool_choice может требоваться. Пока не рискуем.
-                    
-                    # Также попробуем добавить явный hint в сообщениях, если это не system
-                    # (но лучше не менять историю).
+                # Специфичный хак для Gemini на OpenRouter (если нужно отключить тулы)
+                # В стандартном OpenAI API это делается через tool_choice: "none"
+                # Но это работает только если есть список tools.
+                # Если же мы просто хотим убедиться, что Gemini не пытается использовать нативные тулы:
+                if "gemini" in self.model.lower():
+                    # Некоторые провайдеры OpenRouter могут требовать tool_choice: "none"
+                    # Но обычно лучше просто не посылать эти поля, если они не нужны.
+                    # Оставляем только то, что точно не сломает OpenAI-совместимый API.
+                    pass
                     
                 # Дополнительные поля, которые могут помочь
                 # payload["tools"] = [] # Опасно, может вызвать 400 если пустой список
@@ -561,6 +559,11 @@ class LLMClient:
                     timeout=120
                 )
                 
+                if resp.status_code >= 400:
+                    error_body = resp.text
+                    print(f"[GET_RESPONSE] ERROR {resp.status_code}: {error_body}")
+                    logger.error(f"LLM API Error {resp.status_code}: {error_body}")
+
                 if resp.status_code == 429:
                     print(f"[GET_RESPONSE] WARNING: Ошибка 429 (Too Many Requests). Жду 5 секунд...")
                     import time

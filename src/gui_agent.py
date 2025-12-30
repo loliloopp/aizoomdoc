@@ -18,6 +18,7 @@ from .llm_client import LLMClient
 from .image_processor import ImageProcessor
 from .markdown_parser import MarkdownParser
 from .file_processor import FileProcessor
+from .html_ocr_processor import HtmlOcrProcessor
 from .supabase_client import supabase_client
 from .s3_storage import s3_storage
 
@@ -115,7 +116,13 @@ class AgentWorker(QThread):
             try:
                 # В БД модель пока не сохраняем (нет поля в схеме), 
                 # но она есть в metadata чата (общая для чата)
-                asyncio.run(self._save_to_db(role, content, images, model=msg.get("model")))
+                db_role = role
+                if role == "system":
+                    db_role = "assistant"
+                    if not content.startswith("⚠️") and not content.startswith("SYSTEM ALERT:"):
+                         content = "SYSTEM ALERT: " + content
+
+                asyncio.run(self._save_to_db(db_role, content, images, model=msg.get("model")))
             except Exception as e:
                 logger.error(f"Ошибка сохранения в БД: {e}")
 
@@ -573,12 +580,17 @@ class AgentWorker(QThread):
                         except: pass
 
                     # Чтение текста
-                    text = md_path.read_text(encoding="utf-8")
-                    full_md_text += text + "\n\n"
+                    if md_path.suffix.lower() == '.html':
+                        llm_text, _ = HtmlOcrProcessor.process(md_path)
+                        full_md_text += llm_text + "\n\n"
+                    else:
+                        text = md_path.read_text(encoding="utf-8")
+                        full_md_text += text + "\n\n"
                     
                     # Парсинг блоков для RAG и поиска
-                    parser = MarkdownParser(md_path)
-                    all_blocks.extend(parser.parse())
+                    if md_path.suffix.lower() == '.md':
+                        parser = MarkdownParser(md_path)
+                        all_blocks.extend(parser.parse())
                 except Exception as e:
                     self.sig_log.emit(f"Ошибка файла {md_path_str}: {e}")
 
@@ -591,10 +603,12 @@ class AgentWorker(QThread):
             from .json_annotation_processor import JsonAnnotationProcessor
             doc_index = build_index(full_md_text)
             
-            # Добавляем изображения из JSON файлов в каталог
+            # Добавляем изображения из JSON и HTML файлов в каталог
             for md_path_str in files_to_process:
                 md_path = Path(md_path_str)
-                if md_path.suffix.lower() == '.json':
+                suffix = md_path.suffix.lower()
+                
+                if suffix == '.json':
                     try:
                         _, annotation = JsonAnnotationProcessor.process(md_path)
                         if annotation:
@@ -613,6 +627,25 @@ class AgentWorker(QThread):
                             self.sig_log.emit(f"Добавлено {len(annotation.image_blocks)} изображений из JSON в каталог")
                     except Exception as e:
                         logger.error(f"Ошибка добавления изображений из JSON {md_path}: {e}")
+                
+                elif suffix == '.html':
+                    try:
+                        _, document = HtmlOcrProcessor.process(md_path)
+                        if document:
+                            for img_block in document.image_blocks:
+                                entry = ImageCatalogEntry(
+                                    image_id=img_block.block_id,
+                                    page=img_block.page_number,
+                                    uri=img_block.crop_url or "",
+                                    content_summary=img_block.content_summary or "",
+                                    detailed_description=img_block.detailed_description or "",
+                                    clean_ocr_text=img_block.ocr_text or "",
+                                    key_entities=img_block.key_entities or []
+                                )
+                                doc_index.images[img_block.block_id] = entry
+                            self.sig_log.emit(f"Добавлено {len(document.image_blocks)} изображений из HTML в каталог")
+                    except Exception as e:
+                        logger.error(f"Ошибка добавления изображений из HTML {md_path}: {e}")
             
             tail_n = 12 # Начальный размер истории
             context = ""
@@ -662,7 +695,7 @@ class AgentWorker(QThread):
 
                 # Проверяем, влезает ли
                 temp_history = llm_client.history + [{"role": "user", "content": context}]
-                est = llm_client.build_context_report(temp_history, max_tokens=4000)
+                est = llm_client.build_context_report(temp_history, max_tokens=config.MAX_TOKENS)
                 
                 if not est.get("will_overflow"):
                     self.sig_log.emit(f"OK: Промпт ~{est.get('prompt_tokens_est')} токенов.")
@@ -707,7 +740,7 @@ class AgentWorker(QThread):
 
                 # Прогноз по контексту
                 try:
-                    est = llm_client.last_prompt_estimate or llm_client.build_context_report(llm_client.history, max_tokens=4000)
+                    est = llm_client.last_prompt_estimate or llm_client.build_context_report(llm_client.history, max_tokens=config.MAX_TOKENS)
                     if est and est.get("will_overflow"):
                         self.sig_log.emit("⚠️ Риск переполнения контекста на текущем шаге!")
                 except: pass

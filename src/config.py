@@ -26,8 +26,11 @@ class Config:
 
     DEFAULT_MODEL: str = os.getenv(
         "DEFAULT_MODEL", 
-        "gemini-1.5-flash"
+        "google/gemini-3-flash-preview"
     )
+
+    # Параметры генерации
+    MAX_TOKENS: int = int(os.getenv("MAX_TOKENS", "8192"))
     
     # Пути к данным
     DATA_ROOT: Path = Path(os.getenv("DATA_ROOT", "./data"))
