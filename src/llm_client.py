@@ -7,14 +7,20 @@ import json
 import logging
 import re
 from pathlib import Path
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 
 import requests
 import warnings
 
-# Подавление предупреждения о депрекации google.generativeai
-warnings.filterwarnings("ignore", category=FutureWarning, module="google.generativeai")
-import google.generativeai as genai
+try:
+    from google import genai as genai_new
+    from google.genai import types as genai_types
+except ImportError:
+    genai_new = None
+    genai_types = None
+
+# Конвертация для обратной совместимости имен
+genai = genai_new
 
 from .config import config
 from .models import ViewportCrop, ZoomRequest, ImageRequest, ImageSelection, DocumentRequest
@@ -272,11 +278,21 @@ class LLMClient:
         self.history: List[Dict[str, Any]] = [] 
         # Системный промт добавляется позже, в зависимости от режима
 
-        # Инициализация Google Gemini если нужно
+        # Инициализация Google SDK
+        self.google_client = None
         if config.GOOGLE_API_KEY:
-            genai.configure(api_key=config.GOOGLE_API_KEY)
+            if genai_new:
+                try:
+                    self.google_client = genai_new.Client(api_key=config.GOOGLE_API_KEY)
+                    logger.info("Инициализирован новый SDK Google GenAI")
+                except Exception as e:
+                    logger.warning(f"Ошибка инициализации нового SDK Google GenAI: {e}")
+            else:
+                logger.error("SDK google-genai не установлен, но GOOGLE_API_KEY задан.")
 
-        # Контроль контекста / usage
+        # Контроль контекста / кэширования
+        self.current_cache = None
+        self.thought_signatures: Dict[int, str] = {} # индекс в истории -> подпись
         self._context_length_cache: Dict[str, int] = {}
         self.last_usage: Optional[Dict[str, int]] = None
         self.last_usage_selection: Optional[Dict[str, int]] = None
@@ -288,53 +304,12 @@ class LLMClient:
         return self.model in ["gemini-1.5-flash", "gemini-1.5-pro"]
 
     def _call_google_direct(self, messages: List[Dict[str, Any]], temperature: float = 0.2, max_tokens: int = config.MAX_TOKENS, response_json: bool = False) -> str:
-        """Вызов Google API напрямую."""
-        model = genai.GenerativeModel(self.model)
-        
-        # Конвертация сообщений из OpenAI формата в формат Google
-        google_messages = []
-        system_instruction = None
-        
-        for msg in messages:
-            role = msg["role"]
-            content = msg["content"]
+        """Вызов Google API напрямую через новый SDK."""
+        if not self.google_client:
+            raise RuntimeError("Google GenAI SDK не инициализирован")
             
-            if role == "system":
-                system_instruction = content
-                continue
-            
-            parts = []
-            if isinstance(content, str):
-                parts.append(content)
-            elif isinstance(content, list):
-                for part in content:
-                    if part["type"] == "text":
-                        parts.append(part["text"])
-                    elif part["type"] == "image_url":
-                        # Извлекаем base64
-                        url = part["image_url"]["url"]
-                        if url.startswith("data:image"):
-                            b64_data = url.split(",")[1]
-                            image_data = base64.b64decode(b64_data)
-                            parts.append({"mime_type": "image/jpeg", "data": image_data})
-            
-            google_messages.append({
-                "role": "user" if role == "user" else "model",
-                "parts": parts
-            })
-        
-        # Если есть системная инструкция, пересоздаем модель с ней
-        if system_instruction:
-            model = genai.GenerativeModel(self.model, system_instruction=system_instruction)
-        
-        generation_config = genai.GenerationConfig(
-            temperature=temperature,
-            max_output_tokens=max_tokens,
-            response_mime_type="application/json" if response_json else "text/plain"
-        )
-        
-        response = model.generate_content(google_messages, generation_config=generation_config)
-        return response.text
+        text, _ = self._call_google_new_sdk(messages, temperature=temperature, max_tokens=max_tokens)
+        return text
 
     def get_model_context_length(self) -> Optional[int]:
         """
@@ -368,14 +343,15 @@ class LLMClient:
 
     def build_context_report(self, messages: List[Dict[str, Any]], max_tokens: int) -> Dict[str, Any]:
         """
-        Возвращает прогноз по текущему запросу:
-        - оценка prompt токенов
-        - лимит контекста (если удалось получить)
-        - сколько осталось / риск переполнения
+        Возвращает прогноз по текущему запросу.
         """
         est = estimate_prompt_tokens(messages)
         ctx = self.get_model_context_length()
 
+        # Если есть кэш, токены в сообщениях (если они там были) не считаются дважды,
+        # но мы упрощаем: если кэш есть, мы предполагаем что большие данные уже там.
+        prompt_est = est["prompt_tokens_est"]
+        
         report: Dict[str, Any] = {
             "model": self.model,
             "context_length": ctx,
@@ -384,12 +360,13 @@ class LLMClient:
             "will_overflow": None,
             "remaining_after_prompt": None,
             "remaining_after_max_completion": None,
+            "cached": self.current_cache is not None
         }
 
         if isinstance(ctx, int) and ctx > 0:
-            report["remaining_after_prompt"] = ctx - est["prompt_tokens_est"]
-            report["remaining_after_max_completion"] = ctx - (est["prompt_tokens_est"] + max_tokens)
-            report["will_overflow"] = (est["prompt_tokens_est"] + max_tokens) > ctx
+            report["remaining_after_prompt"] = ctx - prompt_est
+            report["remaining_after_max_completion"] = ctx - (prompt_est + max_tokens)
+            report["will_overflow"] = (prompt_est + max_tokens) > ctx
 
         return report
 
@@ -397,19 +374,81 @@ class LLMClient:
         with open(path, "rb") as f:
             return base64.b64encode(f.read()).decode("utf-8")
 
+    def set_document_context(self, text_context: str):
+        """
+        Создает контекстный кэш для документа, если используется новый SDK.
+        """
+        if not self.google_client or not genai_new or not genai_types:
+            return
+
+        if "gemini" not in self.model.lower():
+            return
+
+        try:
+            logger.info(f"Создание контекстного кэша для документа ({len(text_context)} симв.)")
+            base_model = self.model.split("/")[-1]
+            
+            # В новом SDK caches.create принимает model и config
+            self.current_cache = self.google_client.caches.create(
+                model=base_model,
+                config=genai_types.CreateCacheConfig(
+                    contents=[genai_types.Content(role="user", parts=[genai_types.Part.from_text(text_context)])],
+                    ttl_seconds=3600,
+                )
+            )
+            logger.info(f"Кэш создан: {self.current_cache.name}")
+        except Exception as e:
+            logger.error(f"Ошибка создания кэша: {e}")
+            self.current_cache = None
+
     def select_relevant_images(self, text_context: str, query: str) -> ImageSelection:
         """Спрашивает LLM, какие картинки нужны."""
         print(f"[SELECT_IMAGES] Начинаю выбор картинок для запроса: {query[:50]}")
-        print(f"[SELECT_IMAGES] Размер контекста: {len(text_context)} символов")
         
+        # Если кэша еще нет, пробуем создать его сейчас
+        if not self.current_cache:
+            self.set_document_context(text_context)
+
         # Загружаем промт из файла (или используем дефолтный)
         selection_prompt = load_selection_prompt(self.data_root)
         
-        # Передаем весь документ целиком, не обрезаем!
+        # Если есть кэш, отправляем только запрос. Если нет - весь документ.
+        user_content = f"ЗАПРОС: {query}"
+        if not self.current_cache:
+            user_content += f"\n\nДОКУМЕНТ:\n{text_context}"
+        
         messages = [
             {"role": "system", "content": selection_prompt},
-            {"role": "user", "content": f"ЗАПРОС: {query}\n\nДОКУМЕНТ:\n{text_context}"}
+            {"role": "user", "content": user_content}
         ]
+
+        # Если модель - Gemini и у нас есть новый SDK, используем его
+        if self.google_client and "gemini" in self.model.lower():
+            try:
+                base_model = self.model.split("/")[-1]
+                config_args = {
+                    "temperature": 0.1,
+                    "max_output_tokens": 800,
+                    "response_mime_type": "application/json",
+                    "system_instruction": selection_prompt
+                }
+                if self.current_cache:
+                    config_args["cached_content"] = self.current_cache.name
+
+                resp = self.google_client.models.generate_content(
+                    model=base_model,
+                    contents=[genai_types.Content(role="user", parts=[genai_types.Part.from_text(user_content)])],
+                    config=genai_types.GenerateContentConfig(**config_args)
+                )
+                
+                data = json.loads(resp.text)
+                return ImageSelection(
+                    reasoning=data.get("reasoning", ""),
+                    needs_images=data.get("needs_images", False),
+                    image_urls=data.get("image_urls", [])
+                )
+            except Exception as e:
+                logger.warning(f"Ошибка нового SDK при выборе картинок: {e}")
 
         # Прогноз (очень грубо)
         self.last_prompt_estimate_selection = self.build_context_report(messages, max_tokens=800)
@@ -512,12 +551,101 @@ class LLMClient:
 
         self.history.append({"role": "user", "content": content})
 
-    def add_assistant_message(self, text: str):
+    def add_assistant_message(self, text: str, thought_signature: Optional[str] = None):
+        idx = len(self.history)
         self.history.append({"role": "assistant", "content": text})
+        if thought_signature:
+            self.thought_signatures[idx] = thought_signature
+
+    def _call_google_new_sdk(self, messages: List[Dict[str, Any]], temperature: float = 0.2, max_tokens: int = config.MAX_TOKENS) -> Tuple[str, Optional[str]]:
+        """Вызов Google API через новый SDK с поддержкой кэша и подписей."""
+        if not self.google_client or not genai_new:
+            raise RuntimeError("Google GenAI SDK не инициализирован")
+
+        base_model = self.model.split("/")[-1]
+        
+        # Конвертируем историю в формат нового SDK
+        contents = []
+        system_instruction = None
+        
+        for i, msg in enumerate(messages):
+            if msg["role"] == "system":
+                system_instruction = msg["content"]
+                continue
+                
+            role = "user" if msg["role"] == "user" else "model"
+            parts = []
+            content = msg["content"]
+            
+            if isinstance(content, str):
+                parts.append(genai_types.Part.from_text(content))
+            elif isinstance(content, list):
+                for p in content:
+                    if p["type"] == "text":
+                        parts.append(genai_types.Part.from_text(p["text"]))
+                    elif p["type"] == "image_url":
+                        url = p["image_url"]["url"]
+                        if url.startswith("data:image"):
+                            b64_data = url.split(",")[1]
+                            image_data = base64.b64decode(b64_data)
+                            parts.append(genai_types.Part.from_bytes(data=image_data, mime_type="image/jpeg"))
+                        else:
+                            # Прямые URL (например S3) - GenAI SDK может не поддерживать напрямую через Part
+                            # В таком случае лучше загрузить и передать как bytes или использовать Google Cloud Storage если есть.
+                            # Но для простоты попробуем скачать если это не base64.
+                            try:
+                                r = requests.get(url, timeout=10)
+                                if r.status_code == 200:
+                                    parts.append(genai_types.Part.from_bytes(data=r.content, mime_type="image/jpeg"))
+                            except Exception as e:
+                                logger.warning(f"Не удалось скачать картинку для GenAI SDK: {e}")
+            
+            content_obj = genai_types.Content(role=role, parts=parts)
+            # Передаем thought_signature если она была сохранена для этого сообщения
+            if role == "model" and i in self.thought_signatures:
+                content_obj.thought_signature = self.thought_signatures[i]
+                
+            contents.append(content_obj)
+
+        config_args = {
+            "temperature": temperature,
+            "max_output_tokens": max_tokens,
+            "system_instruction": system_instruction
+        }
+        
+        # Включаем Deep Think (thinking) если модель поддерживает
+        if "thinking" in self.model.lower():
+            config_args["thinking_config"] = {"include_thoughts": True}
+            
+        if self.current_cache:
+            config_args["cached_content"] = self.current_cache.name
+
+        response = self.google_client.models.generate_content(
+            model=base_model,
+            contents=contents,
+            config=genai_types.GenerateContentConfig(**config_args)
+        )
+        
+        text = response.text
+        signature = None
+        if response.candidates and hasattr(response.candidates[0], "thought_signature"):
+            signature = response.candidates[0].thought_signature
+            
+        return text, signature
 
     def get_response(self) -> str:
         print(f"[GET_RESPONSE] Отправляю запрос к модели {self.model}")
         
+        # Если модель - Gemini и у нас есть новый SDK, используем его для кэша и подписей
+        if self.google_client and "gemini" in self.model.lower():
+            try:
+                text, signature = self._call_google_new_sdk(self.history)
+                print(f"[GET_RESPONSE] OK (GenAI SDK): Получен ответ длиной {len(text)} символов")
+                self.add_assistant_message(text, thought_signature=signature)
+                return text
+            except Exception as e:
+                logger.warning(f"Ошибка нового SDK, пробую OpenAI-compatible fallback: {e}")
+
         # Попытки повтора (Retries)
         max_retries = 3
         for attempt in range(max_retries):

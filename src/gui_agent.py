@@ -668,11 +668,20 @@ class AgentWorker(QThread):
 
                 if self.md_mode == "full_md":
                     self.sig_log.emit(f"Режим: Полный MD (history_n={tail_n})...")
+                    
+                    doc_text = strip_json_blocks(full_md_text)
+                    # Кэшируем документ для Gemini если еще не кэширован
+                    if not llm_client.current_cache:
+                        llm_client.set_document_context(doc_text)
+                    
                     img_entries = sorted(doc_index.images.values(), key=lambda e: ((e.page or 0), e.image_id))
                     catalog_text = "\n".join([f"- {e.image_id} (стр. {e.page}): {e.content_summary[:150]}" for e in img_entries])
                     
+                    # Если кэш активен, не шлем текст документа повторно в сообщениях
+                    doc_prefix = "" if llm_client.current_cache else f"ПОЛНЫЙ ТЕКСТ ДОКУМЕНТА:\n{doc_text}\n\n"
+                    
                     context = (
-                        f"ПОЛНЫЙ ТЕКСТ ДОКУМЕНТА:\n{strip_json_blocks(full_md_text)}\n\n"
+                        f"{doc_prefix}"
                         f"КАТАЛОГ ИЗОБРАЖЕНИЙ:\n{catalog_text}\n\n"
                         f"ЗАПРОС ПОЛЬЗОВАТЕЛЯ:\n{self.query}\n\n"
                         f"Используй tool=request_images и tool=zoom для работы с графикой."
