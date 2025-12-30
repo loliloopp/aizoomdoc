@@ -811,6 +811,9 @@ class AgentWorker(QThread):
                 except Exception:
                     pass
                 
+                # Флаг, указывающий, что был выполнен какой-то инструмент (images, zoom) и нужно продолжать цикл
+                tools_executed = False
+
                 # 0) Обрабатываем запросы документации (просто уведомляем пользователя)
                 doc_reqs = llm_client.parse_document_requests(response)
                 if doc_reqs:
@@ -903,17 +906,18 @@ class AgentWorker(QThread):
                         # Так как мы отправляем только ссылки, можем передать все изображения без ограничений
                         self.save_message("assistant", msg_text, images=downloaded_imgs)
                         llm_client.add_user_message(msg_text, images=downloaded_imgs)
-                        # Продолжаем цикл — модель увидит картинки и сможет запросить zoom/сделать выводы
-                        continue
+                        
+                        tools_executed = True
                     else:
                         # Нечего показывать модели — продолжаем, чтобы она могла переформулировать запрос
                         llm_client.add_user_message("Не удалось загрузить запрошенные изображения. Попробуй указать другие image_ids из каталога.")
-                        continue
+                        tools_executed = True
 
                 zoom_reqs = llm_client.parse_zoom_request(response)
                 print(f"[GUI_AGENT] Zoom запросов: {len(zoom_reqs)}")
                 
                 if zoom_reqs:
+                    tools_executed = True
                     self._append_app_log(f"LLM Tool Call: Zoom ({len(zoom_reqs)} requests)")
                     
                     # Логирование деталей зума для отладки
@@ -1105,7 +1109,8 @@ class AgentWorker(QThread):
                         self.sig_log.emit("Ошибка Zoom: не удалось получить фрагменты.")
                         self._append_app_log("Ошибка Zoom: не удалось получить фрагменты.")
                         self.save_message("assistant", "⚠️ Ошибка Zoom: не удалось получить фрагменты.")
-                else:
+                
+                if not tools_executed:
                     self._append_app_log("Финальный ответ получен.")
                     # Ответ уже сохранен в начале цикла
                     

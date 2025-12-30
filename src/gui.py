@@ -17,7 +17,7 @@ from PyQt6.QtWidgets import (
     QGroupBox, QSizePolicy, QTreeView, QButtonGroup, QInputDialog,
     QHeaderView, QTabWidget
 )
-from PyQt6.QtCore import Qt, QUrl, QSize
+from PyQt6.QtCore import Qt, QUrl, QSize, QTimer
 from PyQt6.QtGui import (
     QFont, QPixmap, QAction, QDragEnterEvent, QDropEvent, 
     QTextCursor, QKeyEvent, QFileSystemModel, QStandardItemModel, QStandardItem
@@ -1392,17 +1392,29 @@ class MainWindow(QMainWindow):
         self.lbl_used.setText(f"Использовано: {used:,}".replace(",", " "))
         self.lbl_remaining.setText(f"Осталось: {remaining:,}".replace(",", " "))
 
+    def scroll_to_bottom(self):
+        """Прокручивает чат к последнему сообщению."""
+        # Обновляем макет перед прокруткой, чтобы убедиться, что размеры правильные
+        self.chat_container.adjustSize()
+        QApplication.processEvents()
+        scrollbar = self.scroll_area.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+
     def add_chat_message(self, role, text, model=None):
         w = ChatMessageWidget(role, text, is_dark_theme=self.is_dark_theme, model=model)
         self.chat_layout.insertWidget(self.chat_layout.count()-1, w)
         QApplication.processEvents()
-        self.scroll_area.verticalScrollBar().setValue(self.scroll_area.verticalScrollBar().maximum())
+        if role == "user":
+            # Для сообщений пользователя увеличиваем задержку
+            QTimer.singleShot(150, self.scroll_to_bottom)
+        else:
+            QTimer.singleShot(100, self.scroll_to_bottom)
 
     def add_chat_image(self, path, desc):
         w = ImageMessageWidget(path, desc, is_dark_theme=self.is_dark_theme)
         self.chat_layout.insertWidget(self.chat_layout.count()-1, w)
         QApplication.processEvents()
-        self.scroll_area.verticalScrollBar().setValue(self.scroll_area.verticalScrollBar().maximum())
+        QTimer.singleShot(100, self.scroll_to_bottom)
 
     def new_chat(self):
         while self.chat_layout.count() > 1:
@@ -1633,13 +1645,20 @@ class MainWindow(QMainWindow):
             self.new_chat()
             
         self.add_chat_message("user", query)
+        
+        # Сначала обновляем интерфейс
         self.txt_input.clear()
+        QApplication.processEvents()
+        
         self.txt_input.setEnabled(False)
         self.btn_send.setEnabled(False)
         self.btn_send.setVisible(False)  # Скрываем кнопку отправки
         self.btn_stop.setVisible(True)   # Показываем кнопку остановки
         self.btn_attach.setEnabled(False)
         self.progress.setVisible(True)
+        
+        # Даем время интерфейсу перерисоваться
+        QApplication.processEvents()
         
         mid = self.combo_models.currentData()
         md_mode = self.combo_md_mode.currentData()
@@ -1663,6 +1682,9 @@ class MainWindow(QMainWindow):
         self.current_worker.sig_history_saved.connect(self.on_history_saved)
         self.current_worker.sig_usage.connect(self.update_usage)
         self.current_worker.start()
+
+        # Прокручиваем к низу после всех изменений интерфейса
+        QTimer.singleShot(150, self.scroll_to_bottom)
     
     def stop_agent(self):
         """Останавливает текущий воркер."""
