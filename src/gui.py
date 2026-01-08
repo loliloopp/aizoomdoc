@@ -907,7 +907,7 @@ class MainWindow(QMainWindow):
         self.btn_tab_chats.clicked.connect(lambda: self.switch_left_tab("chats"))
         self.btn_tab_chats.setFixedSize(80, 34)
 
-        self.btn_tab_folders = QPushButton("Папки")
+        self.btn_tab_folders = QPushButton("Дерево")
         self.btn_tab_folders.setCheckable(True)
         self.btn_tab_folders.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_tab_folders.clicked.connect(lambda: self.switch_left_tab("folders"))
@@ -924,6 +924,23 @@ class MainWindow(QMainWindow):
         top_bar_layout.addWidget(tabs_container)
         
         top_bar_layout.addStretch()
+        
+        # Селектор модели
+        self.combo_models = QComboBox()
+        for name, mid in MODELS.items():
+            self.combo_models.addItem(name, mid)
+        self.combo_models.setCurrentIndex(0)
+        self.combo_models.setFixedWidth(260)
+        self.combo_models.setFixedHeight(34)
+        self.combo_models.setToolTip("Выбор модели для генерации")
+        top_bar_layout.addWidget(self.combo_models)
+        
+        # Счетчик токенов (компактный)
+        self.lbl_tokens = QLabel("0 / 0")
+        self.lbl_tokens.setFixedHeight(34)
+        self.lbl_tokens.setToolTip("Использовано / Осталось токенов")
+        self.lbl_tokens.setStyleSheet("padding: 0 8px; font-size: 11px;")
+        top_bar_layout.addWidget(self.lbl_tokens)
         
         # Переключатель режима MD (RAG / Full MD)
         self.combo_md_mode = QComboBox()
@@ -1159,51 +1176,10 @@ class MainWindow(QMainWindow):
         right_layout.setSpacing(16)
         right_layout.setContentsMargins(20, 20, 20, 20)
         
-        # Выбор модели
-        self.model_label = QLabel("Модель")
-        right_layout.addWidget(self.model_label)
-        
-        self.combo_models = QComboBox()
-        for name, mid in MODELS.items():
-            self.combo_models.addItem(name, mid)
-        # Устанавливаем Gemini 3 Flash по умолчанию (индекс 0)
-        self.combo_models.setCurrentIndex(0)
-        right_layout.addWidget(self.combo_models)
-        
-        right_layout.addSpacing(8)
-        
         # Путь к данным
         self.lbl_data_root = QLabel(f"📁 {self.data_root}")
         self.lbl_data_root.setWordWrap(True)
         right_layout.addWidget(self.lbl_data_root)
-        
-        # Счетчик использования
-        self.usage_frame = QFrame()
-        self.usage_frame.setStyleSheet("""
-            QFrame {
-                background-color: #f3f4f6;
-                border: 1px solid #e5e7eb;
-                border-radius: 8px;
-                padding: 4px;
-            }
-            QLabel {
-                font-size: 11px;
-                color: #4b5563;
-                border: none;
-                background: transparent;
-            }
-        """)
-        usage_layout = QHBoxLayout(self.usage_frame)
-        usage_layout.setContentsMargins(8, 4, 8, 4)
-        
-        self.lbl_used = QLabel("Использовано: 0")
-        self.lbl_remaining = QLabel("Осталось: 0")
-        
-        usage_layout.addWidget(self.lbl_used)
-        usage_layout.addStretch()
-        usage_layout.addWidget(self.lbl_remaining)
-        
-        right_layout.addWidget(self.usage_frame)
         
         # Логи
         self.logs_label = QLabel("Логи выполнения")
@@ -1416,8 +1392,8 @@ class MainWindow(QMainWindow):
 
     def update_usage(self, used, remaining):
         """Обновляет счетчик использованного и оставшегося контента."""
-        self.lbl_used.setText(f"Использовано: {used:,}".replace(",", " "))
-        self.lbl_remaining.setText(f"Осталось: {remaining:,}".replace(",", " "))
+        # Компактный формат для верхней панели
+        self.lbl_tokens.setText(f"{used:,} / {remaining:,}".replace(",", " "))
 
     def scroll_to_bottom(self):
         """Прокручивает чат к последнему сообщению."""
@@ -2662,12 +2638,6 @@ class MainWindow(QMainWindow):
                 }
             """)
             
-            self.model_label.setStyleSheet("""
-                color: #ececec;
-                font-size: 13px;
-                font-weight: 600;
-            """)
-            
             self.combo_models.setStyleSheet("""
                 QComboBox {
                     background-color: #3d3d3d;
@@ -2698,6 +2668,17 @@ class MainWindow(QMainWindow):
                 QComboBox::item:selected {
                     background-color: #4d4d4f;
                     color: #ececec;
+                }
+            """)
+            
+            self.lbl_tokens.setStyleSheet("""
+                QLabel {
+                    background-color: #3d3d3d;
+                    border: 1px solid #4d4d4f;
+                    border-radius: 8px;
+                    padding: 0 12px;
+                    color: #ececec;
+                    font-size: 11px;
                 }
             """)
 
@@ -3076,12 +3057,6 @@ class MainWindow(QMainWindow):
                 }
             """)
             
-            self.model_label.setStyleSheet("""
-                color: #2d333a;
-                font-size: 13px;
-                font-weight: 600;
-            """)
-            
             self.combo_models.setStyleSheet("""
                 QComboBox {
                     background-color: white;
@@ -3112,6 +3087,17 @@ class MainWindow(QMainWindow):
                 QComboBox::item:selected {
                     background-color: #f3f4f6;
                     color: #2d333a;
+                }
+            """)
+            
+            self.lbl_tokens.setStyleSheet("""
+                QLabel {
+                    background-color: white;
+                    border: 1px solid #d1d5db;
+                    border-radius: 8px;
+                    padding: 0 12px;
+                    color: #2d333a;
+                    font-size: 11px;
                 }
             """)
 
