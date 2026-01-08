@@ -87,6 +87,9 @@ class Config:
     S3_DEV_URL: str = os.getenv("S3_DEV_URL", "")
     USE_S3_DEV_URL: bool = os.getenv("USE_S3_DEV_URL", "false").lower() == "true"
     
+    # URL для разработки (dev) бакета с файлами дерева проектов
+    S3_PROJECTS_DEV_URL: str = os.getenv("S3_PROJECTS_DEV_URL", "")
+    
     # Включить хранение в S3/R2
     USE_S3_STORAGE: bool = os.getenv("USE_S3_STORAGE", "true").lower() == "true"
     

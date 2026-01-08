@@ -6,9 +6,12 @@ import sys
 import os
 import json
 import shutil
+import logging
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Any
+
+logger = logging.getLogger(__name__)
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -1169,27 +1172,33 @@ class MainWindow(QMainWindow):
         input_container_layout.addLayout(input_center_layout)
         center_layout.addWidget(self.input_container)
         
-        # ПРАВАЯ ПАНЕЛЬ (стиль ChatGPT)
+        # ПРАВАЯ ПАНЕЛЬ - Просмотр файлов
         self.right_panel = QFrame()
-        self.right_panel.setFixedWidth(320)
+        self.right_panel.setFixedWidth(600)
         right_layout = QVBoxLayout(self.right_panel)
-        right_layout.setSpacing(16)
-        right_layout.setContentsMargins(20, 20, 20, 20)
+        right_layout.setSpacing(8)
+        right_layout.setContentsMargins(8, 8, 8, 8)
         
-        # Путь к данным
-        self.lbl_data_root = QLabel(f"📁 {self.data_root}")
-        self.lbl_data_root.setWordWrap(True)
-        right_layout.addWidget(self.lbl_data_root)
+        # Заголовок и кнопки управления
+        viewer_header = QHBoxLayout()
+        self.viewer_label = QLabel("Просмотр документа")
+        self.viewer_label.setStyleSheet("font-weight: bold; font-size: 13px;")
+        viewer_header.addWidget(self.viewer_label)
+        viewer_header.addStretch()
         
-        # Логи
-        self.logs_label = QLabel("Логи выполнения")
-        right_layout.addWidget(self.logs_label)
+        self.btn_close_viewer = QPushButton("✕")
+        self.btn_close_viewer.setFixedSize(24, 24)
+        self.btn_close_viewer.setToolTip("Закрыть просмотр")
+        self.btn_close_viewer.clicked.connect(self.close_viewer)
+        viewer_header.addWidget(self.btn_close_viewer)
+        right_layout.addLayout(viewer_header)
         
-        self.log_view = QTextEdit()
-        self.log_view.setReadOnly(True)
-        right_layout.addWidget(self.log_view)
+        # Просмотрщик файлов (используем QTextEdit для простоты)
+        self.file_viewer = QTextEdit()
+        self.file_viewer.setReadOnly(True)
+        right_layout.addWidget(self.file_viewer)
         
-        # Прогресс бар
+        # Прогресс бар (оставляем для загрузки)
         self.progress = QProgressBar()
         self.progress.setVisible(False)
         self.progress.setRange(0, 0)
@@ -1388,7 +1397,9 @@ class MainWindow(QMainWindow):
                 self.log(f"Удален файл: {Path(removed_file).name}")
 
     def log(self, text):
-        self.log_view.append(f"{datetime.now().strftime('%H:%M:%S')} {text}")
+        """Логирование в консоль (логи удалены из GUI)."""
+        logger.info(text)
+
 
     def update_usage(self, used, remaining):
         """Обновляет счетчик использованного и оставшегося контента."""
@@ -2130,11 +2141,52 @@ class MainWindow(QMainWindow):
         
         if item_type == 'document':
             node_data = item.data(Qt.ItemDataRole.UserRole + 2)
-            self.attach_document_to_current_chat(node_data)
+            # Открываем PDF в просмотрщике
+            attributes = node_data.get('attributes', {})
+            if attributes.get('r2_key'):
+                self.open_document_in_viewer(node_data)
             
         elif item_type == 'pdf_result':
             file_data = item.data(Qt.ItemDataRole.UserRole + 2)
             self.open_result_file(file_data)
+    
+    def open_document_in_viewer(self, node_data: Dict):
+        """Открывает PDF документ в просмотрщике."""
+        attributes = node_data.get('attributes', {})
+        r2_key = attributes.get('r2_key')
+        file_name = attributes.get('original_name', node_data.get('name', 'document.pdf'))
+        
+        if not r2_key:
+            self.log("❌ Невозможно открыть документ")
+            return
+        
+        try:
+            import tempfile
+            temp_dir = Path(tempfile.gettempdir()) / "aizoomdoc"
+            temp_dir.mkdir(exist_ok=True)
+            
+            temp_file = temp_dir / file_name
+            
+            self.log(f"⬇️ Загрузка документа {file_name}...")
+            self.viewer_label.setText(f"⏳ Загрузка: {file_name}")
+            
+            # Если ключ начинается с tree_docs/, используем projects bucket
+            if r2_key.startswith('tree_docs/'):
+                success = self.run_async(s3_storage.download_file_from_projects_bucket(r2_key, str(temp_file)))
+            else:
+                success = self.run_async(s3_storage.download_file(r2_key, str(temp_file)))
+            
+            if success:
+                self.display_file_in_viewer(temp_file, file_name, 'pdf')
+                self.log(f"✅ Открыт документ: {file_name}")
+            else:
+                self.log("❌ Ошибка загрузки документа")
+                self.viewer_label.setText("Просмотр документа")
+                
+        except Exception as e:
+            self.log(f"❌ Ошибка открытия документа: {e}")
+            self.viewer_label.setText("Просмотр документа")
+
 
     def attach_document_to_current_chat(self, node_data: Dict):
         """Прикрепляет PDF документ из tree_nodes к текущему чату."""
@@ -2190,9 +2242,10 @@ class MainWindow(QMainWindow):
                 self.log(f"✅ Прикреплен результат: {file_name}")
 
     def open_result_file(self, file_data: Dict):
-        """Открывает файл результата в системном просмотрщике."""
+        """Открывает файл результата во встроенном просмотрщике."""
         r2_key = file_data.get('r2_key')
         file_name = file_data.get('file_name', 'result')
+        file_type = file_data.get('file_type', '')
         
         if not r2_key or not s3_storage.is_connected():
             self.log("❌ Невозможно открыть файл")
@@ -2207,26 +2260,58 @@ class MainWindow(QMainWindow):
             temp_file = temp_dir / file_name
             
             self.log(f"⬇️ Загрузка файла {file_name}...")
+            self.viewer_label.setText(f"⏳ Загрузка: {file_name}")
             success = self.run_async(s3_storage.download_file(r2_key, str(temp_file)))
             
             if success:
-                # Открываем в системном просмотрщике
-                import subprocess
-                import platform
-                
-                if platform.system() == 'Windows':
-                    os.startfile(temp_file)
-                elif platform.system() == 'Darwin':  # macOS
-                    subprocess.run(['open', temp_file])
-                else:  # Linux
-                    subprocess.run(['xdg-open', temp_file])
-                
+                self.display_file_in_viewer(temp_file, file_name, file_type)
                 self.log(f"✅ Открыт файл: {file_name}")
             else:
                 self.log("❌ Ошибка загрузки файла")
+                self.viewer_label.setText("Просмотр документа")
                 
         except Exception as e:
             self.log(f"❌ Ошибка открытия файла: {e}")
+            self.viewer_label.setText("Просмотр документа")
+    
+    def display_file_in_viewer(self, file_path: Path, file_name: str, file_type: str):
+        """Отображает файл в просмотрщике."""
+        try:
+            if file_type in ['ocr_html', 'result_html'] or file_name.endswith('.html'):
+                # HTML файлы
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    html_content = f.read()
+                self.file_viewer.setHtml(html_content)
+                self.viewer_label.setText(f"📄 {file_name}")
+                
+            elif file_type in ['result_json', 'result_md'] or file_name.endswith(('.json', '.md', '.txt')):
+                # Текстовые файлы
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    text_content = f.read()
+                self.file_viewer.setPlainText(text_content)
+                self.viewer_label.setText(f"📄 {file_name}")
+                
+            elif file_name.endswith('.pdf'):
+                # PDF - показываем заглушку
+                self.file_viewer.setPlainText(
+                    f"PDF файл: {file_name}\n\n"
+                    f"Для просмотра PDF используйте системный просмотрщик.\n"
+                    f"Путь к файлу:\n{file_path}"
+                )
+                self.viewer_label.setText(f"📑 {file_name}")
+            else:
+                self.file_viewer.setPlainText(f"Неподдерживаемый тип файла: {file_name}")
+                self.viewer_label.setText(f"❓ {file_name}")
+                
+        except Exception as e:
+            self.file_viewer.setPlainText(f"Ошибка отображения файла:\n{e}")
+            self.viewer_label.setText("❌ Ошибка")
+    
+    def close_viewer(self):
+        """Очищает просмотрщик."""
+        self.file_viewer.clear()
+        self.viewer_label.setText("Просмотр документа")
+
 
     def show_document_info(self, node_data: Dict):
         """Показывает информацию о документе в диалоге."""
@@ -2716,22 +2801,8 @@ class MainWindow(QMainWindow):
             self.combo_md_mode.setStyleSheet(md_combo_style_dark)
             self.combo_user_prompts.setStyleSheet(md_combo_style_dark)
             
-            self.lbl_data_root.setStyleSheet("""
-                color: #8e8ea0;
-                font-size: 11px;
-                padding: 8px;
-                background-color: #2d2d2d;
-                border-radius: 6px;
-            """)
-            
-            self.logs_label.setStyleSheet("""
-                color: #ececec;
-                font-size: 13px;
-                font-weight: 600;
-                margin-top: 8px;
-            """)
-            
-            self.log_view.setStyleSheet("""
+            # Просмотрщик файлов (темная тема)
+            self.file_viewer.setStyleSheet("""
                 QTextEdit {
                     font-family: 'Consolas', 'Monaco', monospace;
                     font-size: 11px;
@@ -2740,6 +2811,20 @@ class MainWindow(QMainWindow):
                     border: 1px solid #2d2d2d;
                     border-radius: 8px;
                     padding: 12px;
+                }
+            """)
+            
+            # Кнопка закрытия просмотра
+            self.btn_close_viewer.setStyleSheet("""
+                QPushButton {
+                    background-color: #2d2d2d;
+                    color: #ffffff;
+                    border: none;
+                    border-radius: 4px;
+                    font-size: 14px;
+                }
+                QPushButton:hover {
+                    background-color: #ff4444;
                 }
             """)
             
@@ -3135,30 +3220,31 @@ class MainWindow(QMainWindow):
             self.combo_md_mode.setStyleSheet(md_combo_style_light)
             self.combo_user_prompts.setStyleSheet(md_combo_style_light)
             
-            self.lbl_data_root.setStyleSheet("""
-                color: #6e6e80;
-                font-size: 11px;
-                padding: 8px;
-                background-color: #ececf1;
-                border-radius: 6px;
-            """)
-            
-            self.logs_label.setStyleSheet("""
-                color: #2d333a;
-                font-size: 13px;
-                font-weight: 600;
-                margin-top: 8px;
-            """)
-            
-            self.log_view.setStyleSheet("""
+            # Просмотрщик файлов (светлая тема)
+            self.file_viewer.setStyleSheet("""
                 QTextEdit {
                     font-family: 'Consolas', 'Monaco', monospace;
                     font-size: 11px;
-                    background-color: #1e1e1e;
-                    color: #d4d4d4;
-                    border: 1px solid #2d2d2d;
+                    background-color: #ffffff;
+                    color: #2d333a;
+                    border: 1px solid #d1d5db;
                     border-radius: 8px;
                     padding: 12px;
+                }
+            """)
+            
+            # Кнопка закрытия просмотра
+            self.btn_close_viewer.setStyleSheet("""
+                QPushButton {
+                    background-color: #ececf1;
+                    color: #2d333a;
+                    border: none;
+                    border-radius: 4px;
+                    font-size: 14px;
+                }
+                QPushButton:hover {
+                    background-color: #ff4444;
+                    color: #ffffff;
                 }
             """)
             

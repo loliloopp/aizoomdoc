@@ -216,6 +216,52 @@ class S3Storage:
             logger.error(f"❌ Ошибка скачивания файла {s3_key}: {e}")
             return False
     
+    async def download_file_from_projects_bucket(
+        self,
+        s3_key: str,
+        local_path: str
+    ) -> bool:
+        """
+        Скачать файл из бакета проектов (projects bucket).
+        Использует S3_PROJECTS_DEV_URL для доступа к файлам.
+        
+        Args:
+            s3_key: Ключ (путь) в S3
+            local_path: Локальный путь для сохранения
+        
+        Returns:
+            True если успешно, False иначе
+        """
+        if not config.S3_PROJECTS_DEV_URL:
+            logger.error("S3_PROJECTS_DEV_URL не настроен")
+            return False
+        
+        try:
+            import requests
+            # Создать директорию если не существует
+            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+            
+            # Формируем полный URL
+            file_url = f"{config.S3_PROJECTS_DEV_URL.rstrip('/')}/{s3_key}"
+            
+            logger.info(f"📥 Скачивание из projects bucket: {file_url}")
+            
+            # Скачиваем через HTTP
+            response = requests.get(file_url, timeout=60, stream=True)
+            response.raise_for_status()
+            
+            # Сохраняем файл
+            with open(local_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            
+            logger.info(f"✅ Файл скачан из projects bucket: {s3_key} -> {local_path}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка скачивания файла из projects bucket {s3_key}: {e}")
+            return False
+    
     # ===== URL Operations =====
     
     def get_signed_url(
