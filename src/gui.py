@@ -19,12 +19,13 @@ from PyQt6.QtWidgets import (
     QListWidget, QListWidgetItem, QFrame, QScrollArea, QProgressBar,
     QFileDialog, QMenuBar, QMenu, QDialog, QDialogButtonBox, QMessageBox,
     QGroupBox, QSizePolicy, QTreeView, QButtonGroup, QInputDialog,
-    QHeaderView, QTabWidget
+    QHeaderView, QTabWidget, QTextBrowser
 )
 from PyQt6.QtCore import Qt, QUrl, QSize, QTimer
 from PyQt6.QtGui import (
     QFont, QPixmap, QAction, QDragEnterEvent, QDropEvent, 
-    QTextCursor, QKeyEvent, QFileSystemModel, QStandardItemModel, QStandardItem
+    QTextCursor, QKeyEvent, QFileSystemModel, QStandardItemModel, QStandardItem,
+    QImage
 )
 
 from .config import config
@@ -33,6 +34,7 @@ from .supabase_client import supabase_client, supabase_projects_client
 from .s3_storage import s3_storage
 from .utils import transliterate
 import asyncio
+import fitz  # PyMuPDF для рендеринга PDF
 
 MODELS = {
     "Gemini 3 Flash (openrouter)": "google/gemini-3-flash-preview",
@@ -877,6 +879,12 @@ class MainWindow(QMainWindow):
         self.current_chat_id = None
         self.current_db_chat_id = None
         
+        # PDF viewer state
+        self.current_pdf_doc = None
+        self.current_pdf_path = None
+        self.current_pdf_page = 0
+        self.current_pdf_zoom = 1.0
+        
         # Меню
         self.menubar = self.menuBar()
         settings_menu = self.menubar.addMenu("Настройки")
@@ -1193,9 +1201,11 @@ class MainWindow(QMainWindow):
         viewer_header.addWidget(self.btn_close_viewer)
         right_layout.addLayout(viewer_header)
         
-        # Просмотрщик файлов (используем QTextEdit для простоты)
-        self.file_viewer = QTextEdit()
+        # Просмотрщик файлов (QTextBrowser для поддержки HTML и навигации)
+        self.file_viewer = QTextBrowser()
         self.file_viewer.setReadOnly(True)
+        self.file_viewer.setOpenLinks(False)  # Обрабатываем клики сами
+        self.file_viewer.anchorClicked.connect(self.on_pdf_navigation)  # Подключаем обработчик навигации
         right_layout.addWidget(self.file_viewer)
         
         # Прогресс бар (оставляем для загрузки)
@@ -2292,13 +2302,8 @@ class MainWindow(QMainWindow):
                 self.viewer_label.setText(f"📄 {file_name}")
                 
             elif file_name.endswith('.pdf'):
-                # PDF - показываем заглушку
-                self.file_viewer.setPlainText(
-                    f"PDF файл: {file_name}\n\n"
-                    f"Для просмотра PDF используйте системный просмотрщик.\n"
-                    f"Путь к файлу:\n{file_path}"
-                )
-                self.viewer_label.setText(f"📑 {file_name}")
+                # PDF - рендерим и показываем в вьювере
+                self.display_pdf_in_viewer(file_path, file_name)
             else:
                 self.file_viewer.setPlainText(f"Неподдерживаемый тип файла: {file_name}")
                 self.viewer_label.setText(f"❓ {file_name}")
@@ -2307,8 +2312,169 @@ class MainWindow(QMainWindow):
             self.file_viewer.setPlainText(f"Ошибка отображения файла:\n{e}")
             self.viewer_label.setText("❌ Ошибка")
     
+    def display_pdf_in_viewer(self, file_path: Path, file_name: str):
+        """Отображает PDF в просмотрщике с навигацией и зумом."""
+        try:
+            self.current_pdf_path = file_path
+            self.current_pdf_doc = fitz.open(str(file_path))
+            self.current_pdf_page = 0
+            self.current_pdf_zoom = 1.0
+            
+            # Создаем HTML с PDF страницей и панелью управления
+            self.render_pdf_page()
+            
+        except Exception as e:
+            self.file_viewer.setPlainText(f"Ошибка открытия PDF:\n{e}")
+            self.viewer_label.setText("❌ Ошибка PDF")
+    
+    def render_pdf_page(self):
+        """Рендерит текущую страницу PDF."""
+        try:
+            if not hasattr(self, 'current_pdf_doc') or self.current_pdf_doc is None:
+                return
+            
+            page = self.current_pdf_doc[self.current_pdf_page]
+            
+            # Рендерим страницу с учетом зума
+            mat = fitz.Matrix(self.current_pdf_zoom * 2, self.current_pdf_zoom * 2)  # *2 для лучшего качества
+            pix = page.get_pixmap(matrix=mat)
+            
+            # Конвертируем в QImage
+            img_data = pix.samples
+            qimg = QImage(img_data, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888)
+            
+            # Сохраняем во временный файл
+            import tempfile
+            temp_img = Path(tempfile.gettempdir()) / "aizoomdoc_pdf_preview.png"
+            qimg.save(str(temp_img))
+            
+            # Создаем HTML с изображением и кнопками навигации
+            page_num = self.current_pdf_page + 1
+            total_pages = len(self.current_pdf_doc)
+            zoom_percent = int(self.current_pdf_zoom * 100)
+            
+            html = f"""
+            <html>
+            <head>
+                <style>
+                    body {{
+                        margin: 0;
+                        padding: 10px;
+                        background: #2b2b2b;
+                        color: #fff;
+                        font-family: Arial;
+                    }}
+                    .controls {{
+                        position: sticky;
+                        top: 0;
+                        background: #1e1e1e;
+                        padding: 10px;
+                        border-radius: 5px;
+                        margin-bottom: 10px;
+                        text-align: center;
+                        z-index: 100;
+                    }}
+                    .btn {{
+                        display: inline-block;
+                        background: #0078d4;
+                        color: white;
+                        border: none;
+                        padding: 8px 15px;
+                        margin: 0 3px;
+                        border-radius: 3px;
+                        cursor: pointer;
+                        font-size: 14px;
+                        text-decoration: none;
+                    }}
+                    .btn:hover {{
+                        background: #106ebe;
+                    }}
+                    .btn.disabled {{
+                        background: #555;
+                        cursor: not-allowed;
+                        pointer-events: none;
+                    }}
+                    .info {{
+                        display: inline-block;
+                        margin: 0 15px;
+                        color: #aaa;
+                    }}
+                    .pdf-container {{
+                        text-align: center;
+                        overflow: auto;
+                    }}
+                    img {{
+                        max-width: 100%;
+                        height: auto;
+                        box-shadow: 0 0 20px rgba(0,0,0,0.5);
+                    }}
+                </style>
+            </head>
+            <body>
+                <div class="controls">
+                    <a class="btn {'disabled' if self.current_pdf_page == 0 else ''}" href="pdf://first">⏮ Первая</a>
+                    <a class="btn {'disabled' if self.current_pdf_page == 0 else ''}" href="pdf://prev">◀ Назад</a>
+                    <span class="info">Страница {page_num} / {total_pages}</span>
+                    <a class="btn {'disabled' if self.current_pdf_page >= total_pages - 1 else ''}" href="pdf://next">Вперед ▶</a>
+                    <a class="btn {'disabled' if self.current_pdf_page >= total_pages - 1 else ''}" href="pdf://last">Последняя ⏭</a>
+                    <span style="margin: 0 10px;">|</span>
+                    <a class="btn" href="pdf://zoomout">🔍-</a>
+                    <span class="info">{zoom_percent}%</span>
+                    <a class="btn" href="pdf://zoomin">🔍+</a>
+                    <a class="btn" href="pdf://zoomreset">100%</a>
+                </div>
+                <div class="pdf-container">
+                    <img src="file:///{temp_img.as_posix()}" />
+                </div>
+            </body>
+            </html>
+            """
+            
+            self.file_viewer.setHtml(html)
+            self.viewer_label.setText(f"📑 {self.current_pdf_path.name} — Стр. {page_num}/{total_pages} — {zoom_percent}%")
+            
+        except Exception as e:
+            self.file_viewer.setPlainText(f"Ошибка рендеринга PDF:\n{e}")
+            logger.error(f"PDF render error: {e}")
+    
+    def on_pdf_navigation(self, url: QUrl):
+        """Обработка навигации по PDF."""
+        scheme = url.scheme()
+        if scheme == "pdf":
+            action = url.host()
+            
+            if action == "prev" and self.current_pdf_page > 0:
+                self.current_pdf_page -= 1
+                self.render_pdf_page()
+            elif action == "next" and self.current_pdf_page < len(self.current_pdf_doc) - 1:
+                self.current_pdf_page += 1
+                self.render_pdf_page()
+            elif action == "first":
+                self.current_pdf_page = 0
+                self.render_pdf_page()
+            elif action == "last":
+                self.current_pdf_page = len(self.current_pdf_doc) - 1
+                self.render_pdf_page()
+            elif action == "zoomin":
+                self.current_pdf_zoom = min(self.current_pdf_zoom * 1.2, 5.0)
+                self.render_pdf_page()
+            elif action == "zoomout":
+                self.current_pdf_zoom = max(self.current_pdf_zoom / 1.2, 0.2)
+                self.render_pdf_page()
+            elif action == "zoomreset":
+                self.current_pdf_zoom = 1.0
+                self.render_pdf_page()
+    
     def close_viewer(self):
         """Очищает просмотрщик."""
+        # Закрываем PDF документ если открыт
+        if hasattr(self, 'current_pdf_doc') and self.current_pdf_doc is not None:
+            self.current_pdf_doc.close()
+            self.current_pdf_doc = None
+            self.current_pdf_path = None
+            self.current_pdf_page = 0
+            self.current_pdf_zoom = 1.0
+        
         self.file_viewer.clear()
         self.viewer_label.setText("Просмотр документа")
 
