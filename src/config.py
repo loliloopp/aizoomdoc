@@ -61,14 +61,16 @@ class Config:
     # Порог расстояния для группировки близких блоков в один viewport (в пикселях)
     CLUSTERING_DISTANCE_THRESHOLD: int = 500
     
-    # ===== Supabase Configuration =====
-    # PostgreSQL БД для хранения чатов и сообщений
+    # ===== Supabase Chat DB (основная БД для чатов) =====
     SUPABASE_URL: str = os.getenv("SUPABASE_URL", "")
     SUPABASE_ANON_KEY: str = os.getenv("SUPABASE_ANON_KEY", "")
     SUPABASE_SERVICE_KEY: str = os.getenv("SUPABASE_SERVICE_KEY", "")
     
-    # Включить сохранение в БД
-    USE_DATABASE: bool = os.getenv("USE_DATABASE", "false").lower() == "true"
+    # ===== Supabase Projects DB (БД для дерева проектов) =====
+    SUPABASE_PROJECTS_URL: str = os.getenv("SUPABASE_PROJECTS_URL", "")
+    SUPABASE_PROJECTS_ANON_KEY: str = os.getenv("SUPABASE_PROJECTS_ANON_KEY", "")
+    SUPABASE_PROJECTS_SERVICE_KEY: str = os.getenv("SUPABASE_PROJECTS_SERVICE_KEY", "")
+    USE_PROJECTS_DATABASE: bool = os.getenv("USE_PROJECTS_DATABASE", "false").lower() == "true"
     
     # ===== S3 / Cloudflare R2 Configuration =====
     # Хранилище для изображений и документов (по умолчанию R2)
@@ -102,12 +104,11 @@ class Config:
                 "Ни OPENROUTER_API_KEY, ни GOOGLE_API_KEY не заданы. Установите хотя бы один в .env файле."
             )
         
-        # Проверка Supabase (если включена БД)
-        if cls.USE_DATABASE:
-            if not cls.SUPABASE_URL:
-                raise ValueError(
-                    "SUPABASE_URL не задан."
-                )
+        # Проверка Supabase Chat DB (обязательна)
+        if not cls.SUPABASE_URL:
+            raise ValueError("SUPABASE_URL не задан.")
+        if not cls.SUPABASE_ANON_KEY:
+            raise ValueError("SUPABASE_ANON_KEY не задан.")
         
         # Проверка S3/R2
         if cls.USE_S3_STORAGE:

@@ -17,12 +17,12 @@ logger = logging.getLogger(__name__)
 
 
 class SupabaseClient:
-    """Клиент для работы с Supabase PostgreSQL."""
+    """Клиент для работы с Supabase Chat DB (чаты, сообщения)."""
     
     def __init__(self):
         """Инициализировать Supabase клиент."""
-        if not config.USE_DATABASE or not config.SUPABASE_URL or not config.SUPABASE_ANON_KEY:
-            logger.warning("Supabase отключен или не сконфигурирован")
+        if not config.SUPABASE_URL or not config.SUPABASE_ANON_KEY:
+            logger.warning("Supabase Chat DB не сконфигурирован")
             self.client = None
             return
         
@@ -31,9 +31,9 @@ class SupabaseClient:
                 config.SUPABASE_URL,
                 config.SUPABASE_ANON_KEY
             )
-            logger.info("✅ Supabase клиент инициализирован")
+            logger.info("✅ Supabase Chat DB клиент инициализирован")
         except Exception as e:
-            logger.error(f"❌ Ошибка инициализации Supabase: {e}")
+            logger.error(f"❌ Ошибка инициализации Supabase Chat DB: {e}")
             self.client = None
     
     def is_connected(self) -> bool:
@@ -689,6 +689,85 @@ class SupabaseClient:
             logger.error(f"❌ Ошибка получения инфо о файле {file_id}: {e}")
             return None
 
-# Глобальный экземпляр клиента
-supabase_client = SupabaseClient()
+
+
+class SupabaseProjectsClient:
+    """Клиент для работы с Supabase Projects DB (дерево проектов, jobs)."""
+    
+    def __init__(self):
+        """Инициализировать клиент проектов."""
+        if not config.USE_PROJECTS_DATABASE:
+            logger.info("Supabase Projects DB отключен (USE_PROJECTS_DATABASE=false)")
+            self.client = None
+            return
+            
+        if not config.SUPABASE_PROJECTS_URL or not config.SUPABASE_PROJECTS_ANON_KEY:
+            logger.warning("Supabase Projects DB не сконфигурирован")
+            self.client = None
+            return
+        
+        try:
+            self.client = create_client(
+                config.SUPABASE_PROJECTS_URL,
+                config.SUPABASE_PROJECTS_ANON_KEY
+            )
+            logger.info("✅ Supabase Projects DB клиент инициализирован")
+        except Exception as e:
+            logger.error(f"❌ Ошибка инициализации Supabase Projects DB: {e}")
+            self.client = None
+    
+    def is_connected(self) -> bool:
+        """Проверить подключение к БД проектов."""
+        return self.client is not None
+    
+    async def get_tree_nodes(self, client_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Получить все узлы дерева."""
+        if not self.is_connected():
+            return []
+        try:
+            query = self.client.table("tree_nodes").select("*").order("sort_order").order("name")
+            response = query.execute()
+            return response.data or []
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения tree_nodes: {e}")
+            return []
+    
+    async def get_document_jobs(self, node_id: str) -> List[Dict[str, Any]]:
+        """Получить джобы для документа по node_id."""
+        if not self.is_connected():
+            return []
+        try:
+            response = (
+                self.client.table("jobs")
+                .select("*")
+                .eq("node_id", node_id)
+                .order("created_at", desc=True)
+                .execute()
+            )
+            return response.data or []
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения jobs для node_id={node_id}: {e}")
+            return []
+    
+    async def get_job_result_files(self, job_id: str) -> List[Dict[str, Any]]:
+        """Получить файлы результатов для джоба."""
+        if not self.is_connected():
+            return []
+        try:
+            response = (
+                self.client.table("job_files")
+                .select("*")
+                .eq("job_id", job_id)
+                .in_("file_type", ["result_json", "result_md", "ocr_html"])
+                .execute()
+            )
+            return response.data or []
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения job_files для job_id={job_id}: {e}")
+            return []
+
+
+# Глобальные экземпляры клиентов
+supabase_client = SupabaseClient()  # Для чатов
+supabase_projects_client = SupabaseProjectsClient()  # Для проектов
 

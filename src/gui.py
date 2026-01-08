@@ -8,6 +8,7 @@ import json
 import shutil
 from pathlib import Path
 from datetime import datetime
+from typing import Dict, List, Any
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -25,7 +26,7 @@ from PyQt6.QtGui import (
 
 from .config import config
 from .gui_agent import AgentWorker
-from .supabase_client import supabase_client
+from .supabase_client import supabase_client, supabase_projects_client
 from .s3_storage import s3_storage
 from .utils import transliterate
 import asyncio
@@ -99,7 +100,7 @@ class SettingsDialog(QDialog):
             self.combo_default_model.addItem(name, mid)
         
         # Загружаем текущую модель по умолчанию
-        if config.USE_DATABASE and supabase_client.is_connected():
+        if supabase_client.is_connected():
             try:
                 def_model = asyncio.run(supabase_client.get_default_model())
                 if def_model:
@@ -981,31 +982,52 @@ class MainWindow(QMainWindow):
         
         left_layout.addWidget(self.chats_widget)
 
-        # --- ВКЛАДКА ПАПКИ ---
+        # --- ВКЛАДКА ДЕРЕВО ПРОЕКТОВ ---
         self.folders_widget = QWidget()
         self.folders_widget.setVisible(False)
         folders_layout = QVBoxLayout(self.folders_widget)
         folders_layout.setSpacing(8)
         folders_layout.setContentsMargins(12, 12, 12, 12)
         
-        # Кнопки управления папками
+        # Заголовок
+        self.folders_label = QLabel("ДЕРЕВО ПРОЕКТОВ")
+        self.folders_label.setStyleSheet("font-weight: bold; font-size: 14px; padding: 4px;")
+        folders_layout.addWidget(self.folders_label)
+        
+        # Кнопки управления
         folders_btns_layout = QHBoxLayout()
         folders_btns_layout.setSpacing(4)
         
-        self.btn_new_folder = QPushButton("+ Папка")
-        self.btn_new_folder.clicked.connect(self.create_new_folder)
-        self.btn_new_folder.setToolTip("Создать тематическую папку")
+        self.btn_new_project = QPushButton("+ Проект")
+        self.btn_new_project.setEnabled(False)  # Пока не реализовано
+        self.btn_new_project.setToolTip("Создать новый проект")
         
-        self.btn_refresh_folders = QPushButton("🔄")
-        self.btn_refresh_folders.setFixedWidth(30)
-        self.btn_refresh_folders.clicked.connect(self.refresh_folders)
+        self.btn_collapse_all = QPushButton("▼")
+        self.btn_collapse_all.setFixedWidth(30)
+        self.btn_collapse_all.setToolTip("Свернуть всё")
+        self.btn_collapse_all.clicked.connect(lambda: self.tree_folders.collapseAll())
         
-        folders_btns_layout.addWidget(self.btn_new_folder)
-        folders_btns_layout.addWidget(self.btn_refresh_folders)
+        self.btn_expand_all = QPushButton("▲")
+        self.btn_expand_all.setFixedWidth(30)
+        self.btn_expand_all.setToolTip("Развернуть всё")
+        self.btn_expand_all.clicked.connect(lambda: self.tree_folders.expandAll())
+        
+        self.btn_refresh_tree = QPushButton("⚙️")
+        self.btn_refresh_tree.setFixedWidth(30)
+        self.btn_refresh_tree.setToolTip("Обновить дерево")
+        self.btn_refresh_tree.clicked.connect(self.refresh_projects_tree)
+        
+        folders_btns_layout.addWidget(self.btn_new_project)
+        folders_btns_layout.addWidget(self.btn_collapse_all)
+        folders_btns_layout.addWidget(self.btn_expand_all)
+        folders_btns_layout.addWidget(self.btn_refresh_tree)
         folders_layout.addLayout(folders_btns_layout)
         
-        self.folders_label = QLabel("Файлы проекта")
-        folders_layout.addWidget(self.folders_label)
+        # Поле поиска
+        self.search_tree_input = QLineEdit()
+        self.search_tree_input.setPlaceholderText("Поиск...")
+        self.search_tree_input.textChanged.connect(self.filter_tree)
+        folders_layout.addWidget(self.search_tree_input)
         
         # Дерево файлов
         self.tree_folders = QTreeView()
@@ -1015,12 +1037,17 @@ class MainWindow(QMainWindow):
         self.tree_folders.customContextMenuRequested.connect(self.show_tree_context_menu)
         self.tree_folders.setSelectionMode(QTreeView.SelectionMode.ExtendedSelection)
         
-        # Логическая модель (БД)
+        # Логическая модель
         self.logical_model = QStandardItemModel()
         self.tree_folders.setModel(self.logical_model)
         
         self.tree_folders.doubleClicked.connect(self.on_tree_double_clicked)
         folders_layout.addWidget(self.tree_folders)
+        
+        # Счетчики статистики
+        self.tree_stats_label = QLabel("Проектов: 0 | PDF: 0 | MD: 0 | Папок с PDF: 0")
+        self.tree_stats_label.setStyleSheet("font-size: 10px; color: #666; padding: 4px;")
+        folders_layout.addWidget(self.tree_stats_label)
         
         # Кнопка прикрепления выбранных
         self.btn_attach_selected = QPushButton("📎 Прикрепить выбранные")
@@ -1214,7 +1241,7 @@ class MainWindow(QMainWindow):
 
     def load_default_model(self):
         """Загружает модель по умолчанию из БД."""
-        if config.USE_DATABASE and supabase_client.is_connected():
+        if supabase_client.is_connected():
             try:
                 def_model = self.run_async(supabase_client.get_default_model())
                 if def_model:
@@ -1229,7 +1256,7 @@ class MainWindow(QMainWindow):
         if dialog.exec():
             # 1. Сохраняем модель по умолчанию в БД
             new_model = dialog.get_default_model()
-            if config.USE_DATABASE and supabase_client.is_connected():
+            if supabase_client.is_connected():
                 try:
                     self.run_async(supabase_client.set_default_model(new_model))
                     # Обновляем текущий выбор в главном окне
@@ -1255,7 +1282,7 @@ class MainWindow(QMainWindow):
         self.combo_user_prompts.clear()
         self.combo_user_prompts.addItem("Без промта", None)
         
-        if config.USE_DATABASE and supabase_client.is_connected():
+        if supabase_client.is_connected():
             try:
                 prompts = self.run_async(supabase_client.get_user_prompts())
                 for p in prompts:
@@ -1509,7 +1536,7 @@ class MainWindow(QMainWindow):
         cloud_local_ids = set()
         
         # 1. Загружаем из облака, если включено
-        if config.USE_DATABASE and supabase_client.is_connected():
+        if supabase_client.is_connected():
             try:
                 chats = self.run_async(supabase_client.get_chats())
                 for chat in chats:
@@ -1729,65 +1756,261 @@ class MainWindow(QMainWindow):
             self.folders_widget.setVisible(True)
             self.btn_tab_chats.setChecked(False)
             self.btn_tab_folders.setChecked(True)
-            # Обновляем логические папки при переключении
-            self.refresh_folders()
+            # Обновляем дерево проектов при переключении
+            self.refresh_projects_tree()
 
-    def refresh_folders(self):
-        """Обновляет дерево логических папок из БД."""
+    def refresh_projects_tree(self):
+        """Обновляет дерево проектов из tree_nodes (БД Projects)."""
         self.logical_model.clear()
-        if not supabase_client.is_connected():
-            item = QStandardItem("Supabase не подключен")
+        
+        if not supabase_projects_client.is_connected():
+            item = QStandardItem("⚠️ Supabase Projects не подключен")
             item.setEnabled(False)
+            item.setToolTip("Проверьте SUPABASE_PROJECTS_URL и USE_PROJECTS_DATABASE в .env")
             self.logical_model.appendRow(item)
+            self.tree_stats_label.setText("Проектов: 0 | PDF: 0 | MD: 0 | Папок с PDF: 0")
             return
 
         try:
-            folders = self.run_async(supabase_client.get_folders())
+            self.log("🔄 Загрузка дерева проектов...")
             
-            # Строим дерево
-            # Для простоты пока плоский список или один уровень вложенности, 
-            # но можно сделать рекурсивно по parent_id
-            folder_items = {}
+            # 1. Загрузить все узлы
+            nodes = self.run_async(supabase_projects_client.get_tree_nodes())
             
-            # Сначала создаем все папки
-            for f in folders:
-                # Если slug пустой (старая папка), генерируем его на лету
-                slug = f.get('slug')
-                if not slug:
-                    slug = transliterate(f['name'])
-                    
-                f_item = QStandardItem(f"📁 {f['name']}")
-                f_item.setData(f['id'], Qt.ItemDataRole.UserRole) # ID папки
-                f_item.setData("folder", Qt.ItemDataRole.UserRole + 1) # Тип
-                f_item.setData(slug, Qt.ItemDataRole.UserRole + 4) # Slug для S3
-                folder_items[f['id']] = f_item
-
-            # Добавляем в модель (учитывая parent_id)
-            for f in folders:
-                f_item = folder_items[f['id']]
-                parent_id = f.get('parent_id')
-                if parent_id and parent_id in folder_items:
-                    folder_items[parent_id].appendRow(f_item)
+            if not nodes:
+                item = QStandardItem("📭 Проектов нет")
+                item.setEnabled(False)
+                self.logical_model.appendRow(item)
+                self.tree_stats_label.setText("Проектов: 0 | PDF: 0 | MD: 0 | Папок с PDF: 0")
+                self.log("ℹ️ Дерево проектов пусто")
+                return
+            
+            self.log(f"📊 Загружено узлов: {len(nodes)}")
+            
+            # 2. Создать словарь node_id → (QStandardItem, node_data)
+            node_items = {}
+            for node in nodes:
+                item = self.create_tree_item_for_project(node)
+                node_items[node['id']] = (item, node)
+            
+            # 3. Построить иерархию по parent_id
+            root_count = 0
+            for node_id, (item, node) in node_items.items():
+                parent_id = node.get('parent_id')
+                if parent_id and parent_id in node_items:
+                    parent_item, _ = node_items[parent_id]
+                    parent_item.appendRow(item)
                 else:
-                    self.logical_model.appendRow(f_item)
+                    # Корневой элемент (обычно project)
+                    self.logical_model.appendRow(item)
+                    root_count += 1
             
-            # Загружаем файлы для каждой папки
-            for f_id, f_item in folder_items.items():
-                files = self.run_async(supabase_client.get_folder_files(f_id))
-                for file in files:
-                    name = file.get('filename') or "Без названия"
-                    file_item = QStandardItem(f"📄 {name}")
-                    file_item.setData(file['id'], Qt.ItemDataRole.UserRole) # ID файла
-                    file_item.setData("file", Qt.ItemDataRole.UserRole + 1) # Тип
-                    file_item.setData(file.get('storage_path') or file.get('external_url'), Qt.ItemDataRole.UserRole + 2) # Путь/URL
-                    file_item.setData(f_id, Qt.ItemDataRole.UserRole + 3) # ID родительской папки в БД
-                    f_item.appendRow(file_item)
+            self.log(f"📁 Корневых проектов: {root_count}")
             
-            # Разворачиваем все папки, чтобы видеть файлы
-            self.tree_folders.expandAll()
+            # 4. Для документов добавить результаты парсинга
+            documents_count = 0
+            for node_id, (item, node) in node_items.items():
+                if node['node_type'] == 'document':
+                    documents_count += 1
+                    self.add_document_results_to_tree(item, node_id)
+            
+            self.log(f"📄 Документов: {documents_count}")
+            
+            # 5. Развернуть проекты первого уровня
+            for i in range(self.logical_model.rowCount()):
+                index = self.logical_model.index(i, 0)
+                self.tree_folders.expand(index)
+            
+            # 6. Обновить счетчики
+            self.update_tree_statistics(nodes)
+            
+            self.log("✅ Дерево проектов обновлено")
+            
+        except Exception as e:
+            self.log(f"❌ Ошибка обновления дерева: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            item = QStandardItem(f"❌ Ошибка: {str(e)}")
+            item.setEnabled(False)
+            self.logical_model.appendRow(item)
+
+    def create_tree_item_for_project(self, node: Dict) -> QStandardItem:
+        """Создает элемент дерева с иконкой, кодом и названием."""
+        node_type = node['node_type']
+        name = node['name']
+        code = node.get('code', '')
+        version = node.get('version', 1)
+        
+        # Иконки по типам
+        icons = {
+            'project': '📁',
+            'section': '📂',
+            'stage': '📋',
+            'task_folder': '📁',
+            'document': '📄'
+        }
+        
+        icon = icons.get(node_type, '📄')
+        
+        # Формируем отображаемое имя
+        if node_type == 'section' and code:
+            # Для секций: [РД] Рабочая документация
+            display_name = f"{icon} [{code}] {name}"
+        elif node_type == 'document':
+            # Для документов: [v1] 95
+            display_name = f"{icon} [v{version}] {name}"
+        else:
+            display_name = f"{icon} {name}"
+        
+        item = QStandardItem(display_name)
+        item.setData(node['id'], Qt.ItemDataRole.UserRole)  # node_id
+        item.setData(node_type, Qt.ItemDataRole.UserRole + 1)  # тип узла
+        item.setData(node, Qt.ItemDataRole.UserRole + 2)  # весь узел
+        
+        # Tooltip с информацией
+        tooltip_parts = [f"Тип: {node_type}"]
+        if code:
+            tooltip_parts.append(f"Код: {code}")
+        if node_type == 'document':
+            pdf_status = node.get('pdf_status', 'unknown')
+            tooltip_parts.append(f"Статус: {pdf_status}")
+            if node.get('pdf_status_message'):
+                tooltip_parts.append(f"Инфо: {node['pdf_status_message']}")
+        item.setToolTip("\n".join(tooltip_parts))
+        
+        return item
+
+    def add_document_results_to_tree(self, doc_item: QStandardItem, node_id: str):
+        """Добавляет результаты парсинга под документ."""
+        try:
+            jobs = self.run_async(supabase_projects_client.get_document_jobs(node_id))
+            
+            if not jobs:
+                return
+            
+            # Берем последний успешный джоб
+            completed_jobs = [j for j in jobs if j.get('status') == 'completed']
+            if not completed_jobs:
+                return
+            
+            job = completed_jobs[0]
+            
+            # Получаем файлы результатов
+            result_files = self.run_async(supabase_projects_client.get_job_result_files(job['id']))
+            
+            if result_files:
+                # Создаем элементы для каждого типа файла
+                for rfile in result_files:
+                    file_type = rfile.get('file_type', '')
+                    file_name = rfile.get('file_name', '')
+                    
+                    if file_type == 'result_json':
+                        icon = '📊'
+                        label = f"{icon} JSON: {file_name}"
+                    elif file_type == 'result_md':
+                        icon = '📝'
+                        label = f"{icon} MD: {file_name}"
+                    elif file_type == 'ocr_html':
+                        icon = '🌐'
+                        label = f"{icon} HTML: {file_name}"
+                    else:
+                        icon = '📄'
+                        label = f"{icon} {file_name}"
+                    
+                    result_item = QStandardItem(label)
+                    result_item.setData(job['id'], Qt.ItemDataRole.UserRole)  # job_id
+                    result_item.setData('pdf_result', Qt.ItemDataRole.UserRole + 1)  # тип
+                    result_item.setData(rfile, Qt.ItemDataRole.UserRole + 2)  # данные файла
+                    result_item.setToolTip(f"Файл: {file_name}\nТип: {file_type}\nR2: {rfile.get('r2_key', '-')}")
+                    
+                    doc_item.appendRow(result_item)
                     
         except Exception as e:
-            self.log(f"Ошибка обновления папок: {e}")
+            self.log(f"⚠️ Ошибка загрузки результатов для документа {node_id}: {e}")
+
+    def update_tree_statistics(self, nodes: List[Dict]):
+        """Обновляет счетчики внизу дерева."""
+        projects_count = sum(1 for n in nodes if n['node_type'] == 'project')
+        pdf_count = sum(1 for n in nodes if n['node_type'] == 'document')
+        
+        # Подсчет обработанных документов (с результатами)
+        md_count = 0
+        for node in nodes:
+            if node['node_type'] == 'document':
+                jobs = self.run_async(supabase_projects_client.get_document_jobs(node['id']))
+                if any(j.get('status') == 'completed' for j in jobs):
+                    md_count += 1
+        
+        # Подсчет папок с PDF
+        folders_with_pdf = set()
+        for node in nodes:
+            if node['node_type'] == 'document':
+                parent_id = node.get('parent_id')
+                if parent_id:
+                    folders_with_pdf.add(parent_id)
+        
+        self.tree_stats_label.setText(
+            f"Проектов: {projects_count} | PDF: {pdf_count} | MD: {md_count} | Папок с PDF: {len(folders_with_pdf)}"
+        )
+
+    def filter_tree(self, search_text: str):
+        """Фильтрует дерево по тексту поиска."""
+        search_text = search_text.lower().strip()
+        
+        if not search_text:
+            # Показать всё
+            self.show_all_tree_items(self.logical_model.invisibleRootItem())
+            return
+        
+        # Скрыть всё, затем показать совпадения
+        self.hide_all_tree_items(self.logical_model.invisibleRootItem())
+        self.show_matching_items(self.logical_model.invisibleRootItem(), search_text)
+
+    def hide_all_tree_items(self, parent_item):
+        """Рекурсивно скрывает все элементы."""
+        for i in range(parent_item.rowCount()):
+            child = parent_item.child(i)
+            index = self.logical_model.indexFromItem(child)
+            self.tree_folders.setRowHidden(index.row(), index.parent(), True)
+            self.hide_all_tree_items(child)
+
+    def show_all_tree_items(self, parent_item):
+        """Рекурсивно показывает все элементы."""
+        for i in range(parent_item.rowCount()):
+            child = parent_item.child(i)
+            index = self.logical_model.indexFromItem(child)
+            self.tree_folders.setRowHidden(index.row(), index.parent(), False)
+            self.show_all_tree_items(child)
+
+    def show_matching_items(self, parent_item, search_text: str) -> bool:
+        """
+        Рекурсивно показывает элементы, соответствующие поиску.
+        Возвращает True если в поддереве есть совпадения.
+        """
+        has_match = False
+        
+        for i in range(parent_item.rowCount()):
+            child = parent_item.child(i)
+            child_text = child.text().lower()
+            
+            # Проверяем совпадение текста
+            text_matches = search_text in child_text
+            
+            # Проверяем детей рекурсивно
+            children_match = self.show_matching_items(child, search_text)
+            
+            # Показываем элемент если он сам или его дети совпадают
+            if text_matches or children_match:
+                index = self.logical_model.indexFromItem(child)
+                self.tree_folders.setRowHidden(index.row(), index.parent(), False)
+                has_match = True
+                
+                # Разворачиваем родителей при совпадении
+                if children_match:
+                    self.tree_folders.expand(index)
+            
+        return has_match
 
     def create_new_folder(self):
         """Создает новую логическую папку в БД."""
@@ -1805,44 +2028,43 @@ class MainWindow(QMainWindow):
                 QMessageBox.critical(self, "Ошибка", f"Ошибка: {e}")
 
     def show_tree_context_menu(self, position):
-        """Контекстное меню для дерева логических папок."""
+        """Контекстное меню для дерева проектов."""
         indexes = self.tree_folders.selectedIndexes()
         if not indexes:
-            menu = QMenu()
-            action_new_folder = menu.addAction("➕ Создать папку")
-            action_new_folder.triggered.connect(self.create_new_folder)
-            menu.exec(self.tree_folders.viewport().mapToGlobal(position))
             return
-
+        
         index = indexes[0]
         item = self.logical_model.itemFromIndex(index)
-        db_id = item.data(Qt.ItemDataRole.UserRole)
+        node_data = item.data(Qt.ItemDataRole.UserRole + 2)
         item_type = item.data(Qt.ItemDataRole.UserRole + 1)
-        folder_slug = item.data(Qt.ItemDataRole.UserRole + 4)
         
         menu = QMenu()
         
-        if item_type == "folder":
-            action_attach_all = menu.addAction("📎 Прикрепить ВСЕ файлы")
-            action_add_files = menu.addAction("📥 Добавить файлы в эту папку")
-            menu.addSeparator()
-            action_new_subfolder = menu.addAction("➕ Создать подпапку")
-            action_delete = menu.addAction("🗑️ Удалить папку")
+        if item_type == 'document':
+            action_attach = menu.addAction("📎 Прикрепить PDF к чату")
+            action_view_info = menu.addAction("ℹ️ Информация о документе")
             
-            action_attach_all.triggered.connect(lambda: self.attach_folder_files_db(db_id, item.text()))
-            action_add_files.triggered.connect(lambda: self.add_external_files_to_db_folder(db_id, folder_slug))
-            action_new_subfolder.triggered.connect(lambda: self.create_subfolder_db(db_id))
-            action_delete.triggered.connect(lambda: self.delete_db_item(db_id, "folder", item.text(), folder_slug=folder_slug))
-        else:
+            action_attach.triggered.connect(lambda: self.attach_document_to_current_chat(node_data))
+            action_view_info.triggered.connect(lambda: self.show_document_info(node_data))
+            
+        elif item_type == 'pdf_result':
+            file_data = item.data(Qt.ItemDataRole.UserRole + 2)
+            
+            action_open = menu.addAction("📂 Открыть файл")
             action_attach = menu.addAction("📎 Прикрепить к чату")
-            action_delete = menu.addAction("🗑️ Удалить из этой папки")
             
-            file_path = item.data(Qt.ItemDataRole.UserRole + 2)
-            parent_folder_id = item.data(Qt.ItemDataRole.UserRole + 3)
-            
-            action_attach.triggered.connect(lambda: self.attach_single_file_db(db_id, item.text(), file_path))
-            action_delete.triggered.connect(lambda: self.delete_db_item(db_id, "file", item.text(), parent_folder_id=parent_folder_id))
-
+            action_open.triggered.connect(lambda: self.open_result_file(file_data))
+            action_attach.triggered.connect(lambda: self.attach_result_file_to_chat(file_data))
+        
+        else:
+            # Для папок: развернуть/свернуть
+            if self.tree_folders.isExpanded(index):
+                action_collapse = menu.addAction("◀ Свернуть")
+                action_collapse.triggered.connect(lambda: self.tree_folders.collapse(index))
+            else:
+                action_expand = menu.addAction("▶ Развернуть")
+                action_expand.triggered.connect(lambda: self.tree_folders.expand(index))
+        
         menu.exec(self.tree_folders.viewport().mapToGlobal(position))
 
     def create_subfolder_db(self, parent_id):
@@ -1926,12 +2148,135 @@ class MainWindow(QMainWindow):
             self.log(f"В папке '{folder_name}' не найдено новых файлов для прикрепления")
 
     def on_tree_double_clicked(self, index):
+        """Обработка двойного клика на элементе дерева."""
         item = self.logical_model.itemFromIndex(index)
         item_type = item.data(Qt.ItemDataRole.UserRole + 1)
-        if item_type == "file":
-            db_id = item.data(Qt.ItemDataRole.UserRole)
-            path = item.data(Qt.ItemDataRole.UserRole + 2)
-            self.attach_single_file_db(db_id, item.text(), path)
+        
+        if item_type == 'document':
+            node_data = item.data(Qt.ItemDataRole.UserRole + 2)
+            self.attach_document_to_current_chat(node_data)
+            
+        elif item_type == 'pdf_result':
+            file_data = item.data(Qt.ItemDataRole.UserRole + 2)
+            self.open_result_file(file_data)
+
+    def attach_document_to_current_chat(self, node_data: Dict):
+        """Прикрепляет PDF документ из tree_nodes к текущему чату."""
+        attributes = node_data.get('attributes', {})
+        r2_key = attributes.get('r2_key')
+        
+        if not r2_key:
+            self.log("❌ У документа нет r2_key")
+            QMessageBox.warning(self, "Ошибка", "Документ не имеет ссылки на файл")
+            return
+        
+        # Получаем URL файла из S3/R2
+        if s3_storage.is_connected():
+            file_url = self.run_async(s3_storage.get_presigned_url(r2_key))
+            if file_url:
+                # Добавляем в список прикрепленных
+                file_info = {
+                    'name': node_data.get('name', 'document.pdf'),
+                    'path': r2_key,
+                    'url': file_url,
+                    'source': 'tree_node',
+                    'node_id': node_data['id']
+                }
+                self.attached_files.append(file_info)
+                self.update_file_count()
+                self.log(f"✅ Прикреплен документ: {node_data.get('name')}")
+            else:
+                self.log("❌ Не удалось получить URL файла")
+        else:
+            self.log("❌ S3 не подключен")
+
+    def attach_result_file_to_chat(self, file_data: Dict):
+        """Прикрепляет файл результата парсинга к чату."""
+        r2_key = file_data.get('r2_key')
+        file_name = file_data.get('file_name', 'result')
+        
+        if not r2_key:
+            self.log("❌ У файла результата нет r2_key")
+            return
+        
+        if s3_storage.is_connected():
+            file_url = self.run_async(s3_storage.get_presigned_url(r2_key))
+            if file_url:
+                file_info = {
+                    'name': file_name,
+                    'path': r2_key,
+                    'url': file_url,
+                    'source': 'job_result',
+                    'file_id': file_data['id']
+                }
+                self.attached_files.append(file_info)
+                self.update_file_count()
+                self.log(f"✅ Прикреплен результат: {file_name}")
+
+    def open_result_file(self, file_data: Dict):
+        """Открывает файл результата в системном просмотрщике."""
+        r2_key = file_data.get('r2_key')
+        file_name = file_data.get('file_name', 'result')
+        
+        if not r2_key or not s3_storage.is_connected():
+            self.log("❌ Невозможно открыть файл")
+            return
+        
+        try:
+            # Скачиваем временно
+            import tempfile
+            temp_dir = Path(tempfile.gettempdir()) / "aizoomdoc"
+            temp_dir.mkdir(exist_ok=True)
+            
+            temp_file = temp_dir / file_name
+            
+            self.log(f"⬇️ Загрузка файла {file_name}...")
+            success = self.run_async(s3_storage.download_file(r2_key, str(temp_file)))
+            
+            if success:
+                # Открываем в системном просмотрщике
+                import subprocess
+                import platform
+                
+                if platform.system() == 'Windows':
+                    os.startfile(temp_file)
+                elif platform.system() == 'Darwin':  # macOS
+                    subprocess.run(['open', temp_file])
+                else:  # Linux
+                    subprocess.run(['xdg-open', temp_file])
+                
+                self.log(f"✅ Открыт файл: {file_name}")
+            else:
+                self.log("❌ Ошибка загрузки файла")
+                
+        except Exception as e:
+            self.log(f"❌ Ошибка открытия файла: {e}")
+
+    def show_document_info(self, node_data: Dict):
+        """Показывает информацию о документе в диалоге."""
+        info_text = f"""
+        <h3>{node_data.get('name', 'Документ')}</h3>
+        <p><b>Тип:</b> {node_data.get('node_type')}</p>
+        <p><b>Версия:</b> {node_data.get('version', 1)}</p>
+        <p><b>Статус:</b> {node_data.get('status', 'active')}</p>
+        <p><b>PDF Статус:</b> {node_data.get('pdf_status', 'unknown')}</p>
+        <p><b>Сообщение:</b> {node_data.get('pdf_status_message', '-')}</p>
+        <p><b>Создан:</b> {node_data.get('created_at', '-')}</p>
+        <p><b>Обновлен:</b> {node_data.get('updated_at', '-')}</p>
+        """
+        
+        attributes = node_data.get('attributes', {})
+        if attributes:
+            info_text += "<p><b>Атрибуты:</b></p><ul>"
+            for key, value in attributes.items():
+                info_text += f"<li>{key}: {value}</li>"
+            info_text += "</ul>"
+        
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Информация о документе")
+        msg.setTextFormat(Qt.TextFormat.RichText)
+        msg.setText(info_text)
+        msg.exec()
 
     def attach_selected_from_tree(self):
         """Прикрепляет все выбранные в дереве файлы из БД."""
@@ -1984,7 +2329,7 @@ class MainWindow(QMainWindow):
 
     def load_md_mode(self):
         """Загружает режим обработки MD из Supabase."""
-        if config.USE_DATABASE and supabase_client.is_connected():
+        if supabase_client.is_connected():
             try:
                 mode = self.run_async(supabase_client.get_md_processing_mode())
                 index = self.combo_md_mode.findData(mode)
@@ -1998,7 +2343,7 @@ class MainWindow(QMainWindow):
     def save_md_mode(self):
         """Сохраняет режим обработки MD в Supabase."""
         mode = self.combo_md_mode.currentData()
-        if config.USE_DATABASE and supabase_client.is_connected():
+        if supabase_client.is_connected():
             try:
                 self.run_async(supabase_client.set_md_processing_mode(mode))
                 self.log(f"Режим MD изменен на: {mode}")
@@ -2196,8 +2541,10 @@ class MainWindow(QMainWindow):
                     background-color: #4d4d4f;
                 }
             """
-            self.btn_new_folder.setStyleSheet(folders_btn_style_dark)
-            self.btn_refresh_folders.setStyleSheet(folders_btn_style_dark)
+            self.btn_new_project.setStyleSheet(folders_btn_style_dark)
+            self.btn_collapse_all.setStyleSheet(folders_btn_style_dark)
+            self.btn_expand_all.setStyleSheet(folders_btn_style_dark)
+            self.btn_refresh_tree.setStyleSheet(folders_btn_style_dark)
             self.btn_attach_selected.setStyleSheet("""
                 QPushButton {
                     background-color: #10A37F;
@@ -2608,8 +2955,10 @@ class MainWindow(QMainWindow):
                     background-color: #f3f4f6;
                 }
             """
-            self.btn_new_folder.setStyleSheet(folders_btn_style_light)
-            self.btn_refresh_folders.setStyleSheet(folders_btn_style_light)
+            self.btn_new_project.setStyleSheet(folders_btn_style_light)
+            self.btn_collapse_all.setStyleSheet(folders_btn_style_light)
+            self.btn_expand_all.setStyleSheet(folders_btn_style_light)
+            self.btn_refresh_tree.setStyleSheet(folders_btn_style_light)
             self.btn_attach_selected.setStyleSheet("""
                 QPushButton {
                     background-color: #10A37F;
