@@ -21,11 +21,11 @@ from PyQt6.QtWidgets import (
     QGroupBox, QSizePolicy, QTreeView, QButtonGroup, QInputDialog,
     QHeaderView, QTabWidget, QTextBrowser, QStackedWidget
 )
-from PyQt6.QtCore import Qt, QUrl, QSize, QTimer, QBuffer
+from PyQt6.QtCore import Qt, QUrl, QSize, QTimer, QBuffer, QPoint, QRect
 from PyQt6.QtGui import (
     QFont, QPixmap, QAction, QDragEnterEvent, QDropEvent, 
     QTextCursor, QKeyEvent, QFileSystemModel, QStandardItemModel, QStandardItem,
-    QImage
+    QImage, QPainter, QPen, QColor
 )
 
 from .config import config
@@ -860,6 +860,88 @@ class ImageMessageWidget(QFrame):
             """)
 
 
+class PdfSelectionLabel(QLabel):
+    """QLabel для отображения PDF-страницы с возможностью выделения прямоугольником."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.selection_enabled = False
+        self._selecting = False
+        self._p1 = None
+        self._selection = None
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+
+    def set_selection_enabled(self, enabled: bool):
+        self.selection_enabled = enabled
+        self.setCursor(Qt.CursorShape.CrossCursor if enabled else Qt.CursorShape.ArrowCursor)
+        if not enabled:
+            self.clear_selection()
+        self.update()
+
+    def clear_selection(self):
+        self._selecting = False
+        self._p1 = None
+        self._selection = None
+        self.update()
+
+    def has_selection(self) -> bool:
+        return (
+            self._selection is not None
+            and not self._selection.isNull()
+            and self._selection.width() > 0
+            and self._selection.height() > 0
+        )
+
+    def selection_rect(self):
+        return self._selection
+
+    def mousePressEvent(self, event):
+        if not self.selection_enabled or event.button() != Qt.MouseButton.LeftButton:
+            return super().mousePressEvent(event)
+        self._selecting = True
+        self._p1 = event.position().toPoint()
+        self._selection = QRect(self._p1, self._p1)
+        self.update()
+
+    def mouseMoveEvent(self, event):
+        if not self.selection_enabled or not self._selecting or self._p1 is None:
+            return super().mouseMoveEvent(event)
+        p2 = event.position().toPoint()
+        self._selection = QRect(self._p1, p2).normalized()
+        self.update()
+
+    def mouseReleaseEvent(self, event):
+        if not self.selection_enabled or event.button() != Qt.MouseButton.LeftButton:
+            return super().mouseReleaseEvent(event)
+        self._selecting = False
+        if self._p1 is None:
+            return
+        p2 = event.position().toPoint()
+        rect = QRect(self._p1, p2).normalized()
+        # Минимальный размер, чтобы не ловить случайные клики
+        if rect.width() < 10 or rect.height() < 10:
+            self._selection = None
+        else:
+            bounded = rect.intersected(QRect(0, 0, self.width(), self.height()))
+            self._selection = bounded if not bounded.isNull() else None
+        self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if not self.selection_enabled or not self.has_selection():
+            return
+        rect = self._selection
+        if rect is None:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.fillRect(rect, QColor(0, 120, 212, 40))
+        pen = QPen(QColor(0, 120, 212, 220))
+        pen.setWidth(2)
+        painter.setPen(pen)
+        painter.drawRect(rect)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -884,6 +966,7 @@ class MainWindow(QMainWindow):
         self.current_pdf_path = None
         self.current_pdf_page = 0
         self.current_pdf_zoom = 1.0
+        self.current_pdf_qimage = None  # QImage текущей страницы (в рендер-разрешении)
         
         # Tree cache для lazy loading
         self.tree_node_items = {}  # node_id → (item, node_data)
@@ -899,6 +982,9 @@ class MainWindow(QMainWindow):
         self.detached_pdf_controls = None
         self.detached_lbl_pdf_page = None
         self.detached_lbl_pdf_zoom = None
+        self.detached_btn_pdf_select = None
+        self.detached_btn_pdf_add_crop = None
+        self.detached_btn_pdf_clear_sel = None
         
         # Меню
         self.menubar = self.menuBar()
@@ -1258,6 +1344,9 @@ class MainWindow(QMainWindow):
         self.lbl_pdf_zoom = QLabel("")
         self.btn_pdf_zoom_in = QPushButton("🔍+")
         self.btn_pdf_zoom_reset = QPushButton("100%")
+        self.btn_pdf_select = QPushButton("▭ Выделение")
+        self.btn_pdf_clear_sel = QPushButton("Сброс")
+        self.btn_pdf_add_crop = QPushButton("Добавить в чат")
 
         for b in (
             self.btn_pdf_first,
@@ -1267,6 +1356,9 @@ class MainWindow(QMainWindow):
             self.btn_pdf_zoom_out,
             self.btn_pdf_zoom_in,
             self.btn_pdf_zoom_reset,
+            self.btn_pdf_select,
+            self.btn_pdf_clear_sel,
+            self.btn_pdf_add_crop,
         ):
             b.setFixedHeight(26)
 
@@ -1283,6 +1375,10 @@ class MainWindow(QMainWindow):
         pdf_controls_layout.addWidget(self.lbl_pdf_zoom)
         pdf_controls_layout.addWidget(self.btn_pdf_zoom_in)
         pdf_controls_layout.addWidget(self.btn_pdf_zoom_reset)
+        pdf_controls_layout.addSpacing(10)
+        pdf_controls_layout.addWidget(self.btn_pdf_select)
+        pdf_controls_layout.addWidget(self.btn_pdf_clear_sel)
+        pdf_controls_layout.addWidget(self.btn_pdf_add_crop)
 
         self.pdf_controls.setVisible(False)
         right_layout.addWidget(self.pdf_controls)
@@ -1295,6 +1391,9 @@ class MainWindow(QMainWindow):
         self.btn_pdf_zoom_in.clicked.connect(lambda: self.on_pdf_navigation(QUrl("pdf://zoomin")))
         self.btn_pdf_zoom_out.clicked.connect(lambda: self.on_pdf_navigation(QUrl("pdf://zoomout")))
         self.btn_pdf_zoom_reset.clicked.connect(lambda: self.on_pdf_navigation(QUrl("pdf://zoomreset")))
+        self.btn_pdf_select.clicked.connect(lambda: self.toggle_pdf_selection("main"))
+        self.btn_pdf_clear_sel.clicked.connect(lambda: self.clear_pdf_selection("main"))
+        self.btn_pdf_add_crop.clicked.connect(lambda: self.add_pdf_selection_to_chat("main"))
         
         # Просмотрщик файлов (QTextBrowser для HTML/текста)
         self.file_viewer = QTextBrowser()
@@ -1303,7 +1402,7 @@ class MainWindow(QMainWindow):
         self.file_viewer.anchorClicked.connect(self.on_pdf_navigation)  # Подключаем обработчик навигации
 
         # PDF просмотрщик (нативный: QLabel в QScrollArea) — без HTML-масштабирования
-        self.pdf_label = QLabel()
+        self.pdf_label = PdfSelectionLabel()
         self.pdf_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.pdf_label.setScaledContents(False)
 
@@ -1481,6 +1580,17 @@ class MainWindow(QMainWindow):
         pdf_controls_layout.addWidget(btn_zoom_in)
         pdf_controls_layout.addWidget(btn_zoom_reset)
 
+        # Инструменты выделения/кропа
+        btn_select = QPushButton("▭ Выделение")
+        btn_clear_sel = QPushButton("Сброс")
+        btn_add_crop = QPushButton("Добавить в чат")
+        for b in (btn_select, btn_clear_sel, btn_add_crop):
+            b.setFixedHeight(26)
+        pdf_controls_layout.addSpacing(10)
+        pdf_controls_layout.addWidget(btn_select)
+        pdf_controls_layout.addWidget(btn_clear_sel)
+        pdf_controls_layout.addWidget(btn_add_crop)
+
         detached_pdf_controls.setVisible(False)
         layout.addWidget(detached_pdf_controls)
 
@@ -1492,6 +1602,9 @@ class MainWindow(QMainWindow):
         btn_zoom_in.clicked.connect(lambda: self.on_pdf_navigation(QUrl("pdf://zoomin")))
         btn_zoom_out.clicked.connect(lambda: self.on_pdf_navigation(QUrl("pdf://zoomout")))
         btn_zoom_reset.clicked.connect(lambda: self.on_pdf_navigation(QUrl("pdf://zoomreset")))
+        btn_select.clicked.connect(lambda: self.toggle_pdf_selection("detached"))
+        btn_clear_sel.clicked.connect(lambda: self.clear_pdf_selection("detached"))
+        btn_add_crop.clicked.connect(lambda: self.add_pdf_selection_to_chat("detached"))
 
         # ---- Текст/HTML просмотрщик ----
         detached_viewer = QTextBrowser()
@@ -1500,7 +1613,7 @@ class MainWindow(QMainWindow):
         detached_viewer.anchorClicked.connect(self.on_pdf_navigation)
 
         # ---- Нативный PDF просмотрщик ----
-        detached_pdf_label = QLabel()
+        detached_pdf_label = PdfSelectionLabel()
         detached_pdf_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         detached_pdf_label.setScaledContents(False)
 
@@ -1524,6 +1637,9 @@ class MainWindow(QMainWindow):
         self.detached_pdf_controls = detached_pdf_controls
         self.detached_lbl_pdf_page = lbl_page
         self.detached_lbl_pdf_zoom = lbl_zoom
+        self.detached_btn_pdf_select = btn_select
+        self.detached_btn_pdf_add_crop = btn_add_crop
+        self.detached_btn_pdf_clear_sel = btn_clear_sel
 
         # Первичная синхронизация с текущим состоянием правой панели
         try:
@@ -2720,7 +2836,9 @@ class MainWindow(QMainWindow):
             pix = page.get_pixmap(matrix=mat, alpha=False)
 
             img_data = pix.samples
-            qimg = QImage(img_data, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888)
+            # Важно: делаем copy(), чтобы QImage не ссылался на буфер pixmap после выхода из функции
+            qimg = QImage(img_data, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888).copy()
+            self.current_pdf_qimage = qimg
             pixmap = QPixmap.fromImage(qimg)
             pixmap.setDevicePixelRatio(device_pixel_ratio * quality_factor)
 
@@ -2784,6 +2902,104 @@ class MainWindow(QMainWindow):
             elif action == "zoomreset":
                 self.current_pdf_zoom = 1.0
                 self.render_pdf_page()
+
+    def _get_pdf_label_for_target(self, target: str):
+        if target == "detached":
+            return getattr(self, "detached_pdf_label", None)
+        return getattr(self, "pdf_label", None)
+
+    def _get_select_button_for_target(self, target: str):
+        if target == "detached":
+            return getattr(self, "detached_btn_pdf_select", None)
+        return getattr(self, "btn_pdf_select", None)
+
+    def toggle_pdf_selection(self, target: str = "main"):
+        """Включает/выключает режим выделения прямоугольником."""
+        lbl = self._get_pdf_label_for_target(target)
+        btn = self._get_select_button_for_target(target)
+        if lbl is None or not hasattr(lbl, "set_selection_enabled"):
+            return
+        enabled = not getattr(lbl, "selection_enabled", False)
+        lbl.set_selection_enabled(enabled)
+        if btn is not None:
+            btn.setText("✖ Выделение" if enabled else "▭ Выделение")
+
+    def clear_pdf_selection(self, target: str = "main"):
+        """Сбрасывает выделение."""
+        lbl = self._get_pdf_label_for_target(target)
+        if lbl is None or not hasattr(lbl, "clear_selection"):
+            return
+        lbl.clear_selection()
+
+    def add_pdf_selection_to_chat(self, target: str = "main"):
+        """
+        Сохраняет выделенный фрагмент PDF-страницы в PNG и добавляет в selected_md_files,
+        чтобы он ушёл в LLM через текущий механизм вложений.
+        """
+        lbl = self._get_pdf_label_for_target(target)
+        if lbl is None or not hasattr(lbl, "has_selection"):
+            self.log("❌ Выделение недоступно.")
+            return
+
+        if self.current_pdf_qimage is None:
+            self.log("❌ Нет изображения страницы для кропа.")
+            return
+
+        if not lbl.has_selection():
+            self.log("❌ Сначала выдели прямоугольником область на странице.")
+            return
+
+        sel = lbl.selection_rect()
+        if sel is None:
+            self.log("❌ Некорректное выделение.")
+            return
+
+        # Маппинг координат выделения (логические px на экране) -> пиксели QImage (рендер)
+        try:
+            disp_w = max(1, int(lbl.width()))
+            disp_h = max(1, int(lbl.height()))
+            src_w = int(self.current_pdf_qimage.width())
+            src_h = int(self.current_pdf_qimage.height())
+
+            scale_x = src_w / disp_w
+            scale_y = src_h / disp_h
+
+            x = int(sel.x() * scale_x)
+            y = int(sel.y() * scale_y)
+            w = int(sel.width() * scale_x)
+            h = int(sel.height() * scale_y)
+
+            # Клип по границам
+            x = max(0, min(x, src_w - 1))
+            y = max(0, min(y, src_h - 1))
+            w = max(1, min(w, src_w - x))
+            h = max(1, min(h, src_h - y))
+
+            crop_img = self.current_pdf_qimage.copy(x, y, w, h)
+        except Exception as e:
+            self.log(f"❌ Ошибка кропа: {e}")
+            return
+
+        # Сохраняем в файл
+        try:
+            out_dir = self.data_root / "user_crops"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            out_path = out_dir / f"pdf_crop_{ts}.png"
+            ok = crop_img.save(str(out_path), "PNG")
+            if not ok:
+                self.log("❌ Не удалось сохранить PNG.")
+                return
+        except Exception as e:
+            self.log(f"❌ Ошибка сохранения PNG: {e}")
+            return
+
+        # Добавляем в существующий механизм вложений
+        p = str(out_path)
+        if p not in self.selected_md_files:
+            self.selected_md_files.append(p)
+            self.update_file_indicator()
+        self.log(f"✅ Кроп добавлен во вложения: {out_path.name}")
     
     def close_viewer(self):
         """Очищает просмотрщик."""
@@ -2798,18 +3014,27 @@ class MainWindow(QMainWindow):
         self.file_viewer.clear()
         if hasattr(self, "pdf_label"):
             self.pdf_label.clear()
+            if hasattr(self.pdf_label, "clear_selection"):
+                self.pdf_label.clear_selection()
         if hasattr(self, "viewer_stack"):
             self.viewer_stack.setCurrentWidget(self.file_viewer)
         if hasattr(self, "pdf_controls"):
             self.pdf_controls.setVisible(False)
+            if hasattr(self, "btn_pdf_select"):
+                self.btn_pdf_select.setText("▭ Выделение")
         if getattr(self, "detached_viewer", None):
             self.detached_viewer.clear()
         if getattr(self, "detached_pdf_label", None):
             self.detached_pdf_label.clear()
+            if hasattr(self.detached_pdf_label, "clear_selection"):
+                self.detached_pdf_label.clear_selection()
         if getattr(self, "detached_viewer_stack", None) and getattr(self, "detached_viewer", None):
             self.detached_viewer_stack.setCurrentWidget(self.detached_viewer)
         if getattr(self, "detached_pdf_controls", None):
             self.detached_pdf_controls.setVisible(False)
+        if getattr(self, "detached_btn_pdf_select", None):
+            self.detached_btn_pdf_select.setText("▭ Выделение")
+        self.current_pdf_qimage = None
         self.viewer_label.setText("Просмотр документа")
 
 

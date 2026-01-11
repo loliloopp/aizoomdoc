@@ -40,6 +40,7 @@ ENV/
 data/chats/
 data/example/
 data/projects/
+data/user_crops
 temp/
 # *.jpg
 # *.png

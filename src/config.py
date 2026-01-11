@@ -31,6 +31,10 @@ class Config:
 
     # Параметры генерации
     MAX_TOKENS: int = int(os.getenv("MAX_TOKENS", "8192"))
+
+    # Ранее в коде использовался флаг USE_DATABASE. БД для чатов считается основной всегда,
+    # поэтому этот флаг не должен влиять на отправку запросов в модель. Оставляем для совместимости.
+    USE_DATABASE: bool = True
     
     # Пути к данным
     DATA_ROOT: Path = Path(os.getenv("DATA_ROOT", "./data"))

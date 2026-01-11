@@ -112,15 +112,16 @@ class AgentWorker(QThread):
         self._save_to_disk()
         
         # Сохранение в БД и S3
-        if config.USE_DATABASE:
+        # БД считается основной всегда, но работаем только если есть подключение
+        if supabase_client.is_connected():
             try:
-                # В БД модель пока не сохраняем (нет поля в схеме), 
+                # В БД модель пока не сохраняем (нет поля в схеме),
                 # но она есть в metadata чата (общая для чата)
                 db_role = role
                 if role == "system":
                     db_role = "assistant"
                     if not content.startswith("⚠️") and not content.startswith("SYSTEM ALERT:"):
-                         content = "SYSTEM ALERT: " + content
+                        content = "SYSTEM ALERT: " + content
 
                 asyncio.run(self._save_to_db(db_role, content, images, model=msg.get("model")))
             except Exception as e:
@@ -330,7 +331,7 @@ class AgentWorker(QThread):
             self._current_msg_id = None # Для привязки блоков к сообщению
             
             # 0. Инициализация чата в Supabase (только для новых чатов)
-            if config.USE_DATABASE and not self.db_chat_id:
+            if not self.db_chat_id and supabase_client.is_connected():
                 try:
                     title = self.query[:100]
                     self.db_chat_id = asyncio.run(supabase_client.create_chat(
@@ -544,8 +545,12 @@ class AgentWorker(QThread):
                                 ))
                             except: pass
             
-            if not full_text.strip():
-                raise ValueError("В чате нет прикрепленных документов для анализа. Прикрепите файлы (md, jpg, png, html, json).")
+            if not full_text.strip() and not attached_images:
+                raise ValueError("В чате нет прикрепленных документов для анализа. Прикрепите файлы (md, jpg, png, html, json) или изображения.")
+            
+            # Если есть только изображения без текста — это допустимо (например, кроп PDF)
+            if not full_text.strip() and attached_images:
+                self.sig_log.emit("⚠️ Нет текстового контекста, отправляю только изображения и запрос.")
 
             # 1. Читаем и регистрируем MD файлы
             full_md_text = ""
@@ -594,8 +599,34 @@ class AgentWorker(QThread):
                 except Exception as e:
                     self.sig_log.emit(f"Ошибка файла {md_path_str}: {e}")
 
-            if not full_md_text.strip():
-                raise ValueError("Нет текста документов для анализа.")
+            if not full_md_text.strip() and self.md_mode == "full":
+                # В режиме full требуем текст для индексации
+                if not full_text.strip():
+                    raise ValueError("Нет текста документов для анализа (режим full).")
+                # Используем full_text из первого прохода
+                full_md_text = full_text
+            
+            # Если нет текста, но есть изображения — это режим "только изображения"
+            only_images_mode = (not full_md_text.strip() and attached_images)
+            
+            if only_images_mode:
+                self.sig_log.emit("📷 Режим: Только изображения (без текстового контекста)")
+                # Пропускаем индексацию, сразу передаём запрос + изображения в LLM
+                context = f"ЗАПРОС ПОЛЬЗОВАТЕЛЯ:\n{self.query}\n\nОтветь на основе прикреплённых изображений."
+                
+                # Сохраняем сообщение пользователя
+                self.save_message("user", self.query, images=None)
+                
+                # Передаём изображения в LLM
+                llm_client.add_user_message(context, images=attached_images)
+                
+                # Получаем ответ
+                response = llm_client.get_response()
+                self.sig_message.emit("assistant", response, self.model)
+                self.save_message("assistant", response, images=None)
+                
+                self.sig_finished.emit()
+                return
 
             # ===== ПОДГОТОВКА КОНТЕКСТА =====
             

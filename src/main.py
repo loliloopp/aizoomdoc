@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 async def save_to_db(chat_id: str, role: str, content: str, images: list = None):
     """Хелпер для сохранения в БД из CLI."""
-    if not config.USE_DATABASE or not chat_id:
+    if not chat_id:
         return None
     
     msg_id = await supabase_client.add_message(chat_id, role, content)
@@ -69,7 +69,7 @@ def run_agent_loop(data_root: Path, user_query: str, model: str = None) -> str:
     llm_client = LLMClient(model=model, data_root=data_root)
     
     db_chat_id = None
-    if config.USE_DATABASE:
+    if supabase_client.is_connected():
         db_chat_id = asyncio.run(supabase_client.create_chat(
             title=user_query[:100],
             user_id="cli_user",
