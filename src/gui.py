@@ -885,6 +885,11 @@ class MainWindow(QMainWindow):
         self.current_pdf_page = 0
         self.current_pdf_zoom = 1.0
         
+        # Tree cache для lazy loading
+        self.tree_node_items = {}  # node_id → (item, node_data)
+        self.tree_loaded_results = set()  # node_id для которых уже загружены результаты
+        self.tree_is_loaded = False  # Флаг первой загрузки дерева
+        
         # Меню
         self.menubar = self.menuBar()
         settings_menu = self.menubar.addMenu("Настройки")
@@ -1064,6 +1069,7 @@ class MainWindow(QMainWindow):
         self.tree_folders.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tree_folders.customContextMenuRequested.connect(self.show_tree_context_menu)
         self.tree_folders.setSelectionMode(QTreeView.SelectionMode.ExtendedSelection)
+        self.tree_folders.expanded.connect(self.on_tree_node_expanded)  # Lazy loading результатов
         
         # Логическая модель
         self.logical_model = QStandardItemModel()
@@ -1753,12 +1759,23 @@ class MainWindow(QMainWindow):
             self.folders_widget.setVisible(True)
             self.btn_tab_chats.setChecked(False)
             self.btn_tab_folders.setChecked(True)
-            # Обновляем дерево проектов при переключении
-            self.refresh_projects_tree()
+            # Загружаем дерево только при первом открытии
+            if not self.tree_is_loaded:
+                self.refresh_projects_tree()
+                self.tree_is_loaded = True
 
-    def refresh_projects_tree(self):
-        """Обновляет дерево проектов из tree_nodes (БД Projects)."""
+    def refresh_projects_tree(self, force=False):
+        """Обновляет дерево проектов из tree_nodes (БД Projects).
+        
+        Args:
+            force: Принудительное обновление (игнорировать кэш)
+        """
+        # Если дерево уже загружено и не force - пропускаем
+        if self.tree_is_loaded and not force:
+            return
+        
         self.logical_model.clear()
+        self.tree_loaded_results.clear()  # Сброс кэша результатов
         
         if not supabase_projects_client.is_connected():
             item = QStandardItem("⚠️ Supabase Projects не подключен")
@@ -1804,13 +1821,11 @@ class MainWindow(QMainWindow):
             
             self.log(f"📁 Корневых проектов: {root_count}")
             
-            # 4. Для документов добавить результаты парсинга
-            documents_count = 0
-            for node_id, (item, node) in node_items.items():
-                if node['node_type'] == 'document':
-                    documents_count += 1
-                    self.add_document_results_to_tree(item, node_id)
+            # 4. ОТЛОЖЕННАЯ ЗАГРУЗКА: результаты парсинга будут загружаться при раскрытии
+            # Сохраняем словарь узлов для быстрого доступа
+            self.tree_node_items = node_items
             
+            documents_count = sum(1 for node in nodes if node['node_type'] == 'document')
             self.log(f"📄 Документов: {documents_count}")
             
             # 5. Развернуть проекты первого уровня
@@ -1821,7 +1836,7 @@ class MainWindow(QMainWindow):
             # 6. Обновить счетчики
             self.update_tree_statistics(nodes)
             
-            self.log("✅ Дерево проектов обновлено")
+            self.log("✅ Дерево проектов обновлено (быстрая загрузка)")
             
         except Exception as e:
             self.log(f"❌ Ошибка обновления дерева: {e}")
@@ -1832,6 +1847,28 @@ class MainWindow(QMainWindow):
             item.setEnabled(False)
             self.logical_model.appendRow(item)
 
+    def on_tree_node_expanded(self, index):
+        """Ленивая загрузка результатов парсинга при раскрытии узла документа."""
+        item = self.logical_model.itemFromIndex(index)
+        if not item:
+            return
+        
+        # Получаем данные узла
+        node_data = item.data(Qt.ItemDataRole.UserRole + 2)
+        if not node_data or node_data.get('node_type') != 'document':
+            return
+        
+        node_id = node_data.get('id')
+        if not node_id or node_id in self.tree_loaded_results:
+            return  # Уже загружены
+        
+        # Загружаем результаты
+        try:
+            self.add_document_results_to_tree(item, node_id)
+            self.tree_loaded_results.add(node_id)
+        except Exception as e:
+            logger.error(f"Ошибка загрузки результатов для {node_id}: {e}")
+    
     def create_tree_item_for_project(self, node: Dict) -> QStandardItem:
         """Создает элемент дерева с иконкой, кодом и названием."""
         node_type = node['node_type']
@@ -1931,13 +1968,13 @@ class MainWindow(QMainWindow):
         projects_count = sum(1 for n in nodes if n['node_type'] == 'project')
         pdf_count = sum(1 for n in nodes if n['node_type'] == 'document')
         
-        # Подсчет обработанных документов (с результатами)
-        md_count = 0
-        for node in nodes:
-            if node['node_type'] == 'document':
-                jobs = self.run_async(supabase_projects_client.get_document_jobs(node['id']))
-                if any(j.get('status') == 'completed' for j in jobs):
-                    md_count += 1
+        # Подсчет обработанных документов (с результатами) - УБРАНО для скорости
+        # md_count = 0
+        # for node in nodes:
+        #     if node['node_type'] == 'document':
+        #         jobs = self.run_async(supabase_projects_client.get_document_jobs(node['id']))
+        #         if any(j.get('status') == 'completed' for j in jobs):
+        #             md_count += 1
         
         # Подсчет папок с PDF
         folders_with_pdf = set()
@@ -1948,7 +1985,8 @@ class MainWindow(QMainWindow):
                     folders_with_pdf.add(parent_id)
         
         self.tree_stats_label.setText(
-            f"Проектов: {projects_count} | PDF: {pdf_count} | MD: {md_count} | Папок с PDF: {len(folders_with_pdf)}"
+            f"Проектов: {projects_count} | Документов: {pdf_count} | "
+            f"Папок с документами: {len(folders_with_pdf)}"
         )
 
     def filter_tree(self, search_text: str):
