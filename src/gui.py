@@ -2489,21 +2489,47 @@ class MainWindow(QMainWindow):
                 return
             
             page = self.current_pdf_doc[self.current_pdf_page]
-            
-            # Рендерим страницу с учетом зума
-            mat = fitz.Matrix(self.current_pdf_zoom * 2, self.current_pdf_zoom * 2)  # *2 для лучшего качества
-            pix = page.get_pixmap(matrix=mat)
-            
+
+            # Цель:
+            # - 100% должен совпадать по размеру с типовым PDF-просмотрщиком на Windows (96 DPI)
+            # - качество должно быть как в внешнем вьювере (сглаживание/антиалиас)
+            #
+            # Решение:
+            # - считаем целевой размер в пикселях на 96 DPI
+            # - рендерим в 2x DPI (суперсэмплинг)
+            # - даунскейлим в целевой размер через SmoothTransformation
+
+            page_rect = page.rect  # в pt (72 pt = 1 inch)
+            page_width_pt = page_rect.width
+            page_height_pt = page_rect.height
+
+            display_dpi = 96  # как в Windows / типовых PDF-вьюверах
+            target_width = max(1, int(page_width_pt * display_dpi / 72 * self.current_pdf_zoom))
+            target_height = max(1, int(page_height_pt * display_dpi / 72 * self.current_pdf_zoom))
+
+            supersample = 2
+            render_dpi = display_dpi * supersample
+            mat = fitz.Matrix((render_dpi / 72) * self.current_pdf_zoom, (render_dpi / 72) * self.current_pdf_zoom)
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+
             # Конвертируем в QImage
             img_data = pix.samples
             qimg = QImage(img_data, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888)
-            
-            # Сохраняем во временный файл с уникальным именем для предотвращения кэширования
+
+            # Даунскейл до целевого размера (без HTML/CSS масштабирования)
+            qimg_final = qimg.scaled(
+                target_width,
+                target_height,
+                Qt.AspectRatioMode.IgnoreAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+
+            # Сохраняем во временный файл с уникальным именем (против кэша)
             import tempfile
             import time
-            timestamp = int(time.time() * 1000)  # Уникальный timestamp
+            timestamp = int(time.time() * 1000)
             temp_img = Path(tempfile.gettempdir()) / f"aizoomdoc_pdf_preview_{timestamp}.png"
-            qimg.save(str(temp_img))
+            qimg_final.save(str(temp_img), "PNG", 100)
             
             # Создаем HTML с изображением и кнопками навигации
             page_num = self.current_pdf_page + 1
@@ -2565,6 +2591,8 @@ class MainWindow(QMainWindow):
                         display: block;
                         margin: 0 auto;
                         box-shadow: 0 0 20px rgba(0,0,0,0.5);
+                        /* не задаём width/height, чтобы не было браузерного масштабирования */
+                        image-rendering: auto;
                     }}
                 </style>
             </head>
