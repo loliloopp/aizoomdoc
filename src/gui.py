@@ -19,9 +19,9 @@ from PyQt6.QtWidgets import (
     QListWidget, QListWidgetItem, QFrame, QScrollArea, QProgressBar,
     QFileDialog, QMenuBar, QMenu, QDialog, QDialogButtonBox, QMessageBox,
     QGroupBox, QSizePolicy, QTreeView, QButtonGroup, QInputDialog,
-    QHeaderView, QTabWidget, QTextBrowser
+    QHeaderView, QTabWidget, QTextBrowser, QStackedWidget
 )
-from PyQt6.QtCore import Qt, QUrl, QSize, QTimer
+from PyQt6.QtCore import Qt, QUrl, QSize, QTimer, QBuffer
 from PyQt6.QtGui import (
     QFont, QPixmap, QAction, QDragEnterEvent, QDropEvent, 
     QTextCursor, QKeyEvent, QFileSystemModel, QStandardItemModel, QStandardItem,
@@ -892,7 +892,13 @@ class MainWindow(QMainWindow):
         
         # Detached viewer
         self.detached_viewer_window = None
-        self.detached_viewer = None
+        self.detached_viewer = None  # QTextBrowser (html/text) в откреплённом окне
+        self.detached_viewer_stack = None
+        self.detached_pdf_scroll = None
+        self.detached_pdf_label = None
+        self.detached_pdf_controls = None
+        self.detached_lbl_pdf_page = None
+        self.detached_lbl_pdf_zoom = None
         
         # Меню
         self.menubar = self.menuBar()
@@ -1235,13 +1241,83 @@ class MainWindow(QMainWindow):
         self.btn_close_viewer.clicked.connect(self.close_viewer)
         viewer_header.addWidget(self.btn_close_viewer)
         right_layout.addLayout(viewer_header)
+
+        # PDF панель управления (показываем только в режиме PDF)
+        self.pdf_controls = QFrame()
+        pdf_controls_layout = QHBoxLayout(self.pdf_controls)
+        pdf_controls_layout.setContentsMargins(0, 0, 0, 0)
+        pdf_controls_layout.setSpacing(6)
+
+        self.btn_pdf_first = QPushButton("⏮")
+        self.btn_pdf_prev = QPushButton("◀")
+        self.lbl_pdf_page = QLabel("")
+        self.btn_pdf_next = QPushButton("▶")
+        self.btn_pdf_last = QPushButton("⏭")
+
+        self.btn_pdf_zoom_out = QPushButton("🔍-")
+        self.lbl_pdf_zoom = QLabel("")
+        self.btn_pdf_zoom_in = QPushButton("🔍+")
+        self.btn_pdf_zoom_reset = QPushButton("100%")
+
+        for b in (
+            self.btn_pdf_first,
+            self.btn_pdf_prev,
+            self.btn_pdf_next,
+            self.btn_pdf_last,
+            self.btn_pdf_zoom_out,
+            self.btn_pdf_zoom_in,
+            self.btn_pdf_zoom_reset,
+        ):
+            b.setFixedHeight(26)
+
+        self.lbl_pdf_page.setStyleSheet("color: #aaa;")
+        self.lbl_pdf_zoom.setStyleSheet("color: #aaa;")
+
+        pdf_controls_layout.addWidget(self.btn_pdf_first)
+        pdf_controls_layout.addWidget(self.btn_pdf_prev)
+        pdf_controls_layout.addWidget(self.lbl_pdf_page)
+        pdf_controls_layout.addWidget(self.btn_pdf_next)
+        pdf_controls_layout.addWidget(self.btn_pdf_last)
+        pdf_controls_layout.addStretch()
+        pdf_controls_layout.addWidget(self.btn_pdf_zoom_out)
+        pdf_controls_layout.addWidget(self.lbl_pdf_zoom)
+        pdf_controls_layout.addWidget(self.btn_pdf_zoom_in)
+        pdf_controls_layout.addWidget(self.btn_pdf_zoom_reset)
+
+        self.pdf_controls.setVisible(False)
+        right_layout.addWidget(self.pdf_controls)
+
+        # Привязка кнопок PDF к существующей логике навигации
+        self.btn_pdf_first.clicked.connect(lambda: self.on_pdf_navigation(QUrl("pdf://first")))
+        self.btn_pdf_prev.clicked.connect(lambda: self.on_pdf_navigation(QUrl("pdf://prev")))
+        self.btn_pdf_next.clicked.connect(lambda: self.on_pdf_navigation(QUrl("pdf://next")))
+        self.btn_pdf_last.clicked.connect(lambda: self.on_pdf_navigation(QUrl("pdf://last")))
+        self.btn_pdf_zoom_in.clicked.connect(lambda: self.on_pdf_navigation(QUrl("pdf://zoomin")))
+        self.btn_pdf_zoom_out.clicked.connect(lambda: self.on_pdf_navigation(QUrl("pdf://zoomout")))
+        self.btn_pdf_zoom_reset.clicked.connect(lambda: self.on_pdf_navigation(QUrl("pdf://zoomreset")))
         
-        # Просмотрщик файлов (QTextBrowser для поддержки HTML и навигации)
+        # Просмотрщик файлов (QTextBrowser для HTML/текста)
         self.file_viewer = QTextBrowser()
         self.file_viewer.setReadOnly(True)
         self.file_viewer.setOpenLinks(False)  # Обрабатываем клики сами
         self.file_viewer.anchorClicked.connect(self.on_pdf_navigation)  # Подключаем обработчик навигации
-        right_layout.addWidget(self.file_viewer)
+
+        # PDF просмотрщик (нативный: QLabel в QScrollArea) — без HTML-масштабирования
+        self.pdf_label = QLabel()
+        self.pdf_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.pdf_label.setScaledContents(False)
+
+        self.pdf_scroll = QScrollArea()
+        self.pdf_scroll.setWidget(self.pdf_label)
+        self.pdf_scroll.setWidgetResizable(False)
+        self.pdf_scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        # Переключатель режимов: обычный просмотр / PDF
+        self.viewer_stack = QStackedWidget()
+        self.viewer_stack.addWidget(self.file_viewer)
+        self.viewer_stack.addWidget(self.pdf_scroll)
+        self.viewer_stack.setCurrentWidget(self.file_viewer)
+        right_layout.addWidget(self.viewer_stack)
         
         # Прогресс бар (оставляем для загрузки)
         self.progress = QProgressBar()
@@ -1363,33 +1439,116 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
         
-        # Создаём новый вьювер для открепленного окна
+        # ---- PDF панель управления (только для PDF-режима) ----
+        detached_pdf_controls = QFrame()
+        pdf_controls_layout = QHBoxLayout(detached_pdf_controls)
+        pdf_controls_layout.setContentsMargins(8, 8, 8, 8)
+        pdf_controls_layout.setSpacing(6)
+
+        btn_first = QPushButton("⏮")
+        btn_prev = QPushButton("◀")
+        lbl_page = QLabel("")
+        btn_next = QPushButton("▶")
+        btn_last = QPushButton("⏭")
+
+        btn_zoom_out = QPushButton("🔍-")
+        lbl_zoom = QLabel("")
+        btn_zoom_in = QPushButton("🔍+")
+        btn_zoom_reset = QPushButton("100%")
+
+        for b in (
+            btn_first,
+            btn_prev,
+            btn_next,
+            btn_last,
+            btn_zoom_out,
+            btn_zoom_in,
+            btn_zoom_reset,
+        ):
+            b.setFixedHeight(26)
+
+        lbl_page.setStyleSheet("color: #aaa;")
+        lbl_zoom.setStyleSheet("color: #aaa;")
+
+        pdf_controls_layout.addWidget(btn_first)
+        pdf_controls_layout.addWidget(btn_prev)
+        pdf_controls_layout.addWidget(lbl_page)
+        pdf_controls_layout.addWidget(btn_next)
+        pdf_controls_layout.addWidget(btn_last)
+        pdf_controls_layout.addStretch()
+        pdf_controls_layout.addWidget(btn_zoom_out)
+        pdf_controls_layout.addWidget(lbl_zoom)
+        pdf_controls_layout.addWidget(btn_zoom_in)
+        pdf_controls_layout.addWidget(btn_zoom_reset)
+
+        detached_pdf_controls.setVisible(False)
+        layout.addWidget(detached_pdf_controls)
+
+        # Привязка кнопок к текущей логике навигации
+        btn_first.clicked.connect(lambda: self.on_pdf_navigation(QUrl("pdf://first")))
+        btn_prev.clicked.connect(lambda: self.on_pdf_navigation(QUrl("pdf://prev")))
+        btn_next.clicked.connect(lambda: self.on_pdf_navigation(QUrl("pdf://next")))
+        btn_last.clicked.connect(lambda: self.on_pdf_navigation(QUrl("pdf://last")))
+        btn_zoom_in.clicked.connect(lambda: self.on_pdf_navigation(QUrl("pdf://zoomin")))
+        btn_zoom_out.clicked.connect(lambda: self.on_pdf_navigation(QUrl("pdf://zoomout")))
+        btn_zoom_reset.clicked.connect(lambda: self.on_pdf_navigation(QUrl("pdf://zoomreset")))
+
+        # ---- Текст/HTML просмотрщик ----
         detached_viewer = QTextBrowser()
         detached_viewer.setReadOnly(True)
         detached_viewer.setOpenLinks(False)
         detached_viewer.anchorClicked.connect(self.on_pdf_navigation)
-        
-        # Копируем текущее содержимое
-        if hasattr(self.file_viewer, 'toHtml'):
-            detached_viewer.setHtml(self.file_viewer.toHtml())
-        
-        layout.addWidget(detached_viewer)
-        
+
+        # ---- Нативный PDF просмотрщик ----
+        detached_pdf_label = QLabel()
+        detached_pdf_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        detached_pdf_label.setScaledContents(False)
+
+        detached_pdf_scroll = QScrollArea()
+        detached_pdf_scroll.setWidget(detached_pdf_label)
+        detached_pdf_scroll.setWidgetResizable(False)
+        detached_pdf_scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        # ---- Стек режимов ----
+        detached_stack = QStackedWidget()
+        detached_stack.addWidget(detached_viewer)
+        detached_stack.addWidget(detached_pdf_scroll)
+        detached_stack.setCurrentWidget(detached_viewer)
+        layout.addWidget(detached_stack)
+
         # Сохраняем ссылки
         self.detached_viewer = detached_viewer
-        
-        # Синхронизируем при изменении основного вьювера
-        def sync_viewer():
-            if hasattr(self, 'detached_viewer') and self.detached_viewer:
+        self.detached_viewer_stack = detached_stack
+        self.detached_pdf_scroll = detached_pdf_scroll
+        self.detached_pdf_label = detached_pdf_label
+        self.detached_pdf_controls = detached_pdf_controls
+        self.detached_lbl_pdf_page = lbl_page
+        self.detached_lbl_pdf_zoom = lbl_zoom
+
+        # Первичная синхронизация с текущим состоянием правой панели
+        try:
+            if hasattr(self, 'current_pdf_doc') and self.current_pdf_doc is not None:
+                self.detached_viewer_stack.setCurrentWidget(self.detached_pdf_scroll)
+                self.detached_pdf_controls.setVisible(True)
+                self.render_pdf_page()
+            else:
                 if hasattr(self.file_viewer, 'toHtml'):
                     self.detached_viewer.setHtml(self.file_viewer.toHtml())
-        
-        self.file_viewer.textChanged.connect(sync_viewer)
+                self.detached_viewer_stack.setCurrentWidget(self.detached_viewer)
+                self.detached_pdf_controls.setVisible(False)
+        except Exception:
+            pass
         
         # При закрытии окна
         def on_close():
             self.detached_viewer_window = None
             self.detached_viewer = None
+            self.detached_viewer_stack = None
+            self.detached_pdf_scroll = None
+            self.detached_pdf_label = None
+            self.detached_pdf_controls = None
+            self.detached_lbl_pdf_page = None
+            self.detached_lbl_pdf_zoom = None
         
         self.detached_viewer_window.finished.connect(on_close)
         self.detached_viewer_window.show()
@@ -2446,26 +2605,54 @@ class MainWindow(QMainWindow):
                 # HTML файлы
                 with open(file_path, 'r', encoding='utf-8') as f:
                     html_content = f.read()
+                self.viewer_stack.setCurrentWidget(self.file_viewer)
+                self.pdf_controls.setVisible(False)
                 self.file_viewer.setHtml(html_content)
                 self.viewer_label.setText(f"📄 {file_name}")
+                if getattr(self, "detached_viewer_stack", None) and getattr(self, "detached_viewer", None):
+                    self.detached_viewer_stack.setCurrentWidget(self.detached_viewer)
+                    if getattr(self, "detached_pdf_controls", None):
+                        self.detached_pdf_controls.setVisible(False)
+                    self.detached_viewer.setHtml(html_content)
                 
             elif file_type in ['result_json', 'result_md'] or file_name.endswith(('.json', '.md', '.txt')):
                 # Текстовые файлы
                 with open(file_path, 'r', encoding='utf-8') as f:
                     text_content = f.read()
+                self.viewer_stack.setCurrentWidget(self.file_viewer)
+                self.pdf_controls.setVisible(False)
                 self.file_viewer.setPlainText(text_content)
                 self.viewer_label.setText(f"📄 {file_name}")
+                if getattr(self, "detached_viewer_stack", None) and getattr(self, "detached_viewer", None):
+                    self.detached_viewer_stack.setCurrentWidget(self.detached_viewer)
+                    if getattr(self, "detached_pdf_controls", None):
+                        self.detached_pdf_controls.setVisible(False)
+                    self.detached_viewer.setPlainText(text_content)
                 
             elif file_name.endswith('.pdf'):
                 # PDF - рендерим и показываем в вьювере
                 self.display_pdf_in_viewer(file_path, file_name)
             else:
+                self.viewer_stack.setCurrentWidget(self.file_viewer)
+                self.pdf_controls.setVisible(False)
                 self.file_viewer.setPlainText(f"Неподдерживаемый тип файла: {file_name}")
                 self.viewer_label.setText(f"❓ {file_name}")
+                if getattr(self, "detached_viewer_stack", None) and getattr(self, "detached_viewer", None):
+                    self.detached_viewer_stack.setCurrentWidget(self.detached_viewer)
+                    if getattr(self, "detached_pdf_controls", None):
+                        self.detached_pdf_controls.setVisible(False)
+                    self.detached_viewer.setPlainText(f"Неподдерживаемый тип файла: {file_name}")
                 
         except Exception as e:
+            self.viewer_stack.setCurrentWidget(self.file_viewer)
+            self.pdf_controls.setVisible(False)
             self.file_viewer.setPlainText(f"Ошибка отображения файла:\n{e}")
             self.viewer_label.setText("❌ Ошибка")
+            if getattr(self, "detached_viewer_stack", None) and getattr(self, "detached_viewer", None):
+                self.detached_viewer_stack.setCurrentWidget(self.detached_viewer)
+                if getattr(self, "detached_pdf_controls", None):
+                    self.detached_pdf_controls.setVisible(False)
+                self.detached_viewer.setPlainText(f"Ошибка отображения файла:\n{e}")
     
     def display_pdf_in_viewer(self, file_path: Path, file_name: str):
         """Отображает PDF в просмотрщике с навигацией и зумом."""
@@ -2475,12 +2662,27 @@ class MainWindow(QMainWindow):
             self.current_pdf_page = 0
             self.current_pdf_zoom = 1.0
             
-            # Создаем HTML с PDF страницей и панелью управления
+            # Переключаемся в PDF-режим
+            self.viewer_stack.setCurrentWidget(self.pdf_scroll)
+            self.pdf_controls.setVisible(True)
+            if getattr(self, "detached_viewer_stack", None) and getattr(self, "detached_pdf_scroll", None):
+                self.detached_viewer_stack.setCurrentWidget(self.detached_pdf_scroll)
+                if getattr(self, "detached_pdf_controls", None):
+                    self.detached_pdf_controls.setVisible(True)
+            
+            # Рендерим первую страницу
             self.render_pdf_page()
             
         except Exception as e:
+            self.viewer_stack.setCurrentWidget(self.file_viewer)
+            self.pdf_controls.setVisible(False)
             self.file_viewer.setPlainText(f"Ошибка открытия PDF:\n{e}")
             self.viewer_label.setText("❌ Ошибка PDF")
+            if getattr(self, "detached_viewer_stack", None) and getattr(self, "detached_viewer", None):
+                self.detached_viewer_stack.setCurrentWidget(self.detached_viewer)
+                if getattr(self, "detached_pdf_controls", None):
+                    self.detached_pdf_controls.setVisible(False)
+                self.detached_viewer.setPlainText(f"Ошибка открытия PDF:\n{e}")
     
     def render_pdf_page(self):
         """Рендерит текущую страницу PDF."""
@@ -2503,125 +2705,57 @@ class MainWindow(QMainWindow):
             page_width_pt = page_rect.width
             page_height_pt = page_rect.height
 
-            display_dpi = 96  # как в Windows / типовых PDF-вьюверах
-            target_width = max(1, int(page_width_pt * display_dpi / 72 * self.current_pdf_zoom))
-            target_height = max(1, int(page_height_pt * display_dpi / 72 * self.current_pdf_zoom))
+            # Рендерим в повышенном разрешении, но показываем 1:1 (как у PDF-вьюверов)
+            # Идея: рендерим в quality_factor * devicePixelRatio, а затем задаём pixmap.devicePixelRatio,
+            # чтобы на экране размер остался тем же, но пикселей стало больше (резче текст).
+            device_pixel_ratio = self.screen().devicePixelRatio() if self.screen() else 1.0
+            base_dpi = 96
+            quality_factor = 2.0
+            render_dpi = base_dpi * device_pixel_ratio * quality_factor
 
-            supersample = 2
-            render_dpi = display_dpi * supersample
-            mat = fitz.Matrix((render_dpi / 72) * self.current_pdf_zoom, (render_dpi / 72) * self.current_pdf_zoom)
+            fitz.TOOLS.set_aa_level(8)  # максимальный антиалиасинг
+
+            scale = (render_dpi / 72) * self.current_pdf_zoom
+            mat = fitz.Matrix(scale, scale)
             pix = page.get_pixmap(matrix=mat, alpha=False)
 
-            # Конвертируем в QImage
             img_data = pix.samples
             qimg = QImage(img_data, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888)
+            pixmap = QPixmap.fromImage(qimg)
+            pixmap.setDevicePixelRatio(device_pixel_ratio * quality_factor)
 
-            # Даунскейл до целевого размера (без HTML/CSS масштабирования)
-            qimg_final = qimg.scaled(
-                target_width,
-                target_height,
-                Qt.AspectRatioMode.IgnoreAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
+            # Важно: показываем без масштабирования QLabel'ом (только скролл)
+            self.pdf_label.setPixmap(pixmap)
+            w = int(pixmap.width() / pixmap.devicePixelRatio())
+            h = int(pixmap.height() / pixmap.devicePixelRatio())
+            self.pdf_label.setFixedSize(w, h)
+            if getattr(self, "detached_pdf_label", None):
+                self.detached_pdf_label.setPixmap(pixmap)
+                self.detached_pdf_label.setFixedSize(w, h)
 
-            # Сохраняем во временный файл с уникальным именем (против кэша)
-            import tempfile
-            import time
-            timestamp = int(time.time() * 1000)
-            temp_img = Path(tempfile.gettempdir()) / f"aizoomdoc_pdf_preview_{timestamp}.png"
-            qimg_final.save(str(temp_img), "PNG", 100)
-            
-            # Создаем HTML с изображением и кнопками навигации
             page_num = self.current_pdf_page + 1
             total_pages = len(self.current_pdf_doc)
             zoom_percent = int(self.current_pdf_zoom * 100)
-            
-            html = f"""
-            <html>
-            <head>
-                <style>
-                    body {{
-                        margin: 0;
-                        padding: 10px;
-                        background: #2b2b2b;
-                        color: #fff;
-                        font-family: Arial;
-                    }}
-                    .controls {{
-                        position: sticky;
-                        top: 0;
-                        background: #1e1e1e;
-                        padding: 10px;
-                        border-radius: 5px;
-                        margin-bottom: 10px;
-                        text-align: center;
-                        z-index: 100;
-                    }}
-                    .btn {{
-                        display: inline-block;
-                        background: #0078d4;
-                        color: white;
-                        border: none;
-                        padding: 8px 15px;
-                        margin: 0 3px;
-                        border-radius: 3px;
-                        cursor: pointer;
-                        font-size: 14px;
-                        text-decoration: none;
-                    }}
-                    .btn:hover {{
-                        background: #106ebe;
-                    }}
-                    .btn.disabled {{
-                        background: #555;
-                        cursor: not-allowed;
-                        pointer-events: none;
-                    }}
-                    .info {{
-                        display: inline-block;
-                        margin: 0 15px;
-                        color: #aaa;
-                    }}
-                    .pdf-container {{
-                        text-align: center;
-                        overflow: auto;
-                        max-height: calc(100vh - 80px);
-                    }}
-                    img {{
-                        display: block;
-                        margin: 0 auto;
-                        box-shadow: 0 0 20px rgba(0,0,0,0.5);
-                        /* не задаём width/height, чтобы не было браузерного масштабирования */
-                        image-rendering: auto;
-                    }}
-                </style>
-            </head>
-            <body>
-                <div class="controls">
-                    <a class="btn {'disabled' if self.current_pdf_page == 0 else ''}" href="pdf://first">⏮ Первая</a>
-                    <a class="btn {'disabled' if self.current_pdf_page == 0 else ''}" href="pdf://prev">◀ Назад</a>
-                    <span class="info">Страница {page_num} / {total_pages}</span>
-                    <a class="btn {'disabled' if self.current_pdf_page >= total_pages - 1 else ''}" href="pdf://next">Вперед ▶</a>
-                    <a class="btn {'disabled' if self.current_pdf_page >= total_pages - 1 else ''}" href="pdf://last">Последняя ⏭</a>
-                    <span style="margin: 0 10px;">|</span>
-                    <a class="btn" href="pdf://zoomout">🔍-</a>
-                    <span class="info">{zoom_percent}%</span>
-                    <a class="btn" href="pdf://zoomin">🔍+</a>
-                    <a class="btn" href="pdf://zoomreset">100%</a>
-                </div>
-                <div class="pdf-container">
-                    <img src="file:///{temp_img.as_posix()}" />
-                </div>
-            </body>
-            </html>
-            """
-            
-            self.file_viewer.setHtml(html)
+
+            self.lbl_pdf_page.setText(f"Стр. {page_num} / {total_pages}")
+            self.lbl_pdf_zoom.setText(f"{zoom_percent}%")
+            if getattr(self, "detached_lbl_pdf_page", None):
+                self.detached_lbl_pdf_page.setText(f"Стр. {page_num} / {total_pages}")
+            if getattr(self, "detached_lbl_pdf_zoom", None):
+                self.detached_lbl_pdf_zoom.setText(f"{zoom_percent}%")
+
             self.viewer_label.setText(f"📑 {self.current_pdf_path.name} — Стр. {page_num}/{total_pages} — {zoom_percent}%")
             
         except Exception as e:
+            self.viewer_stack.setCurrentWidget(self.file_viewer)
+            self.pdf_controls.setVisible(False)
             self.file_viewer.setPlainText(f"Ошибка рендеринга PDF:\n{e}")
             logger.error(f"PDF render error: {e}")
+            if getattr(self, "detached_viewer_stack", None) and getattr(self, "detached_viewer", None):
+                self.detached_viewer_stack.setCurrentWidget(self.detached_viewer)
+                if getattr(self, "detached_pdf_controls", None):
+                    self.detached_pdf_controls.setVisible(False)
+                self.detached_viewer.setPlainText(f"Ошибка рендеринга PDF:\n{e}")
     
     def on_pdf_navigation(self, url: QUrl):
         """Обработка навигации по PDF."""
@@ -2662,6 +2796,20 @@ class MainWindow(QMainWindow):
             self.current_pdf_zoom = 1.0
         
         self.file_viewer.clear()
+        if hasattr(self, "pdf_label"):
+            self.pdf_label.clear()
+        if hasattr(self, "viewer_stack"):
+            self.viewer_stack.setCurrentWidget(self.file_viewer)
+        if hasattr(self, "pdf_controls"):
+            self.pdf_controls.setVisible(False)
+        if getattr(self, "detached_viewer", None):
+            self.detached_viewer.clear()
+        if getattr(self, "detached_pdf_label", None):
+            self.detached_pdf_label.clear()
+        if getattr(self, "detached_viewer_stack", None) and getattr(self, "detached_viewer", None):
+            self.detached_viewer_stack.setCurrentWidget(self.detached_viewer)
+        if getattr(self, "detached_pdf_controls", None):
+            self.detached_pdf_controls.setVisible(False)
         self.viewer_label.setText("Просмотр документа")
 
 
