@@ -890,6 +890,10 @@ class MainWindow(QMainWindow):
         self.tree_loaded_results = set()  # node_id для которых уже загружены результаты
         self.tree_is_loaded = False  # Флаг первой загрузки дерева
         
+        # Detached viewer
+        self.detached_viewer_window = None
+        self.detached_viewer = None
+        
         # Меню
         self.menubar = self.menuBar()
         settings_menu = self.menubar.addMenu("Настройки")
@@ -897,6 +901,31 @@ class MainWindow(QMainWindow):
         action_settings = QAction("Открыть настройки...", self)
         action_settings.triggered.connect(self.open_settings)
         settings_menu.addAction(action_settings)
+        
+        # Меню "Вид"
+        view_menu = self.menubar.addMenu("Вид")
+        
+        # Действия для панелей
+        self.action_show_left_panel = QAction("Показать левую панель", self, checkable=True)
+        self.action_show_left_panel.setChecked(True)
+        self.action_show_left_panel.triggered.connect(lambda: self.toggle_panel('left'))
+        view_menu.addAction(self.action_show_left_panel)
+        
+        self.action_show_center_panel = QAction("Показать панель чата", self, checkable=True)
+        self.action_show_center_panel.setChecked(True)
+        self.action_show_center_panel.triggered.connect(lambda: self.toggle_panel('center'))
+        view_menu.addAction(self.action_show_center_panel)
+        
+        self.action_show_right_panel = QAction("Показать панель просмотра", self, checkable=True)
+        self.action_show_right_panel.setChecked(True)
+        self.action_show_right_panel.triggered.connect(lambda: self.toggle_panel('right'))
+        view_menu.addAction(self.action_show_right_panel)
+        
+        view_menu.addSeparator()
+        
+        action_detach_viewer = QAction("Открепить панель просмотра", self)
+        action_detach_viewer.triggered.connect(self.detach_viewer_panel)
+        view_menu.addAction(action_detach_viewer)
         
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -1224,7 +1253,18 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self.left_panel)
         splitter.addWidget(self.center_panel)
         splitter.addWidget(self.right_panel)
-        splitter.setStretchFactor(1, 1)
+        
+        # Правильные настройки для splitter
+        splitter.setStretchFactor(0, 0)  # Левая панель не растягивается
+        splitter.setStretchFactor(1, 1)  # Центральная растягивается
+        splitter.setStretchFactor(2, 0)  # Правая не растягивается
+        splitter.setHandleWidth(3)  # Толщина разделителя
+        splitter.setChildrenCollapsible(False)  # Не позволяем полностью схлопнуть панели
+        
+        # Устанавливаем начальные размеры панелей
+        splitter.setSizes([300, 600, 500])  # Левая 300px, центр 600px, правая 500px
+        
+        self.main_splitter = splitter  # Сохраняем ссылку для работы с панелями
         content_layout.addWidget(splitter)
         
         main_layout.addWidget(content_widget)
@@ -1277,6 +1317,71 @@ class MainWindow(QMainWindow):
                 self.lbl_data_root.setText(f"📁 {self.data_root}")
                 self.refresh_history_list()
                 QMessageBox.information(self, "Настройки", f"Папка обновлена:\n{self.data_root}")
+    
+    def toggle_panel(self, panel_name: str):
+        """Переключает видимость панели."""
+        if panel_name == 'left':
+            visible = not self.left_panel.isVisible()
+            self.left_panel.setVisible(visible)
+            self.action_show_left_panel.setChecked(visible)
+        elif panel_name == 'center':
+            visible = not self.center_panel.isVisible()
+            self.center_panel.setVisible(visible)
+            self.action_show_center_panel.setChecked(visible)
+        elif panel_name == 'right':
+            visible = not self.right_panel.isVisible()
+            self.right_panel.setVisible(visible)
+            self.action_show_right_panel.setChecked(visible)
+    
+    def detach_viewer_panel(self):
+        """Открепляет панель просмотра в отдельное окно."""
+        if hasattr(self, 'detached_viewer_window') and self.detached_viewer_window:
+            # Окно уже открыто, просто показываем его
+            self.detached_viewer_window.show()
+            self.detached_viewer_window.raise_()
+            self.detached_viewer_window.activateWindow()
+            return
+        
+        # Создаём новое окно
+        from PyQt6.QtWidgets import QDialog
+        
+        self.detached_viewer_window = QDialog(self)
+        self.detached_viewer_window.setWindowTitle("Просмотр документа")
+        self.detached_viewer_window.resize(900, 800)
+        
+        layout = QVBoxLayout(self.detached_viewer_window)
+        layout.setContentsMargins(0, 0, 0, 0)
+        
+        # Создаём новый вьювер для открепленного окна
+        detached_viewer = QTextBrowser()
+        detached_viewer.setReadOnly(True)
+        detached_viewer.setOpenLinks(False)
+        detached_viewer.anchorClicked.connect(self.on_pdf_navigation)
+        
+        # Копируем текущее содержимое
+        if hasattr(self.file_viewer, 'toHtml'):
+            detached_viewer.setHtml(self.file_viewer.toHtml())
+        
+        layout.addWidget(detached_viewer)
+        
+        # Сохраняем ссылку на открепленный вьювер
+        self.detached_viewer = detached_viewer
+        
+        # Синхронизируем при изменении основного вьювера
+        def sync_viewer():
+            if hasattr(self, 'detached_viewer') and self.detached_viewer:
+                if hasattr(self.file_viewer, 'toHtml'):
+                    self.detached_viewer.setHtml(self.file_viewer.toHtml())
+        
+        self.file_viewer.textChanged.connect(sync_viewer)
+        
+        # При закрытии окна
+        def on_close():
+            self.detached_viewer_window = None
+            self.detached_viewer = None
+        
+        self.detached_viewer_window.finished.connect(on_close)
+        self.detached_viewer_window.show()
 
     def load_user_prompts(self):
         """Загружает список пользовательских промтов в выпадающий список."""
