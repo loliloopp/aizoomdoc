@@ -2498,9 +2498,11 @@ class MainWindow(QMainWindow):
             img_data = pix.samples
             qimg = QImage(img_data, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888)
             
-            # Сохраняем во временный файл
+            # Сохраняем во временный файл с уникальным именем для предотвращения кэширования
             import tempfile
-            temp_img = Path(tempfile.gettempdir()) / "aizoomdoc_pdf_preview.png"
+            import time
+            timestamp = int(time.time() * 1000)  # Уникальный timestamp
+            temp_img = Path(tempfile.gettempdir()) / f"aizoomdoc_pdf_preview_{timestamp}.png"
             qimg.save(str(temp_img))
             
             # Создаем HTML с изображением и кнопками навигации
@@ -2557,10 +2559,11 @@ class MainWindow(QMainWindow):
                     .pdf-container {{
                         text-align: center;
                         overflow: auto;
+                        max-height: calc(100vh - 80px);
                     }}
                     img {{
-                        max-width: 100%;
-                        height: auto;
+                        display: block;
+                        margin: 0 auto;
                         box-shadow: 0 0 20px rgba(0,0,0,0.5);
                     }}
                 </style>
