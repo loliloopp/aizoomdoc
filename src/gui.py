@@ -19,7 +19,7 @@ from PyQt6.QtWidgets import (
     QListWidget, QListWidgetItem, QFrame, QScrollArea, QProgressBar,
     QFileDialog, QMenuBar, QMenu, QDialog, QDialogButtonBox, QMessageBox,
     QGroupBox, QSizePolicy, QTreeView, QButtonGroup, QInputDialog,
-    QHeaderView, QTabWidget, QTextBrowser, QStackedWidget
+    QHeaderView, QTabWidget, QTextBrowser, QStackedWidget, QProxyStyle, QStyle
 )
 from PyQt6.QtCore import Qt, QUrl, QSize, QTimer, QBuffer, QPoint, QRect
 from PyQt6.QtGui import (
@@ -982,6 +982,48 @@ class PdfSelectionLabel(QLabel):
         painter.drawRect(rect)
 
 
+class BranchIndicatorStyle(QProxyStyle):
+    """Стиль для отрисовки индикаторов раскрытия QTreeView с заданным цветом (чтобы были видны в тёмной теме)."""
+
+    def __init__(self, color: QColor, base_style=None):
+        super().__init__(base_style)
+        self._color = color
+
+    def drawPrimitive(self, element, option, painter, widget=None):
+        try:
+            if element == QStyle.PrimitiveElement.PE_IndicatorBranch and (option.state & QStyle.StateFlag.State_Children):
+                r = option.rect
+                size = min(r.width(), r.height(), 10)
+                cx = r.center().x()
+                cy = r.center().y()
+                half = max(3, size // 2)
+
+                painter.save()
+                painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(self._color)
+
+                if option.state & QStyle.StateFlag.State_Open:
+                    # ▼
+                    p1 = QPoint(cx - half, cy - half + 1)
+                    p2 = QPoint(cx + half, cy - half + 1)
+                    p3 = QPoint(cx, cy + half)
+                else:
+                    # ▶
+                    p1 = QPoint(cx - half + 1, cy - half)
+                    p2 = QPoint(cx + half, cy)
+                    p3 = QPoint(cx - half + 1, cy + half)
+
+                painter.drawPolygon(p1, p2, p3)
+                painter.restore()
+                return
+        except Exception:
+            # Если что-то пошло не так — просто отдаем базовой реализации
+            pass
+
+        return super().drawPrimitive(element, option, painter, widget)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1357,7 +1399,7 @@ class MainWindow(QMainWindow):
         # Заголовок и кнопки управления
         viewer_header = QHBoxLayout()
         self.viewer_label = QLabel("Просмотр документа")
-        self.viewer_label.setStyleSheet("font-weight: bold; font-size: 13px;")
+        self.viewer_label.setStyleSheet("font-weight: bold; font-size: 13px; color: #ddd;")
         viewer_header.addWidget(self.viewer_label)
         viewer_header.addStretch()
         
@@ -1518,15 +1560,23 @@ class MainWindow(QMainWindow):
         """Обработчик ввода номера страницы в открепляемом окне."""
         if not hasattr(self, 'current_pdf_doc') or self.current_pdf_doc is None:
             return
+        if not hasattr(self, 'detached_edit_pdf_page') or self.detached_edit_pdf_page is None:
+            return
         try:
             page_num = int(self.detached_edit_pdf_page.text())
             if 1 <= page_num <= len(self.current_pdf_doc):
                 self.current_pdf_page = page_num - 1
                 self.render_pdf_page()
             else:
+                self.detached_edit_pdf_page.blockSignals(True)
                 self.detached_edit_pdf_page.setText(str(self.current_pdf_page + 1))
-        except ValueError:
-            self.detached_edit_pdf_page.setText(str(self.current_pdf_page + 1))
+                self.detached_edit_pdf_page.blockSignals(False)
+        except (ValueError, AttributeError) as e:
+            logger.warning(f"Ошибка ввода страницы (detached): {e}")
+            if hasattr(self, 'detached_edit_pdf_page') and self.detached_edit_pdf_page:
+                self.detached_edit_pdf_page.blockSignals(True)
+                self.detached_edit_pdf_page.setText(str(self.current_pdf_page + 1))
+                self.detached_edit_pdf_page.blockSignals(False)
     
     def pdf_scroll_wheel_event(self, event):
         """Обработчик колеса мыши для масштабирования PDF."""
@@ -1652,7 +1702,7 @@ class MainWindow(QMainWindow):
         edit_page = QLineEdit()
         edit_page.setFixedWidth(50)
         edit_page.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        edit_page.returnPressed.connect(self.on_pdf_page_input_detached)
+        # Привязку сделаем после сохранения ссылки
         lbl_page = QLabel("")
         btn_next = QPushButton("▶")
         btn_last = QPushButton("⏭")
@@ -1672,6 +1722,9 @@ class MainWindow(QMainWindow):
             btn_zoom_reset,
         ):
             b.setFixedHeight(26)
+            # В QDialog Enter может нажимать default-кнопку. Отключаем, чтобы Enter работал только в поле ввода страницы.
+            b.setAutoDefault(False)
+            b.setDefault(False)
 
         lbl_page.setStyleSheet("color: #aaa;")
         lbl_zoom.setStyleSheet("color: #aaa;")
@@ -1694,6 +1747,8 @@ class MainWindow(QMainWindow):
         btn_add_crop = QPushButton("Добавить в чат")
         for b in (btn_select, btn_clear_sel, btn_add_crop):
             b.setFixedHeight(26)
+            b.setAutoDefault(False)
+            b.setDefault(False)
         pdf_controls_layout.addSpacing(10)
         pdf_controls_layout.addWidget(btn_select)
         pdf_controls_layout.addWidget(btn_clear_sel)
@@ -1750,6 +1805,9 @@ class MainWindow(QMainWindow):
         self.detached_btn_pdf_select = btn_select
         self.detached_btn_pdf_add_crop = btn_add_crop
         self.detached_btn_pdf_clear_sel = btn_clear_sel
+        
+        # Теперь привязываем обработчик после сохранения ссылки
+        edit_page.returnPressed.connect(self.on_pdf_page_input_detached)
 
         # Первичная синхронизация с текущим состоянием правой панели
         try:
@@ -1773,8 +1831,12 @@ class MainWindow(QMainWindow):
             self.detached_pdf_scroll = None
             self.detached_pdf_label = None
             self.detached_pdf_controls = None
+            self.detached_edit_pdf_page = None
             self.detached_lbl_pdf_page = None
             self.detached_lbl_pdf_zoom = None
+            self.detached_btn_pdf_select = None
+            self.detached_btn_pdf_add_crop = None
+            self.detached_btn_pdf_clear_sel = None
         
         self.detached_viewer_window.finished.connect(on_close)
         self.detached_viewer_window.show()
@@ -2965,11 +3027,15 @@ class MainWindow(QMainWindow):
             total_pages = len(self.current_pdf_doc)
             zoom_percent = int(self.current_pdf_zoom * 100)
 
+            self.edit_pdf_page.blockSignals(True)
             self.edit_pdf_page.setText(str(page_num))
+            self.edit_pdf_page.blockSignals(False)
             self.lbl_pdf_page.setText(f"/ {total_pages}")
             self.lbl_pdf_zoom.setText(f"{zoom_percent}%")
             if getattr(self, "detached_edit_pdf_page", None):
+                self.detached_edit_pdf_page.blockSignals(True)
                 self.detached_edit_pdf_page.setText(str(page_num))
+                self.detached_edit_pdf_page.blockSignals(False)
             if getattr(self, "detached_lbl_pdf_page", None):
                 self.detached_lbl_pdf_page.setText(f"/ {total_pages}")
             if getattr(self, "detached_lbl_pdf_zoom", None):
@@ -3406,7 +3472,20 @@ class MainWindow(QMainWindow):
                 QTreeView::item:selected {
                     background-color: #3d3d3d;
                 }
+                QTreeView::branch {
+                    background: transparent;
+                }
             """)
+            
+            # Устанавливаем палитру для видимости индикаторов раскрытия
+            from PyQt6.QtGui import QPalette, QColor
+            palette = self.tree_folders.palette()
+            palette.setColor(QPalette.ColorRole.WindowText, QColor("#aaaaaa"))
+            palette.setColor(QPalette.ColorRole.Text, QColor("#ececec"))
+            palette.setColor(QPalette.ColorRole.Base, QColor("#1e1e1e"))
+            palette.setColor(QPalette.ColorRole.AlternateBase, QColor("#2d2d2d"))
+            self.tree_folders.setPalette(palette)
+            self.tree_folders.setStyle(BranchIndicatorStyle(QColor("#aaaaaa"), self.tree_folders.style()))
             
             tab_style_dark = """
                 QPushButton {
@@ -3825,7 +3904,20 @@ class MainWindow(QMainWindow):
                 QTreeView::item:selected {
                     background-color: #d1d5db;
                 }
+                QTreeView::branch {
+                    background: transparent;
+                }
             """)
+            
+            # Устанавливаем палитру для видимости индикаторов раскрытия
+            from PyQt6.QtGui import QPalette, QColor
+            palette = self.tree_folders.palette()
+            palette.setColor(QPalette.ColorRole.WindowText, QColor("#555555"))
+            palette.setColor(QPalette.ColorRole.Text, QColor("#2d333a"))
+            palette.setColor(QPalette.ColorRole.Base, QColor("#ffffff"))
+            palette.setColor(QPalette.ColorRole.AlternateBase, QColor("#f7f7f8"))
+            self.tree_folders.setPalette(palette)
+            self.tree_folders.setStyle(BranchIndicatorStyle(QColor("#555555"), self.tree_folders.style()))
             
             tab_style_light = """
                 QPushButton {
