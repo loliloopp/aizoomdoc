@@ -1344,13 +1344,24 @@ class MainWindow(QMainWindow):
         
         # Создаём новое окно
         from PyQt6.QtWidgets import QDialog
+        from PyQt6.QtCore import Qt
         
         self.detached_viewer_window = QDialog(self)
         self.detached_viewer_window.setWindowTitle("Просмотр документа")
+        
+        # Включаем стандартные кнопки окна (свернуть, развернуть, закрыть)
+        self.detached_viewer_window.setWindowFlags(
+            Qt.WindowType.Window |
+            Qt.WindowType.WindowMinimizeButtonHint |
+            Qt.WindowType.WindowMaximizeButtonHint |
+            Qt.WindowType.WindowCloseButtonHint
+        )
+        
         self.detached_viewer_window.resize(900, 800)
         
         layout = QVBoxLayout(self.detached_viewer_window)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
         
         # Создаём новый вьювер для открепленного окна
         detached_viewer = QTextBrowser()
@@ -1364,7 +1375,7 @@ class MainWindow(QMainWindow):
         
         layout.addWidget(detached_viewer)
         
-        # Сохраняем ссылку на открепленный вьювер
+        # Сохраняем ссылки
         self.detached_viewer = detached_viewer
         
         # Синхронизируем при изменении основного вьювера
@@ -1382,6 +1393,7 @@ class MainWindow(QMainWindow):
         
         self.detached_viewer_window.finished.connect(on_close)
         self.detached_viewer_window.show()
+    
 
     def load_user_prompts(self):
         """Загружает список пользовательских промтов в выпадающий список."""
