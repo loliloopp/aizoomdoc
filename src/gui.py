@@ -870,6 +870,10 @@ class PdfSelectionLabel(QLabel):
         self._p1 = None
         self._selection = None
         self.setCursor(Qt.CursorShape.ArrowCursor)
+        
+        # Для drag средней кнопкой
+        self._dragging = False
+        self._drag_start = None
 
     def set_selection_enabled(self, enabled: bool):
         self.selection_enabled = enabled
@@ -896,35 +900,71 @@ class PdfSelectionLabel(QLabel):
         return self._selection
 
     def mousePressEvent(self, event):
-        if not self.selection_enabled or event.button() != Qt.MouseButton.LeftButton:
-            return super().mousePressEvent(event)
-        self._selecting = True
-        self._p1 = event.position().toPoint()
-        self._selection = QRect(self._p1, self._p1)
-        self.update()
+        # Выделение левой кнопкой
+        if self.selection_enabled and event.button() == Qt.MouseButton.LeftButton:
+            self._selecting = True
+            self._p1 = event.position().toPoint()
+            self._selection = QRect(self._p1, self._p1)
+            self.update()
+            return
+        
+        # Drag средней кнопкой
+        if event.button() == Qt.MouseButton.MiddleButton:
+            self._dragging = True
+            self._drag_start = event.globalPosition().toPoint()
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            return
+        
+        super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
-        if not self.selection_enabled or not self._selecting or self._p1 is None:
-            return super().mouseMoveEvent(event)
-        p2 = event.position().toPoint()
-        self._selection = QRect(self._p1, p2).normalized()
-        self.update()
+        # Выделение
+        if self.selection_enabled and self._selecting and self._p1 is not None:
+            p2 = event.position().toPoint()
+            self._selection = QRect(self._p1, p2).normalized()
+            self.update()
+            return
+        
+        # Drag средней кнопкой
+        if self._dragging and self._drag_start is not None:
+            scroll_area = self.parentWidget().parentWidget()
+            if isinstance(scroll_area, QScrollArea):
+                delta = self._drag_start - event.globalPosition().toPoint()
+                self._drag_start = event.globalPosition().toPoint()
+                
+                h_bar = scroll_area.horizontalScrollBar()
+                v_bar = scroll_area.verticalScrollBar()
+                h_bar.setValue(h_bar.value() + delta.x())
+                v_bar.setValue(v_bar.value() + delta.y())
+            return
+        
+        super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
-        if not self.selection_enabled or event.button() != Qt.MouseButton.LeftButton:
-            return super().mouseReleaseEvent(event)
-        self._selecting = False
-        if self._p1 is None:
+        # Выделение
+        if self.selection_enabled and event.button() == Qt.MouseButton.LeftButton:
+            self._selecting = False
+            if self._p1 is None:
+                return super().mouseReleaseEvent(event)
+            p2 = event.position().toPoint()
+            rect = QRect(self._p1, p2).normalized()
+            # Минимальный размер, чтобы не ловить случайные клики
+            if rect.width() < 10 or rect.height() < 10:
+                self._selection = None
+            else:
+                bounded = rect.intersected(QRect(0, 0, self.width(), self.height()))
+                self._selection = bounded if not bounded.isNull() else None
+            self.update()
             return
-        p2 = event.position().toPoint()
-        rect = QRect(self._p1, p2).normalized()
-        # Минимальный размер, чтобы не ловить случайные клики
-        if rect.width() < 10 or rect.height() < 10:
-            self._selection = None
-        else:
-            bounded = rect.intersected(QRect(0, 0, self.width(), self.height()))
-            self._selection = bounded if not bounded.isNull() else None
-        self.update()
+        
+        # Drag средней кнопкой
+        if event.button() == Qt.MouseButton.MiddleButton:
+            self._dragging = False
+            self._drag_start = None
+            self.setCursor(Qt.CursorShape.CrossCursor if self.selection_enabled else Qt.CursorShape.ArrowCursor)
+            return
+        
+        super().mouseReleaseEvent(event)
 
     def paintEvent(self, event):
         super().paintEvent(event)
@@ -1336,6 +1376,10 @@ class MainWindow(QMainWindow):
 
         self.btn_pdf_first = QPushButton("⏮")
         self.btn_pdf_prev = QPushButton("◀")
+        self.edit_pdf_page = QLineEdit()
+        self.edit_pdf_page.setFixedWidth(50)
+        self.edit_pdf_page.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.edit_pdf_page.returnPressed.connect(self.on_pdf_page_input)
         self.lbl_pdf_page = QLabel("")
         self.btn_pdf_next = QPushButton("▶")
         self.btn_pdf_last = QPushButton("⏭")
@@ -1367,6 +1411,7 @@ class MainWindow(QMainWindow):
 
         pdf_controls_layout.addWidget(self.btn_pdf_first)
         pdf_controls_layout.addWidget(self.btn_pdf_prev)
+        pdf_controls_layout.addWidget(self.edit_pdf_page)
         pdf_controls_layout.addWidget(self.lbl_pdf_page)
         pdf_controls_layout.addWidget(self.btn_pdf_next)
         pdf_controls_layout.addWidget(self.btn_pdf_last)
@@ -1410,6 +1455,7 @@ class MainWindow(QMainWindow):
         self.pdf_scroll.setWidget(self.pdf_label)
         self.pdf_scroll.setWidgetResizable(False)
         self.pdf_scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.pdf_scroll.wheelEvent = self.pdf_scroll_wheel_event
 
         # Переключатель режимов: обычный просмотр / PDF
         self.viewer_stack = QStackedWidget()
@@ -1455,6 +1501,63 @@ class MainWindow(QMainWindow):
         
         self.refresh_history_list()
 
+    def detached_pdf_scroll_wheel_event(self, event):
+        """Обработчик колеса мыши для открепляемого PDF-вьювера."""
+        from PyQt6.QtCore import Qt
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            delta = event.angleDelta().y()
+            if delta > 0:
+                self.on_pdf_navigation(QUrl("pdf://zoomin"))
+            elif delta < 0:
+                self.on_pdf_navigation(QUrl("pdf://zoomout"))
+            event.accept()
+        else:
+            QScrollArea.wheelEvent(self.detached_pdf_scroll, event)
+    
+    def on_pdf_page_input_detached(self):
+        """Обработчик ввода номера страницы в открепляемом окне."""
+        if not hasattr(self, 'current_pdf_doc') or self.current_pdf_doc is None:
+            return
+        try:
+            page_num = int(self.detached_edit_pdf_page.text())
+            if 1 <= page_num <= len(self.current_pdf_doc):
+                self.current_pdf_page = page_num - 1
+                self.render_pdf_page()
+            else:
+                self.detached_edit_pdf_page.setText(str(self.current_pdf_page + 1))
+        except ValueError:
+            self.detached_edit_pdf_page.setText(str(self.current_pdf_page + 1))
+    
+    def pdf_scroll_wheel_event(self, event):
+        """Обработчик колеса мыши для масштабирования PDF."""
+        from PyQt6.QtCore import Qt
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            # Ctrl+Wheel → zoom
+            delta = event.angleDelta().y()
+            if delta > 0:
+                self.on_pdf_navigation(QUrl("pdf://zoomin"))
+            elif delta < 0:
+                self.on_pdf_navigation(QUrl("pdf://zoomout"))
+            event.accept()
+        else:
+            # Обычная прокрутка
+            QScrollArea.wheelEvent(self.pdf_scroll, event)
+    
+    def on_pdf_page_input(self):
+        """Обработчик ввода номера страницы."""
+        if not hasattr(self, 'current_pdf_doc') or self.current_pdf_doc is None:
+            return
+        try:
+            page_num = int(self.edit_pdf_page.text())
+            # Нумерация с 1
+            if 1 <= page_num <= len(self.current_pdf_doc):
+                self.current_pdf_page = page_num - 1
+                self.render_pdf_page()
+            else:
+                self.edit_pdf_page.setText(str(self.current_pdf_page + 1))
+        except ValueError:
+            self.edit_pdf_page.setText(str(self.current_pdf_page + 1))
+    
     def load_default_model(self):
         """Загружает модель по умолчанию из БД."""
         if supabase_client.is_connected():
@@ -1546,6 +1649,10 @@ class MainWindow(QMainWindow):
 
         btn_first = QPushButton("⏮")
         btn_prev = QPushButton("◀")
+        edit_page = QLineEdit()
+        edit_page.setFixedWidth(50)
+        edit_page.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        edit_page.returnPressed.connect(self.on_pdf_page_input_detached)
         lbl_page = QLabel("")
         btn_next = QPushButton("▶")
         btn_last = QPushButton("⏭")
@@ -1571,6 +1678,7 @@ class MainWindow(QMainWindow):
 
         pdf_controls_layout.addWidget(btn_first)
         pdf_controls_layout.addWidget(btn_prev)
+        pdf_controls_layout.addWidget(edit_page)
         pdf_controls_layout.addWidget(lbl_page)
         pdf_controls_layout.addWidget(btn_next)
         pdf_controls_layout.addWidget(btn_last)
@@ -1621,6 +1729,7 @@ class MainWindow(QMainWindow):
         detached_pdf_scroll.setWidget(detached_pdf_label)
         detached_pdf_scroll.setWidgetResizable(False)
         detached_pdf_scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        detached_pdf_scroll.wheelEvent = self.detached_pdf_scroll_wheel_event
 
         # ---- Стек режимов ----
         detached_stack = QStackedWidget()
@@ -1635,6 +1744,7 @@ class MainWindow(QMainWindow):
         self.detached_pdf_scroll = detached_pdf_scroll
         self.detached_pdf_label = detached_pdf_label
         self.detached_pdf_controls = detached_pdf_controls
+        self.detached_edit_pdf_page = edit_page
         self.detached_lbl_pdf_page = lbl_page
         self.detached_lbl_pdf_zoom = lbl_zoom
         self.detached_btn_pdf_select = btn_select
@@ -2855,10 +2965,13 @@ class MainWindow(QMainWindow):
             total_pages = len(self.current_pdf_doc)
             zoom_percent = int(self.current_pdf_zoom * 100)
 
-            self.lbl_pdf_page.setText(f"Стр. {page_num} / {total_pages}")
+            self.edit_pdf_page.setText(str(page_num))
+            self.lbl_pdf_page.setText(f"/ {total_pages}")
             self.lbl_pdf_zoom.setText(f"{zoom_percent}%")
+            if getattr(self, "detached_edit_pdf_page", None):
+                self.detached_edit_pdf_page.setText(str(page_num))
             if getattr(self, "detached_lbl_pdf_page", None):
-                self.detached_lbl_pdf_page.setText(f"Стр. {page_num} / {total_pages}")
+                self.detached_lbl_pdf_page.setText(f"/ {total_pages}")
             if getattr(self, "detached_lbl_pdf_zoom", None):
                 self.detached_lbl_pdf_zoom.setText(f"{zoom_percent}%")
 
