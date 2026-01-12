@@ -1644,7 +1644,6 @@ class MainWindow(QMainWindow):
                 self.data_root.mkdir(parents=True, exist_ok=True)
                 self.app_config["data_root"] = str(self.data_root)
                 save_config_file(self.app_config)
-                self.lbl_data_root.setText(f"📁 {self.data_root}")
                 self.refresh_history_list()
                 QMessageBox.information(self, "Настройки", f"Папка обновлена:\n{self.data_root}")
     

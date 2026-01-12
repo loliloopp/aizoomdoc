@@ -377,11 +377,18 @@ class LLMClient:
     def set_document_context(self, text_context: str):
         """
         Создает контекстный кэш для документа, если используется новый SDK.
+        ВРЕМЕННО ОТКЛЮЧЕНО для прямых Google моделей (Gemini 3) из-за конфликта с tools.
         """
         if not self.google_client or not genai_new or not genai_types:
             return
 
         if "gemini" not in self.model.lower():
+            return
+        
+        # Временно отключаем кэш для прямых Google моделей (Gemini 3)
+        if self._is_google_direct():
+            logger.info("Кэширование отключено для прямых Google моделей")
+            self.current_cache = None
             return
 
         try:
@@ -610,15 +617,17 @@ class LLMClient:
         config_args = {
             "temperature": temperature,
             "max_output_tokens": max_tokens,
-            "system_instruction": system_instruction
         }
+        
+        # Нельзя использовать system_instruction вместе с cached_content
+        if self.current_cache:
+            config_args["cached_content"] = self.current_cache.name
+        elif system_instruction:
+            config_args["system_instruction"] = system_instruction
         
         # Включаем Deep Think (thinking) если модель поддерживает
         if "thinking" in self.model.lower():
             config_args["thinking_config"] = {"include_thoughts": True}
-            
-        if self.current_cache:
-            config_args["cached_content"] = self.current_cache.name
 
         response = self.google_client.models.generate_content(
             model=base_model,
@@ -626,25 +635,53 @@ class LLMClient:
             config=genai_types.GenerateContentConfig(**config_args)
         )
         
-        text = response.text
+        # Извлекаем текст из ответа
+        text = None
         signature = None
-        if response.candidates and hasattr(response.candidates[0], "thought_signature"):
-            signature = response.candidates[0].thought_signature
+        
+        # Пробуем разные способы получить текст
+        if hasattr(response, 'text') and response.text:
+            text = response.text
+        elif response.candidates:
+            candidate = response.candidates[0]
+            if hasattr(candidate, 'content') and candidate.content:
+                parts = candidate.content.parts
+                if parts:
+                    text_parts = []
+                    for part in parts:
+                        if hasattr(part, 'text') and part.text:
+                            text_parts.append(part.text)
+                    text = "".join(text_parts)
+            if hasattr(candidate, "thought_signature"):
+                signature = candidate.thought_signature
+        
+        if not text:
+            logger.error(f"Пустой ответ от Google API. Response: {response}")
+            raise ValueError("Получен пустой ответ от Google API")
             
         return text, signature
 
     def get_response(self) -> str:
         print(f"[GET_RESPONSE] Отправляю запрос к модели {self.model}")
         
-        # Если модель - Gemini и у нас есть новый SDK, используем его для кэша и подписей
-        if self.google_client and "gemini" in self.model.lower():
+        # Если модель - прямая Google (не через OpenRouter), используем Google SDK
+        if self._is_google_direct():
+            if not self.google_client:
+                raise RuntimeError("Google GenAI SDK не инициализирован. Проверьте GOOGLE_API_KEY.")
+            text, signature = self._call_google_new_sdk(self.history)
+            print(f"[GET_RESPONSE] OK (GenAI SDK): Получен ответ длиной {len(text)} символов")
+            self.add_assistant_message(text, thought_signature=signature)
+            return text
+        
+        # Если модель - Gemini через OpenRouter, но есть Google SDK - пробуем его
+        if self.google_client and "gemini" in self.model.lower() and not self._is_google_direct():
             try:
                 text, signature = self._call_google_new_sdk(self.history)
                 print(f"[GET_RESPONSE] OK (GenAI SDK): Получен ответ длиной {len(text)} символов")
                 self.add_assistant_message(text, thought_signature=signature)
                 return text
             except Exception as e:
-                logger.warning(f"Ошибка нового SDK, пробую OpenAI-compatible fallback: {e}")
+                logger.warning(f"Ошибка нового SDK, пробую OpenRouter fallback: {e}")
 
         # Попытки повтора (Retries)
         max_retries = 3
