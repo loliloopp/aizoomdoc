@@ -202,7 +202,35 @@ class HtmlOcrProcessor:
             # Извлекаем JSON с анализом изображения
             pre_elem = content_div.find('pre')
             if not pre_elem:
-                return None
+                # Новый формат без JSON - только ссылка на изображение
+                logger.info(f"Блок изображения {block_id} без JSON, извлекаем только crop_url")
+                
+                crop_url = None
+                # Пробуем найти ссылку с текстом "Открыть... изображени..."
+                link_elem = content_div.find('a', string=re.compile(r'Открыть.*изображени', re.IGNORECASE))
+                if link_elem and link_elem.get('href'):
+                    crop_url = link_elem['href']
+                
+                # Fallback: ищем любую ссылку на PDF или изображение
+                if not crop_url:
+                    for a_tag in content_div.find_all('a', href=True):
+                        href = a_tag['href']
+                        if href.endswith('.pdf') or any(href.endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.webp']):
+                            crop_url = href
+                            break
+                
+                # Извлекаем базовое описание из текста (если есть)
+                text_content = content_div.get_text(strip=True)
+                
+                return HtmlBlock(
+                    block_id=block_id,
+                    block_number=block_number,
+                    page_number=page_number,
+                    block_type='image',
+                    content=text_content,
+                    crop_url=crop_url,
+                    content_summary=f"Изображение на странице {page_number}"
+                )
             
             # Декодируем HTML entities
             json_text = html_module.unescape(pre_elem.get_text())
@@ -299,9 +327,18 @@ class HtmlOcrProcessor:
                 
                 # Возвращаем блок без JSON данных, но с crop_url если есть
                 crop_url = None
-                link_elem = content_div.find('a', string=re.compile(r'Открыть изображение'))
+                # Пробуем найти ссылку с текстом "Открыть... изображени..."
+                link_elem = content_div.find('a', string=re.compile(r'Открыть.*изображени', re.IGNORECASE))
                 if link_elem and link_elem.get('href'):
                     crop_url = link_elem['href']
+                
+                # Fallback: ищем любую ссылку на PDF или изображение
+                if not crop_url:
+                    for a_tag in content_div.find_all('a', href=True):
+                        href = a_tag['href']
+                        if href.endswith('.pdf') or any(href.endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.webp']):
+                            crop_url = href
+                            break
                 
                 return HtmlBlock(
                     block_id=block_id,
@@ -322,9 +359,18 @@ class HtmlOcrProcessor:
             
             # Извлекаем crop_url
             crop_url = None
-            link_elem = content_div.find('a', string=re.compile(r'Открыть изображение'))
+            # Пробуем найти ссылку с текстом "Открыть... изображени..."
+            link_elem = content_div.find('a', string=re.compile(r'Открыть.*изображени', re.IGNORECASE))
             if link_elem and link_elem.get('href'):
                 crop_url = link_elem['href']
+            
+            # Fallback: ищем любую ссылку на PDF или изображение
+            if not crop_url:
+                for a_tag in content_div.find_all('a', href=True):
+                    href = a_tag['href']
+                    if href.endswith('.pdf') or any(href.endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.webp']):
+                        crop_url = href
+                        break
             
             return HtmlBlock(
                 block_id=block_id,
