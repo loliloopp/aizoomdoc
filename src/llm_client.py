@@ -301,7 +301,7 @@ class LLMClient:
 
     def _is_google_direct(self) -> bool:
         """Проверяет, является ли модель прямой моделью Google."""
-        return self.model in ["gemini-1.5-flash", "gemini-1.5-pro"]
+        return self.model in ["gemini-3-flash-preview", "gemini-3-pro-preview"]
 
     def _call_google_direct(self, messages: List[Dict[str, Any]], temperature: float = 0.2, max_tokens: int = config.MAX_TOKENS, response_json: bool = False) -> str:
         """Вызов Google API напрямую через новый SDK."""
@@ -391,10 +391,10 @@ class LLMClient:
             # В новом SDK caches.create принимает model и config
             self.current_cache = self.google_client.caches.create(
                 model=base_model,
-                config=genai_types.CreateCacheConfig(
-                    contents=[genai_types.Content(role="user", parts=[genai_types.Part.from_text(text_context)])],
-                    ttl_seconds=3600,
-                )
+                config={
+                    "contents": [genai_types.Content(role="user", parts=[genai_types.Part(text=text_context)])],
+                    "ttl": "3600s",
+                }
             )
             logger.info(f"Кэш создан: {self.current_cache.name}")
         except Exception as e:
@@ -437,7 +437,7 @@ class LLMClient:
 
                 resp = self.google_client.models.generate_content(
                     model=base_model,
-                    contents=[genai_types.Content(role="user", parts=[genai_types.Part.from_text(user_content)])],
+                    contents=[genai_types.Content(role="user", parts=[genai_types.Part(text=user_content)])],
                     config=genai_types.GenerateContentConfig(**config_args)
                 )
                 
@@ -578,17 +578,17 @@ class LLMClient:
             content = msg["content"]
             
             if isinstance(content, str):
-                parts.append(genai_types.Part.from_text(content))
+                parts.append(genai_types.Part(text=content))
             elif isinstance(content, list):
                 for p in content:
                     if p["type"] == "text":
-                        parts.append(genai_types.Part.from_text(p["text"]))
+                        parts.append(genai_types.Part(text=p["text"]))
                     elif p["type"] == "image_url":
                         url = p["image_url"]["url"]
                         if url.startswith("data:image"):
                             b64_data = url.split(",")[1]
                             image_data = base64.b64decode(b64_data)
-                            parts.append(genai_types.Part.from_bytes(data=image_data, mime_type="image/jpeg"))
+                            parts.append(genai_types.Part(inline_data={"mime_type": "image/jpeg", "data": image_data}))
                         else:
                             # Прямые URL (например S3) - GenAI SDK может не поддерживать напрямую через Part
                             # В таком случае лучше загрузить и передать как bytes или использовать Google Cloud Storage если есть.
@@ -596,7 +596,7 @@ class LLMClient:
                             try:
                                 r = requests.get(url, timeout=10)
                                 if r.status_code == 200:
-                                    parts.append(genai_types.Part.from_bytes(data=r.content, mime_type="image/jpeg"))
+                                    parts.append(genai_types.Part(inline_data={"mime_type": "image/jpeg", "data": r.content}))
                             except Exception as e:
                                 logger.warning(f"Не удалось скачать картинку для GenAI SDK: {e}")
             
