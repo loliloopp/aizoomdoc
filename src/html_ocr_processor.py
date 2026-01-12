@@ -46,10 +46,16 @@ class HtmlOcrDocument:
 class HtmlOcrProcessor:
     """Процессор HTML файлов с результатами OCR."""
     
-    # Регулярка для парсинга заголовка блока
+    # Регулярка для парсинга заголовка блока (старый формат с ID)
     # "Блок #1 (стр. 2) | Тип: text | ID: 7LPV-EU9..."
-    HEADER_PATTERN = re.compile(
+    HEADER_PATTERN_OLD = re.compile(
         r'Блок\s+#(\d+)\s+\(стр\.\s+(\d+)\)\s+\|\s+Тип:\s+(\w+)\s+\|\s+ID:\s+([\w-]+)'
+    )
+    
+    # Регулярка для парсинга заголовка блока (новый формат без ID)
+    # "Блок #1 (стр. 1) | Тип: text"
+    HEADER_PATTERN_NEW = re.compile(
+        r'Блок\s+#(\d+)\s+\(стр\.\s+(\d+)\)\s+\|\s+Тип:\s+(\w+)'
     )
     
     # Регулярка для извлечения полного ID блока
@@ -134,28 +140,41 @@ class HtmlOcrProcessor:
                 return None
             
             header_text = header_div.get_text(strip=True)
-            match = HtmlOcrProcessor.HEADER_PATTERN.search(header_text)
-            if not match:
-                logger.warning(f"Не удалось распарсить заголовок блока: {header_text}")
-                return None
             
-            block_number = int(match.group(1))
-            page_number = int(match.group(2))
-            block_type = match.group(3)
-            block_id_short = match.group(4)
+            # Пробуем старый формат (с ID в заголовке)
+            match = HtmlOcrProcessor.HEADER_PATTERN_OLD.search(header_text)
+            block_id_from_header = None
+            if match:
+                block_number = int(match.group(1))
+                page_number = int(match.group(2))
+                block_type = match.group(3)
+                block_id_from_header = match.group(4)
+            else:
+                # Пробуем новый формат (без ID в заголовке)
+                match = HtmlOcrProcessor.HEADER_PATTERN_NEW.search(header_text)
+                if not match:
+                    logger.warning(f"Не удалось распарсить заголовок блока: {header_text}")
+                    return None
+                block_number = int(match.group(1))
+                page_number = int(match.group(2))
+                block_type = match.group(3)
             
             # Извлекаем содержимое блока
             content_div = block_div.find('div', class_='block-content')
             if not content_div:
                 return None
             
-            # Ищем полный ID блока
-            block_id_full = block_id_short
+            # Ищем ID блока в контенте (BLOCK: xxx)
+            block_id_full = block_id_from_header
             block_id_p = content_div.find('p')
             if block_id_p:
                 id_match = HtmlOcrProcessor.BLOCK_ID_PATTERN.search(block_id_p.get_text())
                 if id_match:
                     block_id_full = id_match.group(1)
+            
+            # Если ID не найден ни в заголовке, ни в контенте — генерируем
+            if not block_id_full:
+                block_id_full = f"block_{page_number}_{block_number}"
             
             # Обработка в зависимости от типа
             if block_type == 'image':
