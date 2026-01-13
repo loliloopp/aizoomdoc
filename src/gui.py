@@ -176,6 +176,19 @@ class SettingsDialog(QDialog):
         thinking_layout.addWidget(self.check_thinking)
         thinking_layout.addStretch()
         llm_params_layout.addLayout(thinking_layout)
+
+        # Thinking budget
+        thinking_budget_layout = QHBoxLayout()
+        thinking_budget_layout.addWidget(QLabel("Thinking budget (токены):"))
+        self.spin_thinking_budget = QSpinBox()
+        # 0 = выключить/не выделять бюджет на размышления (по смыслу для Gemini thinking_budget должен быть >0)
+        self.spin_thinking_budget.setRange(0, 200000)
+        self.spin_thinking_budget.setSingleStep(500)
+        self.spin_thinking_budget.setValue(int(getattr(config, "THINKING_BUDGET", 0)))
+        self.spin_thinking_budget.setToolTip("Бюджет токенов на размышления (thinking). Рекомендуется >0, например 2000–8000.")
+        thinking_budget_layout.addWidget(self.spin_thinking_budget)
+        thinking_budget_layout.addStretch()
+        llm_params_layout.addLayout(thinking_budget_layout)
         
         # Flash+Pro Token Budget
         budget_layout = QHBoxLayout()
@@ -448,19 +461,48 @@ class SettingsDialog(QDialog):
         return {
             "temperature": self.spin_temperature.value(),
             "top_p": self.spin_top_p.value(),
-            "media_resolution": self.combo_media_resolution.currentData()
+            "media_resolution": self.combo_media_resolution.currentData(),
+            "thinking_enabled": self.check_thinking.isChecked(),
+            "thinking_budget": self.spin_thinking_budget.value(),
         }
 
     def accept(self):
-        """Сохраняет настройки LLM в config и вызывает стандартный accept."""
-        # Обновляем глобальные настройки config
+        """Сохраняет настройки LLM в config и БД, затем вызывает стандартный accept."""
+        from .supabase_client import supabase_client
+        import asyncio
+        
+        # Обновляем глобальные настройки config (в памяти)
         config.LLM_TEMPERATURE = self.spin_temperature.value()
         config.LLM_TOP_P = self.spin_top_p.value()
         config.MEDIA_RESOLUTION = self.combo_media_resolution.currentData()
         config.THINKING_ENABLED = self.check_thinking.isChecked()
+        config.THINKING_BUDGET = self.spin_thinking_budget.value()
         config.PRO_FIRST_REQUEST_TOKEN_BUDGET = self.spin_pro_budget.value()
         
-        print(f"[Settings] LLM params saved: temp={config.LLM_TEMPERATURE}, top_p={config.LLM_TOP_P}, media_res={config.MEDIA_RESOLUTION}, thinking={config.THINKING_ENABLED}, pro_budget={config.PRO_FIRST_REQUEST_TOKEN_BUDGET}")
+        print(
+            f"[Settings] LLM params saved: temp={config.LLM_TEMPERATURE}, top_p={config.LLM_TOP_P}, "
+            f"media_res={config.MEDIA_RESOLUTION}, thinking={config.THINKING_ENABLED}, "
+            f"thinking_budget={config.THINKING_BUDGET}, pro_budget={config.PRO_FIRST_REQUEST_TOKEN_BUDGET}"
+        )
+        
+        # Сохраняем LLM параметры в БД (таблица settings)
+        if supabase_client.is_connected():
+            try:
+                llm_params = {
+                    "temperature": config.LLM_TEMPERATURE,
+                    "top_p": config.LLM_TOP_P,
+                    "media_resolution": config.MEDIA_RESOLUTION,
+                    "thinking_enabled": config.THINKING_ENABLED,
+                    "thinking_budget": config.THINKING_BUDGET,
+                    "pro_first_request_token_budget": config.PRO_FIRST_REQUEST_TOKEN_BUDGET
+                }
+                asyncio.run(supabase_client.update_page_settings(
+                    page_key="main_window",
+                    patch={"llm_params": llm_params}
+                ))
+                print("[Settings] LLM params сохранены в БД")
+            except Exception as e:
+                print(f"[Settings] Ошибка сохранения LLM params в БД: {e}")
         
         super().accept()
 
@@ -1162,6 +1204,9 @@ class MainWindow(QMainWindow):
         self.detached_btn_pdf_add_crop = None
         self.detached_btn_pdf_clear_sel = None
         
+        # Загружаем LLM параметры из БД при старте
+        self.load_llm_params_from_db()
+        
         # Меню
         self.menubar = self.menuBar()
         settings_menu = self.menubar.addMenu("Настройки")
@@ -1706,6 +1751,36 @@ class MainWindow(QMainWindow):
                         self.combo_models.setCurrentIndex(idx)
             except Exception as e:
                 print(f"Ошибка загрузки модели по умолчанию: {e}")
+    
+    def load_llm_params_from_db(self):
+        """Загружает LLM параметры из БД и применяет их к config."""
+        if supabase_client.is_connected():
+            try:
+                page_settings = self.run_async(supabase_client.get_page_settings("main_window"))
+                llm_params = page_settings.get("llm_params")
+                if llm_params and isinstance(llm_params, dict):
+                    # Применяем параметры к config
+                    if "temperature" in llm_params:
+                        config.LLM_TEMPERATURE = llm_params["temperature"]
+                    if "top_p" in llm_params:
+                        config.LLM_TOP_P = llm_params["top_p"]
+                    if "media_resolution" in llm_params:
+                        config.MEDIA_RESOLUTION = llm_params["media_resolution"]
+                    if "thinking_enabled" in llm_params:
+                        config.THINKING_ENABLED = llm_params["thinking_enabled"]
+                    if "thinking_budget" in llm_params:
+                        config.THINKING_BUDGET = llm_params["thinking_budget"]
+                    if "pro_first_request_token_budget" in llm_params:
+                        config.PRO_FIRST_REQUEST_TOKEN_BUDGET = llm_params["pro_first_request_token_budget"]
+                    
+                    print(
+                        f"[Settings] LLM params загружены из БД: temp={config.LLM_TEMPERATURE}, "
+                        f"top_p={config.LLM_TOP_P}, media_res={config.MEDIA_RESOLUTION}, "
+                        f"thinking={config.THINKING_ENABLED}, thinking_budget={config.THINKING_BUDGET}, "
+                        f"pro_budget={config.PRO_FIRST_REQUEST_TOKEN_BUDGET}"
+                    )
+            except Exception as e:
+                print(f"[Settings] Ошибка загрузки LLM params из БД: {e}")
 
     def open_settings(self):
         dialog = SettingsDialog(self)

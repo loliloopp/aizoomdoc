@@ -15,7 +15,7 @@ from PyQt6.QtCore import QThread, pyqtSignal
 
 from .config import config
 from .llm_client import LLMClient
-from .image_processor import ImageProcessor
+from .image_processor import ImageProcessor, ZoomRequest
 from .markdown_parser import MarkdownParser
 from .file_processor import FileProcessor
 from .html_ocr_processor import HtmlOcrProcessor
@@ -1586,7 +1586,7 @@ class AgentWorker(QThread):
                     "media_resolution": config.MEDIA_RESOLUTION,
                     "thinking_enabled": config.THINKING_ENABLED,
                     "thinking_budget": config.THINKING_BUDGET if config.THINKING_ENABLED else None,
-                    "response_json": True,
+                    "response_mime_type": "application/json",
                     "response_schema": "FLASH_EXTRACTOR_SCHEMA"
                 })
                 
@@ -1756,6 +1756,51 @@ class AgentWorker(QThread):
                 "role": "user", 
                 "content": "Если ты собрал достаточно контекста, верни JSON со status: 'ready'. Иначе запроси нужные изображения или зумы."
             })
+        
+        # ЗАГРУЖАЕМ ИЗОБРАЖЕНИЯ из relevant_images (которые нашел Flash)
+        if extracted_context and extracted_context.relevant_images:
+            self.sig_log.emit(f"📷 Загружаю {len(extracted_context.relevant_images)} изображений для Pro...")
+            self._append_app_log(f"\n{'='*20} ЗАГРУЗКА ИЗОБРАЖЕНИЙ ДЛЯ PRO {'='*20}")
+            
+            for img_id in extracted_context.relevant_images:
+                try:
+                    # Ищем изображение в каталоге
+                    if img_id in doc_index.images:
+                        entry = doc_index.images[img_id]
+                        image_source = entry.uri if entry.uri else entry.local_path
+                        
+                        if not image_source:
+                            self.sig_log.emit(f"⚠️ Нет источника для {img_id}")
+                            continue
+                        
+                        self.sig_log.emit(f"  Загружаю {img_id}...")
+                        
+                        # Загружаем и обрабатываем изображение
+                        viewport_crops = image_processor.download_and_process_pdf(
+                            url=image_source,
+                            image_id=img_id
+                        )
+                        
+                        if viewport_crops:
+                            # Загружаем в Google Files и S3 (best-effort, без падения всего шага)
+                            self._upload_images_to_google_files(viewport_crops, llm_client)
+                            self._upload_images_to_s3(viewport_crops)
+
+                            for crop in viewport_crops:
+                                collected_images.append(crop)
+                                # Отображаем в чате
+                                if crop.image_path:
+                                    self.sig_image.emit(crop.image_path, crop.description or img_id)
+                            
+                            self.sig_log.emit(f"  ✅ {len(viewport_crops)} изображений из {img_id}")
+                        else:
+                            self.sig_log.emit(f"  ⚠️ Не удалось загрузить {img_id}")
+                    else:
+                        self.sig_log.emit(f"⚠️ Изображение {img_id} не найдено в каталоге")
+                        
+                except Exception as e:
+                    logger.error(f"Ошибка загрузки изображения {img_id}: {e}")
+                    self.sig_log.emit(f"❌ Ошибка загрузки {img_id}: {e}")
         
         # Сохраняем промежуточный контекст для отладки
         flash_context_data = {
@@ -1967,11 +2012,11 @@ class AgentWorker(QThread):
             "media_resolution": config.MEDIA_RESOLUTION,
             "thinking_enabled": config.THINKING_ENABLED,
             "thinking_budget": config.THINKING_BUDGET if config.THINKING_ENABLED else None,
-            "response_json": True,
+            "response_mime_type": "application/json",
             "response_schema": "PRO_ANSWER_SCHEMA"
         })
         
-        # Вызываем Pro (response_json=True для структурированного ответа)
+        # Вызываем Pro (response_mime_type="application/json" для структурированного ответа)
         try:
             pro_response_json = llm_client.call_pro_model(
                 pro_messages, 
@@ -2144,7 +2189,13 @@ class AgentWorker(QThread):
                             loaded = image_processor.download_and_process_pdf(image_source, image_id=img_id)
                             # Создаем zoom crop
                             zoom_output_path = self.data_root / "temp" / f"pro_zoom_{pro_step}_{i}.png"
-                            zoom_result = image_processor.process_zoom_request(img_id, coords_norm, output_path=zoom_output_path)
+                            zr = ZoomRequest(
+                                page_number=0,
+                                image_id=img_id,
+                                coords_norm=coords_norm,
+                                reason=reason
+                            )
+                            zoom_result = image_processor.process_zoom_request(zr, output_path=zoom_output_path)
                             if zoom_result:
                                 zoom_crops.append(zoom_result)
                         except Exception as e:
@@ -2231,6 +2282,21 @@ class AgentWorker(QThread):
             self.sig_message.emit("assistant", err, "gemini-3-pro-preview")
             self.save_message("assistant", err)
         else:
+            # Дедуп изображений в истории/чате (на случай повторных запросов одним и тем же image_id)
+            try:
+                seen = set()
+                deduped = []
+                for img in all_images:
+                    p = getattr(img, "image_path", None) or str(img)
+                    if not p:
+                        continue
+                    if p in seen:
+                        continue
+                    seen.add(p)
+                    deduped.append(img)
+                all_images = deduped
+            except Exception:
+                pass
             self.sig_message.emit("assistant", answer_markdown, "gemini-3-pro-preview")
             self.save_message("assistant", answer_markdown, images=all_images)
         

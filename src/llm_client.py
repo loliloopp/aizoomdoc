@@ -695,6 +695,9 @@ class LLMClient:
                             b64_data = url.split(",")[1]
                             image_data = base64.b64decode(b64_data)
                             parts.append(genai_types.Part(inline_data={"mime_type": "image/jpeg", "data": image_data}))
+                        elif url.startswith("files/") or url.startswith("gs://"):
+                            # Google Files API URI: передаем как file_data (без попытки скачать по HTTP)
+                            parts.append(genai_types.Part(file_data={"mime_type": "image/png", "file_uri": url}))
                         else:
                             # Прямые URL (например S3) - GenAI SDK может не поддерживать напрямую через Part
                             # В таком случае лучше загрузить и передать как bytes или использовать Google Cloud Storage если есть.
@@ -1048,6 +1051,8 @@ class LLMClient:
                             b64_data = url.split(",")[1]
                             image_data = base64.b64decode(b64_data)
                             parts.append(genai_types.Part(inline_data={"mime_type": "image/jpeg", "data": image_data}))
+                        elif url.startswith("files/") or url.startswith("gs://"):
+                            parts.append(genai_types.Part(file_data={"mime_type": "image/png", "file_uri": url}))
                         else:
                             try:
                                 r = requests.get(url, timeout=10)
@@ -1089,7 +1094,8 @@ class LLMClient:
                 thinking_config["thinking_budget"] = config.THINKING_BUDGET
             config_args["thinking_config"] = thinking_config
         
-        logger.info(f"Flash API call: temp={temperature}, top_p={config.LLM_TOP_P}, media_res={media_res}, thinking={config.THINKING_ENABLED}, json={response_json}")
+        mime_type = "application/json" if response_json else "text/plain"
+        logger.info(f"Flash API call: temp={temperature}, top_p={config.LLM_TOP_P}, media_res={media_res}, thinking={config.THINKING_ENABLED}, response_mime_type={mime_type}")
         
         response = self.google_client.models.generate_content(
             model=flash_model,
@@ -1164,6 +1170,8 @@ class LLMClient:
                             b64_data = url.split(",")[1]
                             image_data = base64.b64decode(b64_data)
                             parts.append(genai_types.Part(inline_data={"mime_type": "image/jpeg", "data": image_data}))
+                        elif url.startswith("files/") or url.startswith("gs://"):
+                            parts.append(genai_types.Part(file_data={"mime_type": "image/png", "file_uri": url}))
                         else:
                             try:
                                 r = requests.get(url, timeout=10)
@@ -1208,7 +1216,8 @@ class LLMClient:
                 thinking_config["thinking_budget"] = config.THINKING_BUDGET
             config_args["thinking_config"] = thinking_config
         
-        logger.info(f"Pro API call: temp={temp}, top_p={config.LLM_TOP_P}, media_res={media_res}, thinking={config.THINKING_ENABLED}, json={response_json}")
+        mime_type = "application/json" if response_json else "text/plain"
+        logger.info(f"Pro API call: temp={temp}, top_p={config.LLM_TOP_P}, media_res={media_res}, thinking={config.THINKING_ENABLED}, response_mime_type={mime_type}")
         
         response = self.google_client.models.generate_content(
             model=pro_model,
