@@ -534,14 +534,21 @@ class AgentWorker(QThread):
             all_blocks = []
             attached_images = []  # Инициализируем до if/else
             
+            # Отладка В ТЕРМИНАЛ
+            print(f"[DEBUG] self.md_files = {self.md_files}")
+            print(f"[DEBUG] len(self.md_files) = {len(self.md_files) if self.md_files else 0}")
+            
             # ВАЖНО: Если мы продолжаем чат, нам все равно нужен текст документа в контексте.
             # Для варианта A мы просто заново читаем файлы.
             if self.md_files:
+                print(f"[DEBUG] Начинаю обработку {len(self.md_files)} файлов")
                 self.sig_log.emit(f"Используются выбранные файлы: {len(self.md_files)}")
                 
                 for file_path_str in self.md_files:
                     try:
                         file_path = Path(file_path_str)
+                        print(f"[DEBUG] Читаю файл: {file_path}")
+                        print(f"[DEBUG] Файл существует: {file_path.exists()}")
                         self.sig_log.emit(f"Читаю: {file_path}")
                         
                         # Загружаем файл в S3 и регистрируем в БД
@@ -561,13 +568,17 @@ class AgentWorker(QThread):
                                 logger.error(f"Ошибка загрузки/регистрации файла: {e}")
 
                         # Обрабатываем файл в зависимости от типа
+                        print(f"[DEBUG] Вызываю FileProcessor.process_file...")
                         text, blocks, image = FileProcessor.process_file(file_path, self.db_chat_id)
                         
+                        print(f"[DEBUG] FileProcessor вернул: text={len(text)} chars, blocks={len(blocks) if blocks else 0}, image={image is not None}")
+                        
                         # Отладка
-                        self.sig_log.emit(f"  → Получено текста: {len(text)} символов")
+                        self.sig_log.emit(f"  → Получено текста: {len(text)} символов, блоков: {len(blocks) if blocks else 0}")
                         
                         # Добавляем текст в контекст
                         full_text += text
+                        print(f"[DEBUG] full_text после добавления: {len(full_text)} chars")
                         
                         # Добавляем блоки (для .md файлов)
                         if blocks:
@@ -597,17 +608,38 @@ class AgentWorker(QThread):
                             self.sig_log.emit(f"Изображение добавлено: {file_path.name}")
 
                     except Exception as e:
+                        print(f"[DEBUG] ❌ ИСКЛЮЧЕНИЕ при обработке файла: {e}")
+                        import traceback
+                        print(traceback.format_exc())
                         self.sig_log.emit(f"Ошибка чтения {file_path_str}: {e}")
                         import traceback
                         self.sig_log.emit(traceback.format_exc())
             else:
                 # По умолчанию берем result.md
+                print(f"[DEBUG] Ищу result.md в {self.data_root}")
                 self.sig_log.emit(f"Ищу result.md в {self.data_root}")
                 markdown_path, _ = config.get_document_paths(self.data_root)
+                print(f"[DEBUG] Путь: {markdown_path}, Существует: {Path(markdown_path).exists()}")
+                self.sig_log.emit(f"  Путь: {markdown_path}")
+                self.sig_log.emit(f"  Существует: {Path(markdown_path).exists()}")
+                
                 if Path(markdown_path).exists():
                     parser = MarkdownParser(markdown_path)
                     blocks = parser.parse()
                     all_blocks = blocks
+                    
+                    # Заполняем full_text из блоков
+                    for block in blocks:
+                        full_text += block.text + "\n\n"
+                    
+                    # Если парсер не извлек текст, читаем файл напрямую
+                    if not full_text.strip():
+                        full_text = Path(markdown_path).read_text(encoding='utf-8')
+                        self.sig_log.emit(f"  → Прочитано {len(full_text)} символов напрямую")
+                    else:
+                        self.sig_log.emit(f"  → Извлечено {len(full_text)} символов из {len(blocks)} блоков")
+                else:
+                    self.sig_log.emit(f"  ⚠️ result.md НЕ НАЙДЕН!")
                     
                     # Загружаем MD в S3
                     if self.db_chat_id:
@@ -636,21 +668,23 @@ class AgentWorker(QThread):
                                 ))
                             except: pass
             
-            if not full_text.strip() and not attached_images:
-                # Отладка
-                self.sig_log.emit(f"❌ Ошибка проверки:")
-                self.sig_log.emit(f"  full_text length: {len(full_text)}")
-                self.sig_log.emit(f"  attached_images count: {len(attached_images)}")
-                self.sig_log.emit(f"  md_files: {self.md_files}")
-                self.sig_log.emit(f"  files_to_process будут: {files_to_process if 'files_to_process' in locals() else 'НЕ ОПРЕДЕЛЕНЫ'}")
-                
-                # Для flash+pro режима проверка не нужна - файлы читаются позже
-                if self.model != "flash+pro":
+            # Проверка наличия данных ТОЛЬКО если нет прикрепленных файлов вообще
+            if not self.md_files and not attached_images:
+                # Проверяем, есть ли дефолтный result.md
+                markdown_path, _ = config.get_document_paths(self.data_root)
+                if not Path(markdown_path).exists():
+                    # Отладка
+                    print(f"[DEBUG] ❌ Нет прикрепленных файлов и result.md не найден!")
+                    print(f"[DEBUG]   md_files: {self.md_files}")
+                    print(f"[DEBUG]   attached_images: {len(attached_images)}")
+                    
+                    self.sig_log.emit(f"❌ Ошибка: нет файлов для анализа")
+                    self.sig_log.emit(f"  md_files: {self.md_files}")
+                    self.sig_log.emit(f"  result.md path: {markdown_path}")
+                    
                     raise ValueError("В чате нет прикрепленных документов для анализа. Прикрепите файлы (md, jpg, png, html, json) или изображения.")
             
             # Если есть только изображения без текста — это допустимо (например, кроп PDF)
-            if not full_text.strip() and attached_images:
-                self.sig_log.emit("⚠️ Нет текстового контекста, отправляю только изображения и запрос.")
 
             # 1. Читаем и регистрируем MD файлы
             full_md_text = ""
@@ -793,7 +827,6 @@ class AgentWorker(QThread):
                 elif suffix == '.md':
                     # Парсинг нового MD формата (_document.md)
                     try:
-                        from .file_processor import FileProcessor
                         md_image_blocks = FileProcessor.parse_md_image_blocks(md_path)
                         for img_block in md_image_blocks:
                             entry = ImageCatalogEntry(
@@ -804,7 +837,8 @@ class AgentWorker(QThread):
                                 detailed_description=img_block.detailed_description or "",
                                 clean_ocr_text=img_block.ocr_text or "",
                                 key_entities=img_block.key_entities or [],
-                                sheet_name=img_block.sheet_name or ""
+                                sheet_name=img_block.sheet_name or "",
+                                local_path=img_block.local_path or ""
                             )
                             doc_index.images[img_block.block_id] = entry
                         if md_image_blocks:
@@ -1032,8 +1066,15 @@ class AgentWorker(QThread):
                         self.sig_log.emit(f"Скачивание (по id): {rid}")
                         self._append_app_log(f"Скачивание (по id): {rid}")
                         
+                        # Используем локальный путь если нет URI
+                        image_source = entry.uri if entry.uri else entry.local_path
+                        if not image_source:
+                            self._append_app_log(f"  ⚠️ Нет источника изображения: {rid}")
+                            missing_ids.append(rid)
+                            continue
+                        
                         # Получаем список (превью + возможные авто-зумы)
-                        crops = image_processor.download_and_process_pdf(entry.uri, image_id=rid)
+                        crops = image_processor.download_and_process_pdf(image_source, image_id=rid)
                         if crops:
                             downloaded_imgs.extend(crops)
                             sent_image_ids.add(str(rid))
@@ -1386,7 +1427,6 @@ class AgentWorker(QThread):
             elif suffix == '.md':
                 # Парсинг нового MD формата (_document.md)
                 try:
-                    from .file_processor import FileProcessor
                     md_image_blocks = FileProcessor.parse_md_image_blocks(md_path)
                     for img_block in md_image_blocks:
                         entry = ImageCatalogEntry(
