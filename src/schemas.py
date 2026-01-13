@@ -144,6 +144,34 @@ PRO_ANSWER_SCHEMA = {
             "type": "string",
             "enum": ["high", "medium", "low"],
             "description": "Уверенность в ответе"
+        },
+        "needs_more_evidence": {
+            "type": "boolean",
+            "description": "Нужны ли дополнительные изображения или zoom для более полного ответа"
+        },
+        "followup_images": {
+            "type": "array",
+            "description": "Список ID изображений для более полного ответа",
+            "items": {"type": "string"}
+        },
+        "followup_zooms": {
+            "type": "array",
+            "description": "Список запросов zoom для детального анализа",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "image_id": {"type": "string", "description": "ID изображения"},
+                    "coords_norm": {
+                        "type": "array",
+                        "items": {"type": "number"},
+                        "minItems": 4,
+                        "maxItems": 4,
+                        "description": "Координаты [x1, y1, x2, y2]"
+                    },
+                    "reason": {"type": "string", "description": "Причина запроса zoom"}
+                },
+                "required": ["image_id", "coords_norm", "reason"]
+            }
         }
     },
     "required": ["answer_markdown"]

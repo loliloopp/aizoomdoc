@@ -24,6 +24,7 @@ genai = genai_new
 
 from .config import config
 from .models import ViewportCrop, ZoomRequest, ImageRequest, ImageSelection, DocumentRequest, FlashExtractedContext
+from .schemas import PRO_ANSWER_SCHEMA
 
 logger = logging.getLogger(__name__)
 
@@ -142,47 +143,31 @@ def load_analysis_prompt(data_root: Optional[Path] = None) -> str:
 2. Затем внимательно изучи изображения и, при необходимости, запроси ZOOM и изучи зумы.
 3. Сопоставь данные из текста/таблиц и изображений/зумов и только после этого формулируй выводы и ответ.
 
-ИНСТРУКЦИЯ ПО РАБОТЕ С ИЗОБРАЖЕНИЯМИ:
+## ФОРМАТ ОТВЕТА (JSON):
+
+Твой ответ ВСЕГДА должен быть в формате JSON со следующими полями:
+
+- `answer_markdown` (string, обязательно): Полный ответ на вопрос в формате Markdown.
+- `summary` (string): Краткое резюме ответа (1-2 предложения).
+- `counts` (array): Подсчёты объектов (если применимо), каждый: {object_type, count, locations[]}.
+- `citations` (array): Ссылки на источники, каждый: {image_id, coords_norm[4], note}.
+- `confidence` (string): Уверенность в ответе ("high", "medium", "low").
+- `needs_more_evidence` (boolean): true если нужны дополнительные данные для более полного ответа.
+- `followup_images` (array[string]): Список ID изображений для запроса (если needs_more_evidence=true).
+- `followup_zooms` (array): Список запросов zoom (если needs_more_evidence=true), каждый: {image_id, coords_norm[4], reason}.
+
+**ВАЖНО:**
+- Основной ответ для пользователя пиши в поле `answer_markdown` в формате Markdown.
+- Если можешь ответить с имеющимися данными, установи `needs_more_evidence=false` и оставь `followup_*` пустыми.
+- Если нужны дополнительные изображения или zoom, установи `needs_more_evidence=true` и заполни `followup_images` или `followup_zooms`.
+- Координаты в `coords_norm` должны быть нормализованными [0.0-1.0]: [x1, y1, x2, y2].
+- `image_id` берётся из каталога изображений или из строк вида `IMAGE [ID: ...]`.
+
+**ИНСТРУКЦИЯ ПО РАБОТЕ С ИЗОБРАЖЕНИЯМИ:**
 1. Тебе передают текстовые описания и ИЗОБРАЖЕНИЯ (превью).
 2. Каждое изображение имеет ID (Image ID) и информацию об оригинальном размере.
 3. То, что ты видишь — это уменьшенная версия (обычно до 2000px).
-4. Если тебе нужно рассмотреть детали, используй инструмент ZOOM.
-
-ФОРМАТ ЗАПРОСА ZOOM (JSON):
-```json
-{
-  "tool": "zoom",
-  "image_id": "uuid-строка-из-описания",
-  "coords_px": [1000, 2000, 1500, 2500],
-  "reason": "Хочу прочитать мелкий текст в центре"
-}
-```
-
-ФОРМАТ ЗАПРОСА ДОПОЛНИТЕЛЬНЫХ ИЗОБРАЖЕНИЙ (JSON):
-```json
-{
-  "tool": "request_images",
-  "image_ids": ["image_...","image_..."],
-  "reason": "Нужно проверить маркировку/узел/таблицу на чертеже"
-}
-```
-
-ФОРМАТ ЗАПРОСА ДОПОЛНИТЕЛЬНОЙ ДОКУМЕНТАЦИИ (JSON):
-Если ты понимаешь, что для ответа не хватает других томов документации (например, смежных разделов ВК, ОВ, КР, или ПЗ), верни JSON:
-```json
-{
-  "tool": "request_documents",
-  "documents": ["133/23-ГК-АР2", "Раздел ОВ", "ПЗ"],
-  "reason": "Нужно проверить коллизии с вентиляцией"
-}
-```
-
-ВАЖНО:
-- `image_id`/`image_ids` берутся из каталога изображений или из строк вида `IMAGE [ID: ...]`.
-- Если нужно несколько запросов инструментов, можно вернуть список JSON-объектов.
-
-ОТВЕТ:
-Если информации достаточно, отвечай обычным текстом. Ссылайся на источники."""
+4. Если тебе нужно рассмотреть детали, запроси zoom через `followup_zooms`."""
     
     # Пытаемся найти файл с промтом
     if data_root is None:
@@ -237,9 +222,26 @@ def load_flash_extractor_prompt(data_root: Optional[Path] = None) -> str:
     Загружает промт для Flash-экстрактора из файла.
     Если файл не найден, возвращает промт по умолчанию.
     """
-    default_prompt = """Ты — экстрактор контекста. НЕ ОТВЕЧАЙ на вопрос. 
-Извлеки ВСЕ релевантные текстовые фрагменты и укажи нужные изображения.
-Верни JSON со status: "ready" когда всё собрано."""
+    default_prompt = """Ты — экстрактор контекста. НЕ ОТВЕЧАЙ на вопрос пользователя.
+Твоя задача — извлечь ВСЕ релевантные данные из документа для последующего анализа.
+
+## ФОРМАТ ОТВЕТА (JSON):
+
+Твой ответ должен быть в формате JSON со следующими полями:
+
+- `status` (string, обязательно): "collecting" если нужно больше данных, "ready" когда контекст собран
+- `reasoning` (string): Краткое объяснение хода мыслей
+- `tool_calls` (array): Запросы инструментов для сбора дополнительных данных
+  - Каждый элемент: {"tool": "request_images" | "zoom", "image_ids": [...], "image_id": "...", "coords_norm": [x1,y1,x2,y2], "reason": "..."}
+- `relevant_blocks` (array): ID релевантных текстовых блоков (когда status="ready")
+- `relevant_images` (array[string]): ID релевантных изображений (когда status="ready")
+
+**Порядок работы:**
+1. Изучи каталог изображений и запроси нужные через `request_images`
+2. Если нужны детали, запроси `zoom` с нормализованными координатами [x1, y1, x2, y2]
+3. Когда все данные собраны, верни `status="ready"` с `relevant_blocks` и `relevant_images`
+
+**Важно:** Координаты в `coords_norm` должны быть в диапазоне [0.0, 1.0] относительно размеров изображения."""
     
     if data_root is None:
         data_root = Path.cwd() / "data"
@@ -370,11 +372,9 @@ class LLMClient:
             mime_type = mime_types.get(suffix, 'application/octet-stream')
             
             # Загружаем файл через Google Files API
-            with open(path, 'rb') as f:
-                file_data = f.read()
-            
+            # ВАЖНО: Google Files API ожидает путь к файлу, а не байты
             uploaded_file = self.google_client.files.upload(
-                file=file_data,
+                path=str(path),  # Передаем путь как строку
                 config={
                     "display_name": display_name or path.name,
                     "mime_type": mime_type
@@ -651,8 +651,19 @@ class LLMClient:
         if thought_signature:
             self.thought_signatures[idx] = thought_signature
 
-    def _call_google_new_sdk(self, messages: List[Dict[str, Any]], temperature: float = 0.2, max_tokens: int = config.MAX_TOKENS) -> Tuple[str, Optional[str]]:
-        """Вызов Google API через новый SDK с поддержкой кэша и подписей."""
+    def _call_google_new_sdk(self, messages: List[Dict[str, Any]], 
+                            temperature: float = 0.2, max_tokens: int = config.MAX_TOKENS,
+                            response_json: bool = True, response_schema: dict = None) -> Tuple[str, Optional[str]]:
+        """
+        Вызов Google API через новый SDK с поддержкой кэша и подписей.
+        
+        Args:
+            messages: История сообщений
+            temperature: Температура генерации
+            max_tokens: Макс токенов
+            response_json: Требовать JSON ответ (по умолчанию True для единообразия)
+            response_schema: JSON Schema для валидации
+        """
         if not self.google_client or not genai_new:
             raise RuntimeError("Google GenAI SDK не инициализирован")
 
@@ -729,6 +740,12 @@ class LLMClient:
             if config.THINKING_BUDGET > 0:
                 thinking_config["thinking_budget"] = config.THINKING_BUDGET
             config_args["thinking_config"] = thinking_config
+        
+        # Строгий JSON режим (по умолчанию включен)
+        if response_json:
+            config_args["response_mime_type"] = "application/json"
+            if response_schema:
+                config_args["response_schema"] = response_schema
 
         response = self.google_client.models.generate_content(
             model=base_model,
@@ -763,14 +780,22 @@ class LLMClient:
         return text, signature
 
     def get_response(self) -> str:
-        """Получает ответ от модели через Google Gemini SDK."""
+        """
+        Получает ответ от модели через Google Gemini SDK.
+        Возвращает JSON-строку с ответом в формате PRO_ANSWER_SCHEMA.
+        """
         print(f"[GET_RESPONSE] Отправляю запрос к модели {self.model}")
         
         # Все модели теперь работают через Google SDK (OpenRouter отключён)
         if not self.google_client:
             raise RuntimeError("Google GenAI SDK не инициализирован. Проверьте GOOGLE_API_KEY.")
         
-        text, signature = self._call_google_new_sdk(self.history)
+        # Используем PRO_ANSWER_SCHEMA для всех моделей
+        text, signature = self._call_google_new_sdk(
+            self.history,
+            response_json=True,
+            response_schema=PRO_ANSWER_SCHEMA
+        )
         print(f"[GET_RESPONSE] OK (GenAI SDK): Получен ответ длиной {len(text)} символов")
         self.add_assistant_message(text, thought_signature=signature)
         return text

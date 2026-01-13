@@ -21,6 +21,7 @@ from .file_processor import FileProcessor
 from .html_ocr_processor import HtmlOcrProcessor
 from .supabase_client import supabase_client
 from .s3_storage import s3_storage
+from .schemas import PRO_ANSWER_SCHEMA, FLASH_EXTRACTOR_SCHEMA
 
 logger = logging.getLogger(__name__)
 
@@ -755,10 +756,20 @@ class AgentWorker(QThread):
                 # Передаём изображения в LLM
                 llm_client.add_user_message(context, images=attached_images)
                 
-                # Получаем ответ
-                response = llm_client.get_response()
-                self.sig_message.emit("assistant", response, self.model)
-                self.save_message("assistant", response, images=None)
+                # Получаем ответ (JSON)
+                response_json = llm_client.get_response()
+                
+                # Парсим JSON и извлекаем answer_markdown
+                try:
+                    response_data = json.loads(response_json)
+                    answer_text = response_data.get("answer_markdown", "")
+                    if not answer_text or not answer_text.strip():
+                        answer_text = "⚠️ Модель не вернула ответ (answer_markdown пустой)"
+                except json.JSONDecodeError as e:
+                    answer_text = f"⚠️ Ошибка парсинга JSON: {e}\n\nСырой ответ:\n{response_json}"
+                
+                self.sig_message.emit("assistant", answer_text, self.model)
+                self.save_message("assistant", answer_text, images=None)
                 
                 self.sig_finished.emit()
                 return
@@ -938,7 +949,7 @@ class AgentWorker(QThread):
                 except: pass
                 
                 try:
-                    response = llm_client.get_response()
+                    response_json = llm_client.get_response()
                 except Exception as e:
                     if "context_length" in str(e).lower():
                         err = "Критическое переполнение контекста. Попробуйте режим RAG или другую модель."
@@ -947,44 +958,27 @@ class AgentWorker(QThread):
                         raise ValueError(err)
                     raise e
                 
-                # Дальше стандартная обработка response (request_images, zoom, и т.д.)
-                print(f"[GUI_AGENT] Получен ответ длиной {len(response)} символов")
-                print(f"[GUI_AGENT] Первые 300 символов ответа: {response[:300]}")
-
-                # ВАЖНО: Сначала сохраняем текст ответа (включая рассуждения),
-                # но очищаем от JSON-блоков инструментов, чтобы не засорять чат.
-                import re
-                def clean_response_text(text: str) -> str:
-                    # 1. Удаляем блоки кода ```json ... ``` или ``` ... ``` если там есть "tool"
-                    def code_block_replacer(match):
-                        content = match.group(0)
-                        if '"tool"' in content or "'tool'" in content or "```json" in content.lower():
-                            return ""
-                        return content
-                    
-                    text = re.sub(r"```[\s\S]*?```", code_block_replacer, text)
-                    
-                    # 2. Удаляем "сырой" JSON (если модель забыла про блоки кода)
-                    # Ищем объекты { ... "tool": ... }
-                    # Используем нежадный поиск и проверяем наличие "tool" внутри
-                    def raw_json_replacer(match):
-                        content = match.group(0)
-                        if '"tool"' in content or "'tool'" in content:
-                            return ""
-                        return content
-
-                    # Поиск паттернов, похожих на JSON объекты
-                    text = re.sub(r"\{\s*[\s\S]*?\}", raw_json_replacer, text)
-                    
-                    # 3. Удаляем лишние пустые строки
-                    text = re.sub(r"\n{3,}", "\n\n", text)
-                    return text.strip()
-
-                cleaned_response = clean_response_text(response)
-                if cleaned_response:
-                    self.sig_message.emit("assistant", cleaned_response, self.model)
-                    self.save_message("assistant", cleaned_response)
-
+                # Парсим JSON ответ
+                try:
+                    response_data = json.loads(response_json)
+                except json.JSONDecodeError as e:
+                    err = f"⚠️ Ошибка парсинга JSON от модели: {e}"
+                    self.sig_log.emit(err)
+                    self.sig_message.emit("assistant", f"{err}\n\nСырой ответ:\n{response_json[:500]}", self.model)
+                    self.save_message("assistant", err)
+                    break
+                
+                # Извлекаем answer_markdown для показа пользователю
+                answer_markdown = response_data.get("answer_markdown", "")
+                needs_more_evidence = response_data.get("needs_more_evidence", False)
+                followup_images = response_data.get("followup_images", [])
+                followup_zooms = response_data.get("followup_zooms", [])
+                
+                # Показываем ответ пользователю (если есть)
+                if answer_markdown and answer_markdown.strip():
+                    self.sig_message.emit("assistant", answer_markdown, self.model)
+                    self.save_message("assistant", answer_markdown)
+                
                 # Факт по usage (анализ)
                 try:
                     usage = llm_client.last_usage
@@ -1006,31 +1000,16 @@ class AgentWorker(QThread):
                 # Флаг, указывающий, что был выполнен какой-то инструмент (images, zoom) и нужно продолжать цикл
                 tools_executed = False
 
-                # 0) Обрабатываем запросы документации (просто уведомляем пользователя)
-                doc_reqs = llm_client.parse_document_requests(response)
-                if doc_reqs:
-                    for dr in doc_reqs:
-                        docs_str = ", ".join(dr.documents)
-                        info_msg = f"📂 **Модель запрашивает дополнительные документы:**\n- {docs_str}\n\n*Причина:* {dr.reason}\n\n*Пожалуйста, прикрепите эти файлы (если они есть) для более точного анализа.*"
-                        self.sig_log.emit(f"Запрос документации: {docs_str}")
-                        self._append_app_log(f"Запрос документации: {docs_str}")
-                        # Отправляем сообщение как от системы/ассистента, чтобы пользователь увидел
-                        self.sig_message.emit("assistant", info_msg, self.model)
-                        # Сохраняем в историю
-                        self.save_message("assistant", info_msg)
-
-                # 1) Обрабатываем запросы на подгрузку изображений
-                img_reqs = llm_client.parse_image_requests(response)
-                if img_reqs:
+                # 1) Обрабатываем запросы на подгрузку изображений из followup_images
+                if followup_images and needs_more_evidence:
                     # Собираем уникальные id
                     req_ids = []
-                    for r in img_reqs:
-                        for rid in r.image_ids:
-                            rid = str(rid).strip()
-                            if rid.endswith(".pdf"):
-                                rid = rid[:-4]
-                            if rid and rid not in req_ids:
-                                req_ids.append(rid)
+                    for rid in followup_images:
+                        rid = str(rid).strip()
+                        if rid.endswith(".pdf"):
+                            rid = rid[:-4]
+                        if rid and rid not in req_ids:
+                            req_ids.append(rid)
 
                     info_msg = f"🖼️ Запрошены изображения: {', '.join(req_ids[:15])}{' ...' if len(req_ids) > 15 else ''}"
                     self.sig_log.emit(f"LLM запросила изображения: {req_ids}")
@@ -1112,7 +1091,19 @@ class AgentWorker(QThread):
                         llm_client.add_user_message("Не удалось загрузить запрошенные изображения. Попробуй указать другие image_ids из каталога.")
                         tools_executed = True
 
-                zoom_reqs = llm_client.parse_zoom_request(response)
+                # 2) Обрабатываем запросы zoom из followup_zooms
+                # Конвертируем followup_zooms в ZoomRequest объекты для совместимости
+                zoom_reqs = []
+                if followup_zooms and needs_more_evidence:
+                    for fz in followup_zooms:
+                        zoom_req = ZoomRequest(
+                            image_id=fz.get("image_id"),
+                            coords_norm=fz.get("coords_norm"),
+                            coords_px=None,
+                            reason=fz.get("reason", "Детальный анализ")
+                        )
+                        zoom_reqs.append(zoom_req)
+                
                 print(f"[GUI_AGENT] Zoom запросов: {len(zoom_reqs)}")
                 
                 if zoom_reqs:
@@ -1340,45 +1331,6 @@ class AgentWorker(QThread):
     def stop(self):
         self.is_running = False
 
-    def _process_image_request_simple(self, image_request, image_processor, doc_index, sent_ids_set=None):
-        """
-        Упрощённая обработка запроса изображений (для Pro-части).
-        Возвращает список ViewportCrop.
-        """
-        if sent_ids_set is None:
-            sent_ids_set = set()
-        
-        downloaded = []
-        for rid in image_request.image_ids:
-            rid = str(rid).strip()
-            if rid.endswith(".pdf"):
-                rid = rid[:-4]
-            if not rid or rid in sent_ids_set:
-                continue
-            
-            entry = doc_index.images.get(rid)
-            if not entry:
-                self._append_app_log(f"  ⚠️ Изображение не найдено: {rid}")
-                continue
-            
-            self.sig_log.emit(f"Загружаю изображение: {rid}")
-            self._append_app_log(f"  📥 Загрузка изображения: {rid}")
-            
-            image_source = entry.uri if entry.uri else entry.local_path
-            if not image_source:
-                self._append_app_log(f"  ⚠️ Нет источника изображения: {rid}")
-                continue
-            
-            crops = image_processor.download_and_process_pdf(image_source, image_id=rid)
-            if crops:
-                downloaded.extend(crops)
-                sent_ids_set.add(rid)
-                for c in crops:
-                    if c.image_path:
-                        self.sig_image.emit(c.image_path, f"Image: {rid}")
-        
-        return downloaded
-
     def _run_flash_pro_mode(self, full_md_text: str, files_to_process: list, 
                             attached_images: list, all_blocks: list):
         """
@@ -1524,7 +1476,10 @@ class AgentWorker(QThread):
             self._log_full(f"FLASH #{flash_step}: Запрос", self._sanitize_messages_for_log(flash_messages))
             
             try:
-                flash_response = llm_client.call_flash_model(flash_messages)
+                flash_response = llm_client.call_flash_model(
+                    flash_messages,
+                    response_schema=FLASH_EXTRACTOR_SCHEMA
+                )
             except Exception as e:
                 self.sig_log.emit(f"Ошибка Flash: {e}")
                 self._log_full(f"FLASH #{flash_step}: Ошибка", str(e))
@@ -1818,7 +1773,22 @@ class AgentWorker(QThread):
 Изображения и зумы прикреплены ниже. Проанализируй данные и ответь на вопрос."""
         
         pro_messages = [
-            {"role": "system", "content": analysis_prompt}
+            {"role": "system", "content": f"""{analysis_prompt}
+
+## ФОРМАТ ОТВЕТА (JSON):
+
+Твой ответ должен быть в формате JSON со следующими полями:
+- `answer_markdown` (string, обязательно): Полный ответ на вопрос в формате Markdown.
+- `summary` (string): Краткое резюме ответа (1-2 предложения).
+- `counts` (array): Подсчёты объектов (если применимо), каждый элемент: {{object_type, count, locations[]}}.
+- `citations` (array): Ссылки на источники, каждый элемент: {{image_id, coords_norm[4], note}}.
+- `confidence` (string): Уверенность в ответе ("high", "medium", "low").
+- `needs_more_evidence` (boolean): true если нужны дополнительные данные для более полного ответа.
+- `followup_images` (array[string]): Список ID изображений для запроса (если needs_more_evidence=true).
+- `followup_zooms` (array): Список запросов zoom (если needs_more_evidence=true), каждый элемент: {{image_id, coords_norm[4], reason}}.
+
+**Важно:** Если ты можешь ответить на вопрос с имеющимися данными, установи `needs_more_evidence=false` и оставь `followup_*` пустыми.
+"""}
         ]
         
         # Добавляем контекст и изображения
@@ -1851,9 +1821,13 @@ class AgentWorker(QThread):
         self._log_full("PRO: Запрос (полный)", self._sanitize_messages_for_log(pro_messages))
         self._log_full("PRO: Изображений в запросе", len(all_images))
         
-        # Вызываем Pro
+        # Вызываем Pro (response_json=True для структурированного ответа)
         try:
-            pro_response = llm_client.call_pro_model(pro_messages)
+            pro_response_json = llm_client.call_pro_model(
+                pro_messages, 
+                response_json=True,
+                response_schema=PRO_ANSWER_SCHEMA
+            )
         except Exception as e:
             err = f"Ошибка Pro модели: {e}"
             self.sig_log.emit(f"❌ {err}")
@@ -1874,35 +1848,64 @@ class AgentWorker(QThread):
             logger.debug(f"Не удалось обновить токены Pro: {e}")
         
         # Логируем ответ Pro
-        self._log_full("PRO: Ответ", pro_response)
+        self._log_full("PRO: Ответ (JSON)", pro_response_json)
+        
+        # Парсим JSON ответ
+        try:
+            pro_data = json.loads(pro_response_json)
+        except json.JSONDecodeError as e:
+            err = f"Ошибка парсинга JSON от Pro: {e}"
+            self.sig_log.emit(f"❌ {err}")
+            self._log_full("PRO: JSON error", str(e))
+            self.sig_message.emit("assistant", f"⚠️ {err}\n\nСырой ответ:\n{pro_response_json}", "gemini-3-pro-preview")
+            self.save_message("assistant", f"⚠️ {err}")
+            self.sig_finished.emit()
+            return
+        
+        # Извлекаем данные из JSON ответа
+        answer_markdown = pro_data.get("answer_markdown", "")
+        needs_more_evidence = pro_data.get("needs_more_evidence", False)
+        followup_images = pro_data.get("followup_images", [])
+        followup_zooms = pro_data.get("followup_zooms", [])
+        confidence = pro_data.get("confidence", "medium")
+        
+        self._log_full("PRO: answer_markdown", answer_markdown)
+        self._log_full("PRO: needs_more_evidence", needs_more_evidence)
+        self._log_full("PRO: confidence", confidence)
         
         # ===== ЦИКЛ ОБРАБОТКИ TOOL CALLS ОТ PRO =====
         pro_step = 1
         max_pro_steps = 10
         
-        while pro_step <= max_pro_steps:
-            # Проверяем наличие tool calls
-            zoom_reqs = llm_client.parse_zoom_request(pro_response)
-            img_reqs = llm_client.parse_image_requests(pro_response)
+        while pro_step <= max_pro_steps and needs_more_evidence:
+            self._append_app_log(f"\n{'='*20} PRO ШАГ {pro_step} (ДОПОЛНИТЕЛЬНЫЕ ДАННЫЕ) {'='*20}")
             
-            if not zoom_reqs and not img_reqs:
-                # Нет tool calls — это финальный ответ
-                break
+            has_new_data = False
             
-            self._append_app_log(f"\n{'='*20} PRO ШАГ {pro_step} {'='*20}")
-            
-            # Обработка запросов изображений
-            if img_reqs:
-                self._log_full(f"PRO #{pro_step}: Запросы изображений", [
-                    {"image_ids": ir.image_ids, "reason": ir.reason} for ir in img_reqs
-                ])
+            # Обработка followup_images
+            if followup_images:
+                self._log_full(f"PRO #{pro_step}: Запросы изображений", followup_images)
                 
                 new_images = []
-                sent_pro_ids = set()
-                for ir in img_reqs:
-                    self.sig_log.emit(f"Pro запросила изображения: {ir.reason[:50]}")
-                    loaded = self._process_image_request_simple(ir, image_processor, doc_index, sent_pro_ids)
-                    new_images.extend(loaded)
+                for img_id in followup_images:
+                    self.sig_log.emit(f"Pro запросила изображение: {img_id}")
+                    entry = doc_index.images.get(img_id)
+                    if not entry:
+                        self._append_app_log(f"  ⚠️ Изображение не найдено: {img_id}")
+                        continue
+                    
+                    self._append_app_log(f"  📥 Загрузка изображения: {img_id}")
+                    try:
+                        # Используем локальный путь если нет URI
+                        image_source = entry.uri if entry.uri else entry.local_path
+                        if not image_source:
+                            self._append_app_log(f"  ⚠️ Нет источника изображения: {img_id}")
+                            continue
+                        
+                        loaded = image_processor.download_and_process_pdf(image_source, image_id=img_id)
+                        new_images.extend(loaded)
+                    except Exception as e:
+                        self._append_app_log(f"  ❌ Ошибка загрузки {img_id}: {e}")
                 
                 if new_images:
                     # Загружаем в Google Files API
@@ -1910,9 +1913,10 @@ class AgentWorker(QThread):
                     # Fallback на S3
                     self._upload_images_to_s3(new_images)
                     all_images.extend(new_images)
+                    has_new_data = True
                     
                     # Добавляем изображения в историю Pro
-                    content_with_images = [{"type": "text", "text": "Загружены изображения:"}]
+                    content_with_images = [{"type": "text", "text": "Загружены дополнительные изображения:"}]
                     for vc in new_images:
                         img_url = getattr(vc, 'google_file_uri', None) or vc.s3_url
                         if img_url:
@@ -1922,64 +1926,117 @@ class AgentWorker(QThread):
                             })
                     pro_messages.append({"role": "user", "content": content_with_images})
             
-            # Обработка zoom запросов
-            if zoom_reqs:
-                self._log_full(f"PRO #{pro_step}: Запросы ZOOM", [
-                    {"image_id": zr.image_id, "coords_norm": zr.coords_norm, "coords_px": zr.coords_px, "reason": zr.reason}
-                    for zr in zoom_reqs
-                ])
+            # Обработка followup_zooms
+            if followup_zooms:
+                self._log_full(f"PRO #{pro_step}: Запросы ZOOM", followup_zooms)
                 
                 zoom_crops = []
-                for i, zr in enumerate(zoom_reqs):
-                    self.sig_log.emit(f"Pro запросила zoom: {zr.reason[:50]}")
-                    self._append_app_log(f"  🔍 PRO ZOOM #{i+1}: {zr.image_id}, coords_norm={zr.coords_norm}, reason={zr.reason[:80]}")
+                for i, fz in enumerate(followup_zooms):
+                    img_id = fz.get("image_id")
+                    coords_norm = fz.get("coords_norm")
+                    reason = fz.get("reason", "")
+                    
+                    # ФИКС: Проверяем формат coords_norm
+                    if coords_norm and isinstance(coords_norm, list):
+                        # Если это плоский массив координат (ошибка модели), пропускаем
+                        if len(coords_norm) != 4:
+                            self._append_app_log(f"  ⚠️ ZOOM #{i+1}: Неверный формат coords_norm (ожидается [x1,y1,x2,y2], получено {len(coords_norm)} элементов). Пропускаю.")
+                            continue
+                        # Проверяем что все координаты - числа
+                        if not all(isinstance(c, (int, float)) for c in coords_norm):
+                            self._append_app_log(f"  ⚠️ ZOOM #{i+1}: coords_norm содержит не-числа. Пропускаю.")
+                            continue
+                    else:
+                        self._append_app_log(f"  ⚠️ ZOOM #{i+1}: Отсутствуют coords_norm. Пропускаю.")
+                        continue
+                    
+                    self.sig_log.emit(f"Pro запросила zoom: {reason[:50]}")
+                    self._append_app_log(f"  🔍 PRO ZOOM #{i+1}: {img_id}, coords_norm={coords_norm}, reason={reason[:80]}")
                     
                     # Загружаем изображение если нужно
-                    img_id = getattr(zr, "image_id", None)
                     if isinstance(img_id, str) and img_id:
-                        if img_id.endswith(".pdf"):
-                            self._append_app_log(f"Загружаем PDF для zoom: {img_id}")
-                            crops = image_processor.download_and_process_pdf(img_id, image_id=img_id)
-                        elif img_id in doc_index.images:
-                            entry = doc_index.images[img_id]
-                            if entry.uri and entry.uri.startswith("http"):
-                                self._append_app_log(f"Загружаем изображение для zoom: {entry.uri[:80]}")
-                                crops = image_processor.download_and_process_pdf(entry.uri, image_id=img_id)
-                    
-                    # Выполняем zoom
-                    zoom_output_path = self.data_root / "temp" / f"pro_zoom_{pro_step}_{i}.png"
-                    zoom_crop = image_processor.process_zoom_request(zr, output_path=zoom_output_path)
-                    
-                    if zoom_crop:
-                        zoom_crops.append(zoom_crop)
-                        self._append_app_log(f"  ✅ Zoom #{i+1} выполнен: {zoom_crop.description[:100]}")
+                        entry = doc_index.images.get(img_id)
+                        if not entry:
+                            self._append_app_log(f"  ⚠️ Изображение не найдено: {img_id}")
+                            continue
+                        
+                        # Загружаем и обрабатываем
+                        try:
+                            # Используем локальный путь если нет URI
+                            image_source = entry.uri if entry.uri else entry.local_path
+                            if not image_source:
+                                self._append_app_log(f"  ⚠️ Нет источника изображения: {img_id}")
+                                continue
+                            
+                            loaded = image_processor.download_and_process_pdf(image_source, image_id=img_id)
+                            # Создаем zoom crop
+                            zoom_output_path = self.data_root / "temp" / f"pro_zoom_{pro_step}_{i}.png"
+                            zoom_result = image_processor.process_zoom_request(img_id, coords_norm, output_path=zoom_output_path)
+                            if zoom_result:
+                                zoom_crops.append(zoom_result)
+                        except Exception as e:
+                            self._append_app_log(f"  ❌ Ошибка zoom {img_id}: {e}")
                 
                 if zoom_crops:
-                    # Загружаем в Google Files API
+                    # Загружаем зумы в Google Files API
                     self._upload_images_to_google_files(zoom_crops, llm_client)
                     # Fallback на S3
                     self._upload_images_to_s3(zoom_crops)
                     all_images.extend(zoom_crops)
+                    has_new_data = True
                     
-                    # Добавляем zoom результаты в историю Pro
-                    content_with_zooms = [{"type": "text", "text": "Zoom результаты:"}]
-                    for vc in zoom_crops:
-                        img_url = getattr(vc, 'google_file_uri', None) or vc.s3_url
+                    # Добавляем в историю Pro
+                    content_with_zooms = [{"type": "text", "text": "Выполнены zoom запросы:"}]
+                    for zc in zoom_crops:
+                        desc = zc.description[:100] if zc.description else "Zoom"
+                        img_url = getattr(zc, 'google_file_uri', None) or zc.s3_url
                         if img_url:
+                            content_with_zooms.append({"type": "text", "text": f"[{desc}]"})
                             content_with_zooms.append({
                                 "type": "image_url",
                                 "image_url": {"url": img_url}
                             })
                     pro_messages.append({"role": "user", "content": content_with_zooms})
             
-            # Повторный вызов Pro
+            # Если нет новых данных - выход
+            if not has_new_data:
+                self._append_app_log("  ℹ️ Нет новых данных для загрузки")
+                break
+            
+            # Повторный запрос к Pro
             try:
-                pro_response = llm_client.call_pro_model(pro_messages)
-                self._log_full(f"PRO #{pro_step}: Ответ", pro_response)
+                pro_response_json = llm_client.call_pro_model(
+                    pro_messages, 
+                    response_json=True,
+                    response_schema=PRO_ANSWER_SCHEMA
+                )
             except Exception as e:
-                err = f"Ошибка Pro модели на шаге {pro_step}: {e}"
+                err = f"Ошибка Pro модели (шаг {pro_step}): {e}"
                 self.sig_log.emit(f"❌ {err}")
-                self._log_full(f"PRO #{pro_step}: Ошибка", str(e))
+                self._log_full(f"PRO шаг {pro_step}: Ошибка", str(e))
+                break
+            
+            # Обновляем токены
+            try:
+                usage = llm_client.last_usage
+                if isinstance(usage, dict) and usage.get("total_tokens"):
+                    self._update_tokens(usage.get("total_tokens"))
+            except:
+                pass
+            
+            # Парсим ответ
+            try:
+                pro_data = json.loads(pro_response_json)
+                answer_markdown = pro_data.get("answer_markdown", answer_markdown)  # Обновляем ответ
+                needs_more_evidence = pro_data.get("needs_more_evidence", False)
+                followup_images = pro_data.get("followup_images", [])
+                followup_zooms = pro_data.get("followup_zooms", [])
+                confidence = pro_data.get("confidence", confidence)
+                
+                self._log_full(f"PRO шаг {pro_step}: answer_markdown", answer_markdown)
+                self._log_full(f"PRO шаг {pro_step}: needs_more_evidence", needs_more_evidence)
+            except json.JSONDecodeError as e:
+                self._log_full(f"PRO шаг {pro_step}: JSON error", str(e))
                 break
             
             pro_step += 1
@@ -1987,9 +2044,17 @@ class AgentWorker(QThread):
         if pro_step > max_pro_steps:
             self.sig_log.emit(f"⚠️ Достигнут лимит шагов Pro: {max_pro_steps}")
         
-        # Отправляем финальный ответ пользователю
-        self.sig_message.emit("assistant", pro_response, "gemini-3-pro-preview")
-        self.save_message("assistant", pro_response, images=all_images)
+        # Отправляем финальный ответ пользователю (answer_markdown)
+        # ФИКС: Проверяем что answer_markdown не пустой
+        if not answer_markdown or not answer_markdown.strip():
+            err = "⚠️ Pro модель не вернула финальный ответ (answer_markdown пустой)"
+            self.sig_log.emit(err)
+            self._log_full("PRO: Ошибка", err)
+            self.sig_message.emit("assistant", err, "gemini-3-pro-preview")
+            self.save_message("assistant", err)
+        else:
+            self.sig_message.emit("assistant", answer_markdown, "gemini-3-pro-preview")
+            self.save_message("assistant", answer_markdown, images=all_images)
         
         self._append_app_log(f"\n{'='*20} FLASH+PRO ЗАВЕРШЕНО {'='*20}")
         self.sig_log.emit("✅ Flash + Pro обработка завершена")
