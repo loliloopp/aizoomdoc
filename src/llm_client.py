@@ -372,14 +372,15 @@ class LLMClient:
             mime_type = mime_types.get(suffix, 'application/octet-stream')
             
             # Загружаем файл через Google Files API
-            # ВАЖНО: Google Files API ожидает путь к файлу, а не байты
-            uploaded_file = self.google_client.files.upload(
-                path=str(path),  # Передаем путь как строку
-                config={
-                    "display_name": display_name or path.name,
-                    "mime_type": mime_type
-                }
-            )
+            # Google Files API принимает открытый файл, а не путь
+            with open(path, 'rb') as f:
+                uploaded_file = self.google_client.files.upload(
+                    file=f,
+                    config={
+                        "display_name": display_name or path.name,
+                        "mime_type": mime_type
+                    }
+                )
             
             # Возвращаем URI файла
             file_uri = uploaded_file.uri if hasattr(uploaded_file, 'uri') else str(uploaded_file.name)

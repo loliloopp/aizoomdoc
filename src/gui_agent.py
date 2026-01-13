@@ -352,10 +352,12 @@ class AgentWorker(QThread):
             json.dump(self.chat_history_data, f, indent=2, ensure_ascii=False)
         self.sig_history_saved.emit(self.chat_id, self.query)
 
-    def _log_full(self, header: str, content: object):
+    def _log_full(self, header: str, content: object, timestamp: bool = True):
+        """Логирование с опциональным timestamp."""
         try:
             with open(self.full_log_path, "a", encoding="utf-8") as f:
-                f.write(f"\n{'='*20} {header} {'='*20}\n")
+                ts = f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] " if timestamp else ""
+                f.write(f"\n{ts}{'='*20} {header} {'='*20}\n")
                 if isinstance(content, (dict, list)):
                     f.write(json.dumps(content, indent=2, ensure_ascii=False))
                 else:
@@ -364,10 +366,53 @@ class AgentWorker(QThread):
         except Exception as e:
             logger.error(f"Failed to write full log: {e}")
 
-    def _append_app_log(self, text: str):
+    def _append_app_log(self, text: str, timestamp: bool = True):
+        """Добавление строки в лог с опциональным timestamp."""
         try:
             with open(self.full_log_path, "a", encoding="utf-8") as f:
-                f.write(f"{text}\n")
+                ts = f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] " if timestamp else ""
+                f.write(f"{ts}{text}\n")
+        except: pass
+    
+    def _log_api_call(self, phase: str, model: str, params: dict, start_time: float = None):
+        """Логирование API вызова с параметрами и таймингом."""
+        try:
+            with open(self.full_log_path, "a", encoding="utf-8") as f:
+                ts = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+                duration = f" ({(datetime.now().timestamp() - start_time)*1000:.0f}ms)" if start_time else ""
+                f.write(f"\n[{ts}] {'='*15} {phase} - {model}{duration} {'='*15}\n")
+                f.write(json.dumps(params, indent=2, ensure_ascii=False))
+                f.write("\n")
+        except: pass
+    
+    def _log_tokens(self, usage: dict, phase: str = ""):
+        """Логирование использования токенов."""
+        try:
+            with open(self.full_log_path, "a", encoding="utf-8") as f:
+                ts = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+                prefix = f"{phase} - " if phase else ""
+                f.write(f"[{ts}] 📊 {prefix}Tokens: in={usage.get('prompt_tokens', 0):,}, "
+                       f"out={usage.get('completion_tokens', 0):,}, "
+                       f"total={usage.get('total_tokens', 0):,}\n")
+        except: pass
+    
+    def _log_summary(self, total_tokens: dict, total_duration_ms: float, stages: list):
+        """Логирование итоговой статистики."""
+        try:
+            with open(self.full_log_path, "a", encoding="utf-8") as f:
+                f.write(f"\n{'='*60}\n")
+                f.write(f"📋 SUMMARY\n")
+                f.write(f"{'='*60}\n")
+                f.write(f"Total duration: {total_duration_ms/1000:.1f}s ({total_duration_ms:.0f}ms)\n")
+                f.write(f"Total tokens: {total_tokens.get('total_tokens', 0):,} "
+                       f"(in: {total_tokens.get('prompt_tokens', 0):,}, "
+                       f"out: {total_tokens.get('completion_tokens', 0):,})\n")
+                if stages:
+                    f.write(f"\nStages:\n")
+                    for stage in stages:
+                        f.write(f"  - {stage['name']}: {stage['duration_ms']:.0f}ms, "
+                               f"{stage.get('tokens', 0):,} tokens\n")
+                f.write(f"{'='*60}\n")
         except: pass
 
     def _sanitize_messages_for_log(self, messages: list) -> list:
@@ -756,8 +801,22 @@ class AgentWorker(QThread):
                 # Передаём изображения в LLM
                 llm_client.add_user_message(context, images=attached_images)
                 
+                # Логируем API вызов
+                start_time = datetime.now().timestamp()
+                self._log_api_call(f"API Call START - {self.model}", self.model, {
+                    "query_length": len(self.query),
+                    "images_count": len(attached_images)
+                })
+                
                 # Получаем ответ (JSON)
                 response_json = llm_client.get_response()
+                
+                # Логируем токены
+                if hasattr(llm_client, 'last_usage') and llm_client.last_usage:
+                    self._log_tokens(llm_client.last_usage, self.model)
+                self._log_api_call(f"API Call COMPLETE - {self.model}", self.model, {
+                    "response_length": len(response_json)
+                }, start_time)
                 
                 # Парсим JSON и извлекаем answer_markdown
                 try:
@@ -936,6 +995,11 @@ class AgentWorker(QThread):
             missing_repeat_count = 0
             max_missing_repeats = 3
             
+            # Статистика для summary
+            stages = []
+            total_tokens = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+            session_start = datetime.now().timestamp()
+            
             while step < max_steps and self.is_running:
                 step += 1
                 self.current_step = step
@@ -948,6 +1012,12 @@ class AgentWorker(QThread):
                         self.sig_log.emit("⚠️ Риск переполнения контекста на текущем шаге!")
                 except: pass
                 
+                step_start = datetime.now().timestamp()
+                self._log_api_call(f"Step {step} START - {self.model}", self.model, {
+                    "step": step,
+                    "history_length": len(llm_client.history)
+                })
+                
                 try:
                     response_json = llm_client.get_response()
                 except Exception as e:
@@ -957,6 +1027,24 @@ class AgentWorker(QThread):
                         self.save_message("system", err)
                         raise ValueError(err)
                     raise e
+                
+                # Логируем токены и длительность
+                step_duration = (datetime.now().timestamp() - step_start) * 1000
+                if hasattr(llm_client, 'last_usage') and llm_client.last_usage:
+                    usage = llm_client.last_usage
+                    self._log_tokens(usage, f"Step {step}")
+                    # Суммируем
+                    for key in total_tokens:
+                        total_tokens[key] += usage.get(key, 0)
+                    stages.append({
+                        "name": f"Step {step}",
+                        "duration_ms": step_duration,
+                        "tokens": usage.get('total_tokens', 0)
+                    })
+                
+                self._log_api_call(f"Step {step} COMPLETE - {self.model}", self.model, {
+                    "response_length": len(response_json)
+                }, step_start)
                 
                 # Парсим JSON ответ
                 try:
@@ -1315,6 +1403,10 @@ class AgentWorker(QThread):
                     except Exception as e:
                         logger.warning(f"Не удалось обновить память диалога: {e}")
 
+                    # Логируем итоговую статистику
+                    total_duration = (datetime.now().timestamp() - session_start) * 1000
+                    self._log_summary(total_tokens, total_duration, stages)
+
                     self.sig_finished.emit()
                     return
 
@@ -1322,6 +1414,10 @@ class AgentWorker(QThread):
                 err = "Лимит шагов."
                 self.sig_error.emit(err)
                 self.save_message("system", err)
+                
+                # Логируем статистику даже при лимите шагов
+                total_duration = (datetime.now().timestamp() - session_start) * 1000
+                self._log_summary(total_tokens, total_duration, stages)
                 
         except Exception as e:
             logger.error(f"Error: {e}", exc_info=True)
@@ -1467,6 +1563,11 @@ class AgentWorker(QThread):
         flash_step = 0
         extracted_context = None
         
+        # Статистика Flash
+        flash_tokens = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        flash_stages = []
+        flash_session_start = datetime.now().timestamp()
+        
         while flash_step < max_flash_steps and self.is_running:
             flash_step += 1
             self.sig_log.emit(f"Flash шаг {flash_step}/{max_flash_steps}...")
@@ -1475,7 +1576,20 @@ class AgentWorker(QThread):
             # Логируем запрос к Flash
             self._log_full(f"FLASH #{flash_step}: Запрос", self._sanitize_messages_for_log(flash_messages))
             
+            flash_step_start = datetime.now().timestamp()
+            
             try:
+                # Логируем параметры API
+                self._log_api_call(f"FLASH Step {flash_step} START", "gemini-3-flash", {
+                    "temperature": 0.1,
+                    "top_p": config.LLM_TOP_P,
+                    "media_resolution": config.MEDIA_RESOLUTION,
+                    "thinking_enabled": config.THINKING_ENABLED,
+                    "thinking_budget": config.THINKING_BUDGET if config.THINKING_ENABLED else None,
+                    "response_json": True,
+                    "response_schema": "FLASH_EXTRACTOR_SCHEMA"
+                })
+                
                 flash_response = llm_client.call_flash_model(
                     flash_messages,
                     response_schema=FLASH_EXTRACTOR_SCHEMA
@@ -1484,6 +1598,24 @@ class AgentWorker(QThread):
                 self.sig_log.emit(f"Ошибка Flash: {e}")
                 self._log_full(f"FLASH #{flash_step}: Ошибка", str(e))
                 break
+            
+            # Логируем токены и длительность
+            flash_step_duration = (datetime.now().timestamp() - flash_step_start) * 1000
+            if hasattr(llm_client, 'last_usage') and llm_client.last_usage:
+                usage = llm_client.last_usage
+                self._log_tokens(usage, f"FLASH Step {flash_step}")
+                # Суммируем
+                for key in flash_tokens:
+                    flash_tokens[key] += usage.get(key, 0)
+                flash_stages.append({
+                    "name": f"FLASH Step {flash_step}",
+                    "duration_ms": flash_step_duration,
+                    "tokens": usage.get('total_tokens', 0)
+                })
+            
+            self._log_api_call(f"FLASH Step {flash_step} COMPLETE", "gemini-3-flash", {
+                "response_length": len(flash_response) if isinstance(flash_response, str) else 0
+            }, flash_step_start)
             
             # Обновляем счетчик токенов после вызова Flash
             try:
@@ -1821,6 +1953,24 @@ class AgentWorker(QThread):
         self._log_full("PRO: Запрос (полный)", self._sanitize_messages_for_log(pro_messages))
         self._log_full("PRO: Изображений в запросе", len(all_images))
         
+        # Статистика Pro
+        pro_tokens = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        pro_stages = []
+        pro_session_start = datetime.now().timestamp()
+        pro_step_start = datetime.now().timestamp()
+        
+        # Логируем параметры API
+        self._log_api_call("PRO Initial Request START", "gemini-3-pro", {
+            "temperature": config.LLM_TEMPERATURE,
+            "top_p": config.LLM_TOP_P,
+            "max_output_tokens": config.MAX_TOKENS,
+            "media_resolution": config.MEDIA_RESOLUTION,
+            "thinking_enabled": config.THINKING_ENABLED,
+            "thinking_budget": config.THINKING_BUDGET if config.THINKING_ENABLED else None,
+            "response_json": True,
+            "response_schema": "PRO_ANSWER_SCHEMA"
+        })
+        
         # Вызываем Pro (response_json=True для структурированного ответа)
         try:
             pro_response_json = llm_client.call_pro_model(
@@ -1836,6 +1986,24 @@ class AgentWorker(QThread):
             self.save_message("assistant", f"⚠️ {err}")
             self.sig_finished.emit()
             return
+        
+        # Логируем токены и длительность
+        pro_step_duration = (datetime.now().timestamp() - pro_step_start) * 1000
+        if hasattr(llm_client, 'last_usage') and llm_client.last_usage:
+            usage = llm_client.last_usage
+            self._log_tokens(usage, "PRO Initial Request")
+            # Суммируем
+            for key in pro_tokens:
+                pro_tokens[key] += usage.get(key, 0)
+            pro_stages.append({
+                "name": "PRO Initial Request",
+                "duration_ms": pro_step_duration,
+                "tokens": usage.get('total_tokens', 0)
+            })
+        
+        self._log_api_call("PRO Initial Request COMPLETE", "gemini-3-pro", {
+            "response_length": len(pro_response_json)
+        }, pro_step_start)
         
         # Обновляем счетчик токенов после вызова Pro
         try:
@@ -1915,6 +2083,11 @@ class AgentWorker(QThread):
                     all_images.extend(new_images)
                     has_new_data = True
                     
+                    # Показываем изображения в GUI
+                    for vc in new_images:
+                        if vc.image_path:
+                            self.sig_image.emit(vc.image_path, f"Pro: {img_id}")
+                    
                     # Добавляем изображения в историю Pro
                     content_with_images = [{"type": "text", "text": "Загружены дополнительные изображения:"}]
                     for vc in new_images:
@@ -1984,6 +2157,11 @@ class AgentWorker(QThread):
                     self._upload_images_to_s3(zoom_crops)
                     all_images.extend(zoom_crops)
                     has_new_data = True
+                    
+                    # Показываем зумы в GUI
+                    for zc in zoom_crops:
+                        if zc.image_path:
+                            self.sig_image.emit(zc.image_path, f"Pro zoom: {zc.description[:50] if zc.description else 'Zoom'}")
                     
                     # Добавляем в историю Pro
                     content_with_zooms = [{"type": "text", "text": "Выполнены zoom запросы:"}]
@@ -2055,6 +2233,26 @@ class AgentWorker(QThread):
         else:
             self.sig_message.emit("assistant", answer_markdown, "gemini-3-pro-preview")
             self.save_message("assistant", answer_markdown, images=all_images)
+        
+        # Логируем итоговую статистику Flash+Pro
+        flash_duration = (datetime.now().timestamp() - flash_session_start) * 1000
+        pro_duration = (datetime.now().timestamp() - pro_session_start) * 1000
+        total_duration = flash_duration + pro_duration
+        
+        # Суммарные токены
+        total_tokens = {
+            "prompt_tokens": flash_tokens["prompt_tokens"] + pro_tokens["prompt_tokens"],
+            "completion_tokens": flash_tokens["completion_tokens"] + pro_tokens["completion_tokens"],
+            "total_tokens": flash_tokens["total_tokens"] + pro_tokens["total_tokens"]
+        }
+        
+        # Объединяем этапы
+        all_stages = [
+            {"name": f"FLASH ({len(flash_stages)} steps)", "duration_ms": flash_duration, "tokens": flash_tokens["total_tokens"]},
+            {"name": f"PRO ({len(pro_stages)} steps)", "duration_ms": pro_duration, "tokens": pro_tokens["total_tokens"]}
+        ]
+        
+        self._log_summary(total_tokens, total_duration, all_stages)
         
         self._append_app_log(f"\n{'='*20} FLASH+PRO ЗАВЕРШЕНО {'='*20}")
         self.sig_log.emit("✅ Flash + Pro обработка завершена")
