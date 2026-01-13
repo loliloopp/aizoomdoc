@@ -14,6 +14,7 @@ import cv2
 import numpy as np
 import requests
 import fitz  # PyMuPDF
+from urllib.parse import urlparse
 
 from .config import config
 from .models import Page, ViewportCrop, ZoomRequest
@@ -79,28 +80,53 @@ class ImageProcessor:
             if img_bgr is None:
                 # Проверяем, локальный ли это путь
                 is_local = os.path.exists(url) or (len(url) > 2 and url[1] == ':')  # Windows путь
+                # Определяем тип по расширению (и для локальных, и для http)
+                try:
+                    parsed = urlparse(url)
+                    ext_source = parsed.path if parsed.scheme in ("http", "https") else url
+                except Exception:
+                    ext_source = url
+                suffix = Path(ext_source).suffix.lower()
+                is_image_file = suffix in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff")
                 
                 if is_local:
-                    logger.info(f"Чтение локального PDF: {url}")
-                    with fitz.open(url) as doc:
-                        if doc.page_count == 0:
+                    if is_image_file:
+                        logger.info(f"Чтение локального изображения: {url}")
+                        img_bgr = cv2.imread(str(url))
+                        if img_bgr is None:
+                            logger.error(f"Не удалось прочитать локальное изображение: {url}")
                             return []
-                        page = doc[0]
-                        pix = page.get_pixmap(dpi=200) 
-                        img_array = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
-                        img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR) if pix.n >= 3 else cv2.cvtColor(img_array, cv2.COLOR_GRAY2BGR)
+                    else:
+                        logger.info(f"Чтение локального PDF: {url}")
+                        with fitz.open(url) as doc:
+                            if doc.page_count == 0:
+                                return []
+                            page = doc[0]
+                            pix = page.get_pixmap(dpi=200) 
+                            img_array = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+                            img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR) if pix.n >= 3 else cv2.cvtColor(img_array, cv2.COLOR_GRAY2BGR)
                 else:
-                    logger.info(f"Скачивание PDF: {url}")
-                    response = requests.get(url, timeout=30)
-                    response.raise_for_status()
-                    
-                    with fitz.open(stream=response.content, filetype="pdf") as doc:
-                        if doc.page_count == 0:
+                    if is_image_file:
+                        logger.info(f"Скачивание изображения: {url}")
+                        response = requests.get(url, timeout=30)
+                        response.raise_for_status()
+                        data = np.frombuffer(response.content, dtype=np.uint8)
+                        img_bgr = cv2.imdecode(data, cv2.IMREAD_COLOR)
+                        if img_bgr is None:
+                            logger.error(f"Не удалось декодировать изображение по URL: {url}")
                             return []
-                        page = doc[0]
-                        pix = page.get_pixmap(dpi=200) 
-                        img_array = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
-                        img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR) if pix.n >= 3 else cv2.cvtColor(img_array, cv2.COLOR_GRAY2BGR)
+                    else:
+                        logger.info(f"Скачивание PDF: {url}")
+                        response = requests.get(url, timeout=30)
+                        response.raise_for_status()
+                        
+                        with fitz.open(stream=response.content, filetype="pdf") as doc:
+                            if doc.page_count == 0:
+                                return []
+                            page = doc[0]
+                            pix = page.get_pixmap(dpi=200) 
+                            img_array = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+                            img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR) if pix.n >= 3 else cv2.cvtColor(img_array, cv2.COLOR_GRAY2BGR)
                 
                 # Сохраняем оригинал
                 cv2.imwrite(str(cache_path), img_bgr)
@@ -218,6 +244,21 @@ class ImageProcessor:
             # Загружаем из кэша
             path = self._image_cache[img_id]
             img = cv2.imread(str(path))
+        elif img_id and getattr(request, "source_path", None):
+            # Если кэш не прогрет, пробуем загрузить исходник напрямую из source_path (локальный файл)
+            try:
+                sp = str(getattr(request, "source_path"))
+                if sp and os.path.exists(sp):
+                    img = cv2.imread(sp)
+                    if img is not None:
+                        # Кладем в кэш под image_id, чтобы дальше все работало по ID
+                        cache_path = self.temp_dir / f"{img_id}_full.png"
+                        cv2.imwrite(str(cache_path), img)
+                        h, w = img.shape[:2]
+                        self._image_cache[img_id] = cache_path
+                        self._image_sizes[img_id] = (w, h)
+            except Exception as e:
+                logger.warning(f"Не удалось загрузить source_path для zoom: {e}")
         elif isinstance(request.page_number, int):
              # Локальная страница
              img = self.load_local_page(request.page_number)
@@ -291,5 +332,6 @@ class ImageProcessor:
             crop_coords=(x1, y1, x2, y2),
             image_path=str(output_path),
             description=desc,
+            target_blocks=[img_id] if img_id else [],
             is_zoom_request=True
         )

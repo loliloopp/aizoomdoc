@@ -695,7 +695,7 @@ class LLMClient:
                             b64_data = url.split(",")[1]
                             image_data = base64.b64decode(b64_data)
                             parts.append(genai_types.Part(inline_data={"mime_type": "image/jpeg", "data": image_data}))
-                        elif url.startswith("files/") or url.startswith("gs://"):
+                        elif url.startswith("files/") or url.startswith("gs://") or "generativelanguage.googleapis.com/v1beta/files/" in url:
                             # Google Files API URI: передаем как file_data (без попытки скачать по HTTP)
                             parts.append(genai_types.Part(file_data={"mime_type": "image/png", "file_uri": url}))
                         else:
@@ -857,30 +857,33 @@ class LLMClient:
             return (prev_summary or "").strip()
 
     def parse_zoom_request(self, response_text: str) -> List[ZoomRequest]:
+        """
+        Парсит запросы zoom из ответа модели.
+        Поддерживает как прямой формат {"tool": "zoom", ...},
+        так и вложенный {"tool_calls": [{"tool": "zoom", ...}]}.
+        """
         response_text = response_text.strip()
-        data_list = []
         
-        # 1. Попытка извлечь из markdown блоков (для надежности)
-        # Ищем ```json ... ``` и просто ``` ... ```
-        code_blocks = re.findall(r"```(?:json)?\s*([\s\S]*?)\s*```", response_text, re.IGNORECASE)
-        for block in code_blocks:
-             extracted = extract_json_objects(block)
-             data_list.extend(extracted)
-
-        # 2. Если ничего не нашли или если модель пишет вне блоков, сканируем весь текст
-        # extract_json_objects достаточно умная, чтобы найти объекты в мусоре
+        # Извлекаем все JSON-объекты
         all_objects = extract_json_objects(response_text)
         
-        # Объединяем, убирая дубликаты (по контенту сложно, но объекты разные)
-        # Просто берем all_objects, так как он охватывает и то что внутри блоков
-        # Но чтобы сохранить приоритет блоков (если вдруг), можно оставить логику.
-        # Однако extract_json_objects(response_text) найдет ВСЁ, включая то что в блоках.
-        # Поэтому просто используем его.
-        data_list = all_objects
+        # Разворачиваем tool_calls если есть
+        data_list = []
+        for item in all_objects:
+            if not isinstance(item, dict):
+                continue
+            # Если есть tool_calls — добавляем их содержимое
+            if "tool_calls" in item and isinstance(item["tool_calls"], list):
+                for tc in item["tool_calls"]:
+                    if isinstance(tc, dict):
+                        data_list.append(tc)
+            # Также проверяем сам объект (на случай прямого формата)
+            if item.get("tool"):
+                data_list.append(item)
 
         zoom_requests = []
         for item in data_list:
-            if isinstance(item, dict) and item.get("tool") == "zoom":
+            if item.get("tool") == "zoom":
                 coords_norm = item.get("coords_norm")
                 coords_px = item.get("coords_px")
                 
@@ -921,6 +924,8 @@ class LLMClient:
     def parse_image_requests(self, response_text: str) -> List[ImageRequest]:
         """
         Ищет в ответе JSON-команды tool=request_images и возвращает список ImageRequest.
+        Поддерживает как прямой формат {"tool": "request_images", ...},
+        так и вложенный {"tool_calls": [{"tool": "request_images", ...}]}.
         """
         response_text = (response_text or "").strip()
         if not response_text:
@@ -929,10 +934,22 @@ class LLMClient:
         # Используем универсальный экстрактор
         data_list = extract_json_objects(response_text)
 
-        requests_out: List[ImageRequest] = []
+        # Разворачиваем tool_calls если есть
+        all_items = []
         for item in data_list:
             if not isinstance(item, dict):
                 continue
+            # Если есть tool_calls — добавляем их содержимое
+            if "tool_calls" in item and isinstance(item["tool_calls"], list):
+                for tc in item["tool_calls"]:
+                    if isinstance(tc, dict):
+                        all_items.append(tc)
+            # Также проверяем сам объект (на случай прямого формата)
+            if item.get("tool"):
+                all_items.append(item)
+
+        requests_out: List[ImageRequest] = []
+        for item in all_items:
             if item.get("tool") != "request_images":
                 continue
             ids = item.get("image_ids") or item.get("images") or item.get("ids") or []
@@ -1051,7 +1068,7 @@ class LLMClient:
                             b64_data = url.split(",")[1]
                             image_data = base64.b64decode(b64_data)
                             parts.append(genai_types.Part(inline_data={"mime_type": "image/jpeg", "data": image_data}))
-                        elif url.startswith("files/") or url.startswith("gs://"):
+                        elif url.startswith("files/") or url.startswith("gs://") or "generativelanguage.googleapis.com/v1beta/files/" in url:
                             parts.append(genai_types.Part(file_data={"mime_type": "image/png", "file_uri": url}))
                         else:
                             try:
@@ -1170,7 +1187,7 @@ class LLMClient:
                             b64_data = url.split(",")[1]
                             image_data = base64.b64decode(b64_data)
                             parts.append(genai_types.Part(inline_data={"mime_type": "image/jpeg", "data": image_data}))
-                        elif url.startswith("files/") or url.startswith("gs://"):
+                        elif url.startswith("files/") or url.startswith("gs://") or "generativelanguage.googleapis.com/v1beta/files/" in url:
                             parts.append(genai_types.Part(file_data={"mime_type": "image/png", "file_uri": url}))
                         else:
                             try:

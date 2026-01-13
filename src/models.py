@@ -96,6 +96,8 @@ class ZoomRequest:
     coords_norm: Optional[List[float]] = None
     coords_px: Optional[List[int]] = None
     reason: str = ""
+    # Локальный/скачанный путь к исходному изображению (если кэш по image_id ещё не прогрет)
+    source_path: Optional[str] = None
 
 
 @dataclass

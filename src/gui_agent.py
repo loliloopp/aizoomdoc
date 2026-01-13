@@ -2089,6 +2089,7 @@ class AgentWorker(QThread):
         # ===== ЦИКЛ ОБРАБОТКИ TOOL CALLS ОТ PRO =====
         pro_step = 1
         max_pro_steps = 10
+        requested_zooms = set()  # Для детекции повторных zoom запросов: (image_id, x1, y1, x2, y2)
         
         while pro_step <= max_pro_steps and needs_more_evidence:
             self._append_app_log(f"\n{'='*20} PRO ШАГ {pro_step} (ДОПОЛНИТЕЛЬНЫЕ ДАННЫЕ) {'='*20}")
@@ -2193,7 +2194,8 @@ class AgentWorker(QThread):
                                 page_number=0,
                                 image_id=img_id,
                                 coords_norm=coords_norm,
-                                reason=reason
+                                reason=reason,
+                                source_path=image_source
                             )
                             zoom_result = image_processor.process_zoom_request(zr, output_path=zoom_output_path)
                             if zoom_result:
@@ -2230,6 +2232,10 @@ class AgentWorker(QThread):
             # Если нет новых данных - выход
             if not has_new_data:
                 self._append_app_log("  ℹ️ Нет новых данных для загрузки")
+                # Если модель продолжает запрашивать zoom несмотря на отсутствие прогресса - останавливаем
+                if needs_more_evidence:
+                    self.sig_log.emit("⚠️ Pro продолжает запрашивать zoom без прогресса. Останавливаем.")
+                    needs_more_evidence = False
                 break
             
             # Повторный запрос к Pro
