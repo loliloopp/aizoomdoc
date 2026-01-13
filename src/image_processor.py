@@ -50,17 +50,20 @@ class ImageProcessor:
     def download_and_process_pdf(
         self,
         url: str,
-        max_side: int = 2000,
+        max_side: int = None,
         image_id: Optional[str] = None,
     ) -> List[ViewportCrop]:
         """
         1. Скачивает PDF по ссылке.
         2. Рендерит первую страницу в полном разрешении.
         3. Сохраняет оригинал в кэш.
-        4. Создает превью (max_side).
-        5. Если превью слишком мелкое (scale > 2.5), автоматически делает 4 зума.
+        4. Создает превью (max_side из config.PREVIEW_MAX_SIDE).
+        5. Если превью слишком мелкое (scale > config.AUTO_QUADRANTS_THRESHOLD), автоматически делает 4 зума.
         6. Возвращает список ViewportCrop.
         """
+        # Используем настройки из config
+        if max_side is None:
+            max_side = config.PREVIEW_MAX_SIDE
         try:
             img_id = image_id or str(uuid.uuid5(uuid.NAMESPACE_URL, url))
             cache_path = self.temp_dir / f"{img_id}_full.png"
@@ -132,8 +135,9 @@ class ImageProcessor:
                 target_blocks=[img_id],
             ))
 
-            # 4. АВТОМАТИЧЕСКИЕ ЗУМЫ (если factor > 2.5)
-            if scale > 2.5:
+            # 4. АВТОМАТИЧЕСКИЕ ЗУМЫ (если factor > порога из config)
+            if scale > config.AUTO_QUADRANTS_THRESHOLD:
+                logger.info(f"Auto-quadrants: scale={scale:.2f} > threshold={config.AUTO_QUADRANTS_THRESHOLD}")
                 # [y1, x1, y2, x2] в нормализованных координатах
                 quadrants = [
                     ([0.0, 0.0, 0.55, 0.55], "1_TL", "Top-Left"),
@@ -158,11 +162,12 @@ class ImageProcessor:
                     
                     crop = img_bgr[y1:y2, x1:x2]
                     
-                    # Ресайз кропа если он все еще огромный (больше 2000)
+                    # Ресайз кропа если он все еще огромный (больше ZOOM_PREVIEW_MAX_SIDE)
                     ch, cw = crop.shape[:2]
                     crop_scale = 1.0
-                    if max(ch, cw) > 2000:
-                        crop_scale = max(ch, cw) / 2000
+                    zoom_max = config.ZOOM_PREVIEW_MAX_SIDE
+                    if max(ch, cw) > zoom_max:
+                        crop_scale = max(ch, cw) / zoom_max
                         crop = cv2.resize(crop, (int(cw/crop_scale), int(ch/crop_scale)), interpolation=cv2.INTER_AREA)
 
                     q_filename = f"{img_id}_autozoom_{suffix}.png"
@@ -228,10 +233,25 @@ class ImageProcessor:
             x1, y1, x2, y2 = request.coords_px
         elif request.coords_norm:
             nx1, ny1, nx2, ny2 = request.coords_norm
+            
+            # Правило расширения ROI у краёв (15%):
+            # Если координата ближе 15% к краю — расширяем до 0.0 или 1.0
+            EDGE_THRESHOLD = 0.15
+            if nx1 < EDGE_THRESHOLD:
+                nx1 = 0.0
+            if ny1 < EDGE_THRESHOLD:
+                ny1 = 0.0
+            if nx2 > (1.0 - EDGE_THRESHOLD):
+                nx2 = 1.0
+            if ny2 > (1.0 - EDGE_THRESHOLD):
+                ny2 = 1.0
+            
             x1 = int(nx1 * w_full)
             y1 = int(ny1 * h_full)
             x2 = int(nx2 * w_full)
             y2 = int(ny2 * h_full)
+            
+            logger.info(f"Zoom ROI: norm=[{nx1:.2f},{ny1:.2f},{nx2:.2f},{ny2:.2f}] → px=[{x1},{y1},{x2},{y2}]")
         else:
             return None
             
@@ -243,14 +263,16 @@ class ImageProcessor:
             
         crop = img[y1:y2, x1:x2]
         
-        # Ресайз кропа если огромный
+        # Ресайз кропа если огромный (больше ZOOM_PREVIEW_MAX_SIDE)
         h_c, w_c = crop.shape[:2]
         was_scaled = False
         scale_val = 1.0
-        if max(h_c, w_c) > 2000:
-            scale_val = max(h_c, w_c) / 2000
+        zoom_max = config.ZOOM_PREVIEW_MAX_SIDE
+        if max(h_c, w_c) > zoom_max:
+            scale_val = max(h_c, w_c) / zoom_max
             crop = cv2.resize(crop, (int(w_c/scale_val), int(h_c/scale_val)))
             was_scaled = True
+            logger.info(f"Zoom scaled: {w_c}x{h_c} → {int(w_c/scale_val)}x{int(h_c/scale_val)} (factor {scale_val:.2f})")
             
         if output_path:
             output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -259,7 +281,10 @@ class ImageProcessor:
         desc = f"Zoom {x1},{y1}-{x2},{y2}"
         if was_scaled:
             h_new, w_new = crop.shape[:2]
-            desc = f"⚠️ ZOOM PREVIEW (factor {scale_val:.1f}x): Crop {w_c}x{h_c}px → Scaled to {w_new}x{h_new}px. If details are not clear, request ZOOM again inside this area."
+            repeat_hint = ""
+            if config.FORCE_REPEAT_ZOOM_IF_SCALED:
+                repeat_hint = " **MUST request deeper ZOOM for accurate analysis.**"
+            desc = f"⚠️ ZOOM PREVIEW (factor {scale_val:.1f}x): Crop {w_c}x{h_c}px → Scaled to {w_new}x{h_new}px.{repeat_hint}"
 
         return ViewportCrop(
             page_number=request.page_number,

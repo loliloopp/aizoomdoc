@@ -20,7 +20,7 @@ from PyQt6.QtWidgets import (
     QFileDialog, QMenuBar, QMenu, QDialog, QDialogButtonBox, QMessageBox,
     QGroupBox, QSizePolicy, QTreeView, QButtonGroup, QInputDialog,
     QHeaderView, QTabWidget, QTextBrowser, QStackedWidget, QProxyStyle, QStyle,
-    QDoubleSpinBox
+    QDoubleSpinBox, QCheckBox, QSpinBox
 )
 from PyQt6.QtCore import Qt, QUrl, QSize, QTimer, QBuffer, QPoint, QRect
 from PyQt6.QtGui import (
@@ -38,11 +38,9 @@ import asyncio
 import fitz  # PyMuPDF для рендеринга PDF
 
 MODELS = {
-    "Gemini 3 Flash (openrouter)": "google/gemini-3-flash-preview",
-    "Gemini 3 Pro (openrouter)": "google/gemini-3-pro-preview",
     "Gemini 3 Flash": "gemini-3-flash-preview",
     "Gemini 3 Pro": "gemini-3-pro-preview",
-    "Gemini 3 Flash + Pro": "flash+pro"
+    "Flash + Pro": "flash+pro",
 }
 
 CONFIG_PATH = Path.home() / ".aizoomdoc_config.json"
@@ -169,6 +167,27 @@ class SettingsDialog(QDialog):
         media_res_layout.addWidget(self.combo_media_resolution)
         media_res_layout.addStretch()
         llm_params_layout.addLayout(media_res_layout)
+        
+        # Thinking (Deep Think)
+        thinking_layout = QHBoxLayout()
+        self.check_thinking = QCheckBox("Включить Thinking (Deep Think)")
+        self.check_thinking.setChecked(config.THINKING_ENABLED)
+        self.check_thinking.setToolTip("Включить режим глубоких размышлений для улучшения качества ответов")
+        thinking_layout.addWidget(self.check_thinking)
+        thinking_layout.addStretch()
+        llm_params_layout.addLayout(thinking_layout)
+        
+        # Flash+Pro Token Budget
+        budget_layout = QHBoxLayout()
+        budget_layout.addWidget(QLabel("Flash+Pro бюджет (токены):"))
+        self.spin_pro_budget = QSpinBox()
+        self.spin_pro_budget.setRange(10000, 500000)
+        self.spin_pro_budget.setSingleStep(10000)
+        self.spin_pro_budget.setValue(config.PRO_FIRST_REQUEST_TOKEN_BUDGET)
+        self.spin_pro_budget.setToolTip("Целевой бюджет токенов для первого запроса в Pro (режим Flash+Pro)")
+        budget_layout.addWidget(self.spin_pro_budget)
+        budget_layout.addStretch()
+        llm_params_layout.addLayout(budget_layout)
         
         general_layout.addWidget(gb_llm_params)
         
@@ -438,8 +457,10 @@ class SettingsDialog(QDialog):
         config.LLM_TEMPERATURE = self.spin_temperature.value()
         config.LLM_TOP_P = self.spin_top_p.value()
         config.MEDIA_RESOLUTION = self.combo_media_resolution.currentData()
+        config.THINKING_ENABLED = self.check_thinking.isChecked()
+        config.PRO_FIRST_REQUEST_TOKEN_BUDGET = self.spin_pro_budget.value()
         
-        print(f"[Settings] LLM params saved: temp={config.LLM_TEMPERATURE}, top_p={config.LLM_TOP_P}, media_res={config.MEDIA_RESOLUTION}")
+        print(f"[Settings] LLM params saved: temp={config.LLM_TEMPERATURE}, top_p={config.LLM_TOP_P}, media_res={config.MEDIA_RESOLUTION}, thinking={config.THINKING_ENABLED}, pro_budget={config.PRO_FIRST_REQUEST_TOKEN_BUDGET}")
         
         super().accept()
 
@@ -1234,14 +1255,8 @@ class MainWindow(QMainWindow):
         self.lbl_tokens.setStyleSheet("padding: 0 8px; font-size: 11px;")
         top_bar_layout.addWidget(self.lbl_tokens)
         
-        # Переключатель режима MD (RAG / Full MD)
-        self.combo_md_mode = QComboBox()
-        self.combo_md_mode.addItem("RAG (блоки)", "rag")
-        self.combo_md_mode.addItem("Полный MD", "full_md")
-        self.combo_md_mode.setFixedWidth(140)
-        self.combo_md_mode.setFixedHeight(34)
-        self.combo_md_mode.currentIndexChanged.connect(self.save_md_mode)
-        top_bar_layout.addWidget(self.combo_md_mode)
+        # Режим MD зафиксирован как FullMD (RAG убран)
+        # combo_md_mode удалён — всегда используется полный контекст документа
         
         # Переключатель темы
         self.theme_toggle = QPushButton("🌙" if self.is_dark_theme else "☀️")
@@ -1608,8 +1623,7 @@ class MainWindow(QMainWindow):
         # Применяем тему
         self.apply_theme()
         
-        # Загружаем настройки режима MD из БД
-        self.load_md_mode()
+        # Режим MD зафиксирован как full_md (RAG убран)
         
         # Загружаем модель по умолчанию из БД
         self.load_default_model()
@@ -2334,7 +2348,7 @@ class MainWindow(QMainWindow):
         QApplication.processEvents()
         
         mid = self.combo_models.currentData()
-        md_mode = self.combo_md_mode.currentData()
+        md_mode = "full_md"  # Режим RAG убран, всегда используем полный контекст
         user_prompt = self.combo_user_prompts.currentData()
         
         # Передаем сохраненные md файлы и текущие ID чата в воркера
@@ -3371,28 +3385,7 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 self.log(f"Ошибка удаления: {e}")
 
-    def load_md_mode(self):
-        """Загружает режим обработки MD из Supabase."""
-        if supabase_client.is_connected():
-            try:
-                mode = self.run_async(supabase_client.get_md_processing_mode())
-                index = self.combo_md_mode.findData(mode)
-                if index >= 0:
-                    self.combo_md_mode.blockSignals(True)
-                    self.combo_md_mode.setCurrentIndex(index)
-                    self.combo_md_mode.blockSignals(False)
-            except Exception as e:
-                self.log(f"Ошибка загрузки режима MD: {e}")
-
-    def save_md_mode(self):
-        """Сохраняет режим обработки MD в Supabase."""
-        mode = self.combo_md_mode.currentData()
-        if supabase_client.is_connected():
-            try:
-                self.run_async(supabase_client.set_md_processing_mode(mode))
-                self.log(f"Режим MD изменен на: {mode}")
-            except Exception as e:
-                self.log(f"Ошибка сохранения режима MD: {e}")
+    # Методы load_md_mode и save_md_mode удалены - режим зафиксирован как full_md
 
     def toggle_theme(self):
         """Переключает тему интерфейса."""
@@ -3794,7 +3787,7 @@ class MainWindow(QMainWindow):
                     color: #ececec;
                 }
             """
-            self.combo_md_mode.setStyleSheet(md_combo_style_dark)
+            # combo_md_mode удалён
             self.combo_user_prompts.setStyleSheet(md_combo_style_dark)
             
             # Просмотрщик файлов (темная тема)
@@ -4226,7 +4219,7 @@ class MainWindow(QMainWindow):
                     color: #2d333a;
                 }
             """
-            self.combo_md_mode.setStyleSheet(md_combo_style_light)
+            # combo_md_mode удалён
             self.combo_user_prompts.setStyleSheet(md_combo_style_light)
             
             # Просмотрщик файлов (светлая тема)

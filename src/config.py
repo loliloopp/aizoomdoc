@@ -14,19 +14,20 @@ load_dotenv()
 class Config:
     """Центральная конфигурация приложения."""
     
-    # OpenRouter API
-    OPENROUTER_API_KEY: str = os.getenv("OPENROUTER_API_KEY", "")
+    # ===== OpenRouter API (LEGACY - не используется) =====
+    # OpenRouter отключён, все запросы идут через прямой Google Gemini SDK
+    OPENROUTER_API_KEY: str = os.getenv("OPENROUTER_API_KEY", "")  # legacy
     OPENROUTER_BASE_URL: str = os.getenv(
         "OPENROUTER_BASE_URL", 
         "https://openrouter.ai/api/v1"
-    )
+    )  # legacy
 
-    # Google API
+    # ===== Google Gemini API (ОСНОВНОЙ) =====
     GOOGLE_API_KEY: str = os.getenv("GOOGLE_API_KEY", "")
 
     DEFAULT_MODEL: str = os.getenv(
         "DEFAULT_MODEL", 
-        "google/gemini-3-flash-preview"
+        "gemini-3-flash-preview"  # Прямой вызов через Google SDK
     )
 
     # Параметры генерации LLM
@@ -39,6 +40,28 @@ class Config:
     # medium - баланс качества и скорости
     # low - быстро и дешево
     MEDIA_RESOLUTION: str = os.getenv("MEDIA_RESOLUTION", "high")
+    
+    # ===== Thinking (Deep Think) настройки =====
+    # Включить thinking для улучшения качества рассуждений
+    THINKING_ENABLED: bool = os.getenv("THINKING_ENABLED", "true").lower() == "true"
+    # Бюджет токенов для thinking (0 = без ограничений)
+    THINKING_BUDGET: int = int(os.getenv("THINKING_BUDGET", "0"))
+    
+    # ===== Flash+Pro Token Budget =====
+    # Целевой бюджет токенов для первого запроса в Pro (режим flash+pro)
+    PRO_FIRST_REQUEST_TOKEN_BUDGET: int = int(os.getenv("PRO_FIRST_REQUEST_TOKEN_BUDGET", "100000"))
+    
+    # ===== Контроль размытости/детализации изображений =====
+    # Максимальный размер стороны preview (px)
+    PREVIEW_MAX_SIDE: int = int(os.getenv("PREVIEW_MAX_SIDE", "2000"))
+    # Максимальный размер стороны zoom preview (px)
+    ZOOM_PREVIEW_MAX_SIDE: int = int(os.getenv("ZOOM_PREVIEW_MAX_SIDE", "2000"))
+    # Порог scale_factor для автоматического создания квадрантов
+    AUTO_QUADRANTS_THRESHOLD: float = float(os.getenv("AUTO_QUADRANTS_THRESHOLD", "2.5"))
+    # Требовать повторный zoom если кроп был scaled
+    FORCE_REPEAT_ZOOM_IF_SCALED: bool = os.getenv("FORCE_REPEAT_ZOOM_IF_SCALED", "true").lower() == "true"
+    # Максимальная глубина повторных zoom
+    MAX_REPEAT_ZOOM_DEPTH: int = int(os.getenv("MAX_REPEAT_ZOOM_DEPTH", "3"))
 
     # Ранее в коде использовался флаг USE_DATABASE. БД для чатов считается основной всегда,
     # поэтому этот флаг не должен влиять на отправку запросов в модель. Оставляем для совместимости.
@@ -114,9 +137,10 @@ class Config:
     @classmethod
     def validate(cls) -> None:
         """Проверяет обязательные параметры конфигурации."""
-        if not cls.OPENROUTER_API_KEY and not cls.GOOGLE_API_KEY:
+        # GOOGLE_API_KEY обязателен (OpenRouter отключён)
+        if not cls.GOOGLE_API_KEY:
             raise ValueError(
-                "Ни OPENROUTER_API_KEY, ни GOOGLE_API_KEY не заданы. Установите хотя бы один в .env файле."
+                "GOOGLE_API_KEY не задан. Установите его в .env файле для работы с Gemini API."
             )
         
         # Проверка Supabase Chat DB (обязательна)

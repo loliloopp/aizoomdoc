@@ -291,31 +291,36 @@ def extract_json_objects(text: str) -> List[Any]:
 
 class LLMClient:
     def __init__(self, model: Optional[str] = None, data_root: Optional[Path] = None, log_callback: Optional[callable] = None):
-        self.api_key = config.OPENROUTER_API_KEY
-        self.base_url = config.OPENROUTER_BASE_URL
+        # OpenRouter отключён (legacy) — все вызовы через Google Gemini SDK
+        # self.api_key = config.OPENROUTER_API_KEY  # legacy
+        # self.base_url = config.OPENROUTER_BASE_URL  # legacy
         self.model = model or config.DEFAULT_MODEL
         self.data_root = data_root or Path.cwd() / "data"
         self.log_callback = log_callback
-        self.headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "https://github.com/aizoomdoc",
-            "X-Title": "AIZoomDoc"
-        }
+        # OpenRouter headers (legacy, не используется)
+        # self.headers = {
+        #     "Authorization": f"Bearer {self.api_key}",
+        #     "Content-Type": "application/json",
+        #     "HTTP-Referer": "https://github.com/aizoomdoc",
+        #     "X-Title": "AIZoomDoc"
+        # }
         self.history: List[Dict[str, Any]] = [] 
         # Системный промт добавляется позже, в зависимости от режима
 
-        # Инициализация Google SDK
+        # Инициализация Google SDK (обязательный)
         self.google_client = None
         if config.GOOGLE_API_KEY:
             if genai_new:
                 try:
                     self.google_client = genai_new.Client(api_key=config.GOOGLE_API_KEY)
-                    logger.info("Инициализирован новый SDK Google GenAI")
+                    logger.info("Инициализирован Google GenAI SDK")
                 except Exception as e:
-                    logger.warning(f"Ошибка инициализации нового SDK Google GenAI: {e}")
+                    logger.error(f"Ошибка инициализации Google GenAI SDK: {e}")
+                    raise RuntimeError(f"Не удалось инициализировать Google GenAI SDK: {e}")
             else:
-                logger.error("SDK google-genai не установлен, но GOOGLE_API_KEY задан.")
+                raise RuntimeError("SDK google-genai не установлен. Установите: pip install google-genai")
+        else:
+            raise RuntimeError("GOOGLE_API_KEY не задан. Установите его в .env файле.")
 
         # Контроль контекста / кэширования
         self.current_cache = None
@@ -327,8 +332,8 @@ class LLMClient:
         self.last_prompt_estimate_selection: Optional[Dict[str, int]] = None
 
     def _is_google_direct(self) -> bool:
-        """Проверяет, является ли модель прямой моделью Google."""
-        return self.model in ["gemini-3-flash-preview", "gemini-3-pro-preview"]
+        """Проверяет, является ли модель прямой моделью Google (все модели теперь direct)."""
+        return self.model in ["gemini-3-flash-preview", "gemini-3-pro-preview", "flash+pro"]
 
     def upload_to_google_files(self, file_path: str, display_name: str = None) -> Optional[str]:
         """
@@ -718,9 +723,12 @@ class LLMClient:
         elif system_instruction:
             config_args["system_instruction"] = system_instruction
         
-        # Включаем Deep Think (thinking) если модель поддерживает
-        if "thinking" in self.model.lower():
-            config_args["thinking_config"] = {"include_thoughts": True}
+        # Включаем Deep Think (thinking) по настройкам конфига
+        if config.THINKING_ENABLED:
+            thinking_config = {"include_thoughts": True}
+            if config.THINKING_BUDGET > 0:
+                thinking_config["thinking_budget"] = config.THINKING_BUDGET
+            config_args["thinking_config"] = thinking_config
 
         response = self.google_client.models.generate_content(
             model=base_model,
@@ -755,112 +763,17 @@ class LLMClient:
         return text, signature
 
     def get_response(self) -> str:
+        """Получает ответ от модели через Google Gemini SDK."""
         print(f"[GET_RESPONSE] Отправляю запрос к модели {self.model}")
         
-        # Если модель - прямая Google (не через OpenRouter), используем Google SDK
-        if self._is_google_direct():
-            if not self.google_client:
-                raise RuntimeError("Google GenAI SDK не инициализирован. Проверьте GOOGLE_API_KEY.")
-            text, signature = self._call_google_new_sdk(self.history)
-            print(f"[GET_RESPONSE] OK (GenAI SDK): Получен ответ длиной {len(text)} символов")
-            self.add_assistant_message(text, thought_signature=signature)
-            return text
+        # Все модели теперь работают через Google SDK (OpenRouter отключён)
+        if not self.google_client:
+            raise RuntimeError("Google GenAI SDK не инициализирован. Проверьте GOOGLE_API_KEY.")
         
-        # Если модель - Gemini через OpenRouter, но есть Google SDK - пробуем его
-        if self.google_client and "gemini" in self.model.lower() and not self._is_google_direct():
-            try:
-                text, signature = self._call_google_new_sdk(self.history)
-                print(f"[GET_RESPONSE] OK (GenAI SDK): Получен ответ длиной {len(text)} символов")
-                self.add_assistant_message(text, thought_signature=signature)
-                return text
-            except Exception as e:
-                logger.warning(f"Ошибка нового SDK, пробую OpenRouter fallback: {e}")
-
-        # Попытки повтора (Retries)
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                # Подготовка payload
-                payload = {
-                    "model": self.model,
-                    "messages": self.history,
-                    "temperature": 0.2,
-                    "max_tokens": config.MAX_TOKENS,
-                }
-                
-                # Специфичный хак для Gemini на OpenRouter (если нужно отключить тулы)
-                # В стандартном OpenAI API это делается через tool_choice: "none"
-                # Но это работает только если есть список tools.
-                # Если же мы просто хотим убедиться, что Gemini не пытается использовать нативные тулы:
-                if "gemini" in self.model.lower():
-                    # Некоторые провайдеры OpenRouter могут требовать tool_choice: "none"
-                    # Но обычно лучше просто не посылать эти поля, если они не нужны.
-                    # Оставляем только то, что точно не сломает OpenAI-совместимый API.
-                    pass
-                    
-                # Дополнительные поля, которые могут помочь
-                # payload["tools"] = [] # Опасно, может вызвать 400 если пустой список
-
-                # Прогноз (очень грубо)
-                self.last_prompt_estimate = self.build_context_report(self.history, max_tokens=payload["max_tokens"])
-                
-                if self.log_callback:
-                    try:
-                        self.log_callback("request", payload)
-                    except Exception as e:
-                        print(f"Log callback error (request): {e}")
-
-                resp = requests.post(
-                    f"{self.base_url}/chat/completions",
-                    headers=self.headers,
-                    json=payload,
-                    timeout=120
-                )
-                
-                if resp.status_code >= 400:
-                    error_body = resp.text
-                    print(f"[GET_RESPONSE] ERROR {resp.status_code}: {error_body}")
-                    logger.error(f"LLM API Error {resp.status_code}: {error_body}")
-
-                if resp.status_code == 429:
-                    print(f"[GET_RESPONSE] WARNING: Ошибка 429 (Too Many Requests). Жду 5 секунд...")
-                    import time
-                    time.sleep(5)
-                    continue
-                
-                resp.raise_for_status()
-                response_data = resp.json()
-
-                if self.log_callback:
-                    try:
-                        self.log_callback("response", response_data)
-                    except Exception as e:
-                        print(f"Log callback error (response): {e}")
-
-                self.last_usage = response_data.get("usage") if isinstance(response_data, dict) else None
-                
-                if not response_data.get("choices"):
-                    print(f"[GET_RESPONSE] WARNING: Попытка {attempt+1}: Нет choices в ответе")
-                    continue
-                
-                answer = response_data["choices"][0]["message"].get("content", "")
-                
-                if not answer:
-                    print(f"[GET_RESPONSE] WARNING: Попытка {attempt+1}: Пустой content")
-                    # Если пустой ответ - пробуем еще раз
-                    continue
-                
-                print(f"[GET_RESPONSE] OK: Получен ответ длиной {len(answer)} символов")
-                self.add_assistant_message(answer)
-                return answer
-                
-            except Exception as e:
-                print(f"[GET_RESPONSE] Ошибка при попытке {attempt+1}: {e}")
-                if attempt == max_retries - 1:
-                    logger.error(f"LLM Error after retries: {e}")
-                    raise
-        
-        raise ValueError("Не удалось получить ответ от модели после 3 попыток")
+        text, signature = self._call_google_new_sdk(self.history)
+        print(f"[GET_RESPONSE] OK (GenAI SDK): Получен ответ длиной {len(text)} символов")
+        self.add_assistant_message(text, thought_signature=signature)
+        return text
 
     def update_memory_summary(self, prev_summary: str, user_message: str, assistant_message: str) -> str:
         """
@@ -1067,10 +980,17 @@ class LLMClient:
         
         return None
 
-    def call_flash_model(self, messages: List[Dict[str, Any]], temperature: float = 0.1) -> str:
+    def call_flash_model(self, messages: List[Dict[str, Any]], temperature: float = 0.1, 
+                         response_json: bool = True, response_schema: dict = None) -> str:
         """
         Вызывает Flash-модель напрямую через Google SDK.
         Используется для этапа экстракции контекста.
+        
+        Args:
+            messages: Список сообщений в формате OpenAI
+            temperature: Температура генерации
+            response_json: Если True, требует JSON ответ
+            response_schema: JSON Schema для валидации ответа (опционально)
         """
         if not self.google_client:
             raise RuntimeError("Google GenAI SDK не инициализирован. Проверьте GOOGLE_API_KEY.")
@@ -1130,11 +1050,34 @@ class LLMClient:
         if system_instruction:
             config_args["system_instruction"] = system_instruction
         
+        # Строгий JSON режим
+        if response_json:
+            config_args["response_mime_type"] = "application/json"
+            if response_schema:
+                config_args["response_schema"] = response_schema
+        
+        # Включаем thinking для Flash если настроено
+        if config.THINKING_ENABLED:
+            thinking_config = {"include_thoughts": True}
+            if config.THINKING_BUDGET > 0:
+                thinking_config["thinking_budget"] = config.THINKING_BUDGET
+            config_args["thinking_config"] = thinking_config
+        
+        logger.info(f"Flash API call: temp={temperature}, top_p={config.LLM_TOP_P}, media_res={media_res}, thinking={config.THINKING_ENABLED}, json={response_json}")
+        
         response = self.google_client.models.generate_content(
             model=flash_model,
             contents=contents,
             config=genai_types.GenerateContentConfig(**config_args)
         )
+        
+        # Сохраняем usage если доступен
+        if hasattr(response, 'usage_metadata'):
+            self.last_usage = {
+                "prompt_tokens": getattr(response.usage_metadata, 'prompt_token_count', 0),
+                "completion_tokens": getattr(response.usage_metadata, 'candidates_token_count', 0),
+                "total_tokens": getattr(response.usage_metadata, 'total_token_count', 0),
+            }
         
         # Извлекаем текст
         text = None
@@ -1153,10 +1096,17 @@ class LLMClient:
         
         return text
 
-    def call_pro_model(self, messages: List[Dict[str, Any]], temperature: float = None) -> str:
+    def call_pro_model(self, messages: List[Dict[str, Any]], temperature: float = None,
+                        response_json: bool = True, response_schema: dict = None) -> str:
         """
         Вызывает Pro-модель напрямую через Google SDK.
         Используется для финального анализа.
+        
+        Args:
+            messages: Список сообщений в формате OpenAI
+            temperature: Температура генерации (по умолчанию из config)
+            response_json: Если True, требует JSON ответ
+            response_schema: JSON Schema для валидации ответа (опционально)
         """
         if not self.google_client:
             raise RuntimeError("Google GenAI SDK не инициализирован. Проверьте GOOGLE_API_KEY.")
@@ -1219,11 +1169,34 @@ class LLMClient:
         if system_instruction:
             config_args["system_instruction"] = system_instruction
         
+        # Строгий JSON режим
+        if response_json:
+            config_args["response_mime_type"] = "application/json"
+            if response_schema:
+                config_args["response_schema"] = response_schema
+        
+        # Включаем thinking для Pro если настроено
+        if config.THINKING_ENABLED:
+            thinking_config = {"include_thoughts": True}
+            if config.THINKING_BUDGET > 0:
+                thinking_config["thinking_budget"] = config.THINKING_BUDGET
+            config_args["thinking_config"] = thinking_config
+        
+        logger.info(f"Pro API call: temp={temp}, top_p={config.LLM_TOP_P}, media_res={media_res}, thinking={config.THINKING_ENABLED}, json={response_json}")
+        
         response = self.google_client.models.generate_content(
             model=pro_model,
             contents=contents,
             config=genai_types.GenerateContentConfig(**config_args)
         )
+        
+        # Сохраняем usage если доступен
+        if hasattr(response, 'usage_metadata'):
+            self.last_usage = {
+                "prompt_tokens": getattr(response.usage_metadata, 'prompt_token_count', 0),
+                "completion_tokens": getattr(response.usage_metadata, 'candidates_token_count', 0),
+                "total_tokens": getattr(response.usage_metadata, 'total_token_count', 0),
+            }
         
         # Извлекаем текст
         text = None

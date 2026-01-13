@@ -34,14 +34,15 @@ class AgentWorker(QThread):
     sig_usage = pyqtSignal(int, int) # used, remaining
     
     def __init__(self, data_root: Path, query: str, model: str, md_files: List[str] = None, 
-                 existing_chat_id: str = None, existing_db_chat_id: str = None, md_mode: str = "rag",
+                 existing_chat_id: str = None, existing_db_chat_id: str = None, md_mode: str = "full_md",
                  user_prompt: str = None):
         super().__init__()
         self.data_root = data_root
         self.query = query
         self.model = model
         self.md_files = md_files or []
-        self.md_mode = md_mode
+        # Режим RAG убран — всегда используем full_md
+        self.md_mode = "full_md"
         self.user_prompt = user_prompt
         self.is_running = True
         
@@ -733,10 +734,10 @@ class AgentWorker(QThread):
                 except Exception as e:
                     self.sig_log.emit(f"Ошибка файла {md_path_str}: {e}")
 
-            if not full_md_text.strip() and self.md_mode == "full":
-                # В режиме full требуем текст для индексации
+            if not full_md_text.strip():
+                # Требуем текст для индексации
                 if not full_text.strip():
-                    raise ValueError("Нет текста документов для анализа (режим full).")
+                    raise ValueError("Нет текста документов для анализа.")
                 # Используем full_text из первого прохода
                 full_md_text = full_text
             
@@ -775,7 +776,7 @@ class AgentWorker(QThread):
 
             # ===== ПОДГОТОВКА КОНТЕКСТА =====
             
-            from .doc_index import build_index, retrieve_text_chunks, strip_json_blocks, ImageCatalogEntry
+            from .doc_index import build_index, strip_json_blocks, ImageCatalogEntry
             from .json_annotation_processor import JsonAnnotationProcessor
             doc_index = build_index(full_md_text)
             
@@ -865,41 +866,26 @@ class AgentWorker(QThread):
                 for msg in history_messages[-(tail_n if tail_n > 0 else 0):] if tail_n > 0 else []:
                     llm_client.history.append({"role": msg.get("role", "user"), "content": msg.get("content", "")})
 
-                if self.md_mode == "full_md":
-                    self.sig_log.emit(f"Режим: Полный MD (history_n={tail_n})...")
-                    
-                    doc_text = strip_json_blocks(full_md_text)
-                    # Кэшируем документ для Gemini если еще не кэширован
-                    if not llm_client.current_cache:
-                        llm_client.set_document_context(doc_text)
-                    
-                    img_entries = sorted(doc_index.images.values(), key=lambda e: ((e.page or 0), e.image_id))
-                    catalog_text = "\n".join([f"- {e.image_id} (стр. {e.page}): {e.content_summary[:150]}" for e in img_entries])
-                    
-                    # Если кэш активен, не шлем текст документа повторно в сообщениях
-                    doc_prefix = "" if llm_client.current_cache else f"ПОЛНЫЙ ТЕКСТ ДОКУМЕНТА:\n{doc_text}\n\n"
-                    
-                    context = (
-                        f"{doc_prefix}"
-                        f"КАТАЛОГ ИЗОБРАЖЕНИЙ:\n{catalog_text}\n\n"
-                        f"ЗАПРОС ПОЛЬЗОВАТЕЛЯ:\n{self.query}\n\n"
-                        f"Используй tool=request_images и tool=zoom для работы с графикой."
-                    )
-                else:
-                    self.sig_log.emit(f"Режим: RAG (history_n={tail_n})...")
-                    text_snippets = retrieve_text_chunks(doc_index, self.query, top_k=10)
-                    self._save_gui_search_log(self.query, text_snippets, doc_index)
-                    
-                    img_entries = sorted(doc_index.images.values(), key=lambda e: ((e.page or 0), e.image_id))
-                    catalog_text = "\n".join([f"- {e.image_id} (стр. {e.page}): {e.content_summary[:180]}" for e in img_entries])
-                    snippets_text = "\n\n".join([f"[{cid}]\n{txt}" for cid, txt in text_snippets])
-                    
-                    context = (
-                        f"РЕЛЕВАНТНЫЕ ФРАГМЕНТЫ:\n{snippets_text}\n\n"
-                        f"КАТАЛОГ ИЗОБРАЖЕНИЙ:\n{catalog_text}\n\n"
-                        f"ЗАПРОС ПОЛЬЗОВАТЕЛЯ:\n{self.query}\n\n"
-                        f"Используй tool=request_images для просмотра чертежей."
-                    )
+                # Режим full_md (RAG удалён)
+                self.sig_log.emit(f"Режим: Полный MD (history_n={tail_n})...")
+                
+                doc_text = strip_json_blocks(full_md_text)
+                # Кэшируем документ для Gemini если еще не кэширован
+                if not llm_client.current_cache:
+                    llm_client.set_document_context(doc_text)
+                
+                img_entries = sorted(doc_index.images.values(), key=lambda e: ((e.page or 0), e.image_id))
+                catalog_text = "\n".join([f"- {e.image_id} (стр. {e.page}): {e.content_summary[:150]}" for e in img_entries])
+                
+                # Если кэш активен, не шлем текст документа повторно в сообщениях
+                doc_prefix = "" if llm_client.current_cache else f"ПОЛНЫЙ ТЕКСТ ДОКУМЕНТА:\n{doc_text}\n\n"
+                
+                context = (
+                    f"{doc_prefix}"
+                    f"КАТАЛОГ ИЗОБРАЖЕНИЙ:\n{catalog_text}\n\n"
+                    f"ЗАПРОС ПОЛЬЗОВАТЕЛЯ:\n{self.query}\n\n"
+                    f"Используй tool=request_images и tool=zoom для работы с графикой."
+                )
 
                 # Проверяем, влезает ли
                 temp_history = llm_client.history + [{"role": "user", "content": context}]
@@ -909,11 +895,9 @@ class AgentWorker(QThread):
                     self.sig_log.emit(f"OK: Промпт ~{est.get('prompt_tokens_est')} токенов.")
                     break
                 
-                if self.md_mode == "full_md" and tail_n == 0:
-                    self.sig_log.emit("⚠️ Даже без истории не влезает. Fallback в RAG...")
-                    self.md_mode = "rag"
-                    tail_n = 12 # Сбрасываем tail_n для RAG
-                    continue
+                if tail_n == 0:
+                    # Переполнение даже без истории — ошибка (RAG fallback удалён)
+                    raise ValueError("Документ слишком большой для контекста модели. Используйте режим flash+pro для автоматического сжатия.")
                 
                 tail_n -= 3 # Уменьшаем историю и пробуем снова
                 self.sig_log.emit(f"⚠️ Переполнение. Сокращаю историю до {tail_n}...")
@@ -1355,6 +1339,45 @@ class AgentWorker(QThread):
 
     def stop(self):
         self.is_running = False
+
+    def _process_image_request_simple(self, image_request, image_processor, doc_index, sent_ids_set=None):
+        """
+        Упрощённая обработка запроса изображений (для Pro-части).
+        Возвращает список ViewportCrop.
+        """
+        if sent_ids_set is None:
+            sent_ids_set = set()
+        
+        downloaded = []
+        for rid in image_request.image_ids:
+            rid = str(rid).strip()
+            if rid.endswith(".pdf"):
+                rid = rid[:-4]
+            if not rid or rid in sent_ids_set:
+                continue
+            
+            entry = doc_index.images.get(rid)
+            if not entry:
+                self._append_app_log(f"  ⚠️ Изображение не найдено: {rid}")
+                continue
+            
+            self.sig_log.emit(f"Загружаю изображение: {rid}")
+            self._append_app_log(f"  📥 Загрузка изображения: {rid}")
+            
+            image_source = entry.uri if entry.uri else entry.local_path
+            if not image_source:
+                self._append_app_log(f"  ⚠️ Нет источника изображения: {rid}")
+                continue
+            
+            crops = image_processor.download_and_process_pdf(image_source, image_id=rid)
+            if crops:
+                downloaded.extend(crops)
+                sent_ids_set.add(rid)
+                for c in crops:
+                    if c.image_path:
+                        self.sig_image.emit(c.image_path, f"Image: {rid}")
+        
+        return downloaded
 
     def _run_flash_pro_mode(self, full_md_text: str, files_to_process: list, 
                             attached_images: list, all_blocks: list):
@@ -1853,7 +1876,118 @@ class AgentWorker(QThread):
         # Логируем ответ Pro
         self._log_full("PRO: Ответ", pro_response)
         
-        # Отправляем ответ пользователю
+        # ===== ЦИКЛ ОБРАБОТКИ TOOL CALLS ОТ PRO =====
+        pro_step = 1
+        max_pro_steps = 10
+        
+        while pro_step <= max_pro_steps:
+            # Проверяем наличие tool calls
+            zoom_reqs = llm_client.parse_zoom_request(pro_response)
+            img_reqs = llm_client.parse_image_requests(pro_response)
+            
+            if not zoom_reqs and not img_reqs:
+                # Нет tool calls — это финальный ответ
+                break
+            
+            self._append_app_log(f"\n{'='*20} PRO ШАГ {pro_step} {'='*20}")
+            
+            # Обработка запросов изображений
+            if img_reqs:
+                self._log_full(f"PRO #{pro_step}: Запросы изображений", [
+                    {"image_ids": ir.image_ids, "reason": ir.reason} for ir in img_reqs
+                ])
+                
+                new_images = []
+                sent_pro_ids = set()
+                for ir in img_reqs:
+                    self.sig_log.emit(f"Pro запросила изображения: {ir.reason[:50]}")
+                    loaded = self._process_image_request_simple(ir, image_processor, doc_index, sent_pro_ids)
+                    new_images.extend(loaded)
+                
+                if new_images:
+                    # Загружаем в Google Files API
+                    self._upload_images_to_google_files(new_images, llm_client)
+                    # Fallback на S3
+                    self._upload_images_to_s3(new_images)
+                    all_images.extend(new_images)
+                    
+                    # Добавляем изображения в историю Pro
+                    content_with_images = [{"type": "text", "text": "Загружены изображения:"}]
+                    for vc in new_images:
+                        img_url = getattr(vc, 'google_file_uri', None) or vc.s3_url
+                        if img_url:
+                            content_with_images.append({
+                                "type": "image_url",
+                                "image_url": {"url": img_url}
+                            })
+                    pro_messages.append({"role": "user", "content": content_with_images})
+            
+            # Обработка zoom запросов
+            if zoom_reqs:
+                self._log_full(f"PRO #{pro_step}: Запросы ZOOM", [
+                    {"image_id": zr.image_id, "coords_norm": zr.coords_norm, "coords_px": zr.coords_px, "reason": zr.reason}
+                    for zr in zoom_reqs
+                ])
+                
+                zoom_crops = []
+                for i, zr in enumerate(zoom_reqs):
+                    self.sig_log.emit(f"Pro запросила zoom: {zr.reason[:50]}")
+                    self._append_app_log(f"  🔍 PRO ZOOM #{i+1}: {zr.image_id}, coords_norm={zr.coords_norm}, reason={zr.reason[:80]}")
+                    
+                    # Загружаем изображение если нужно
+                    img_id = getattr(zr, "image_id", None)
+                    if isinstance(img_id, str) and img_id:
+                        if img_id.endswith(".pdf"):
+                            self._append_app_log(f"Загружаем PDF для zoom: {img_id}")
+                            crops = image_processor.download_and_process_pdf(img_id, image_id=img_id)
+                        elif img_id in doc_index.images:
+                            entry = doc_index.images[img_id]
+                            if entry.uri and entry.uri.startswith("http"):
+                                self._append_app_log(f"Загружаем изображение для zoom: {entry.uri[:80]}")
+                                crops = image_processor.download_and_process_pdf(entry.uri, image_id=img_id)
+                    
+                    # Выполняем zoom
+                    zoom_output_path = self.data_root / "temp" / f"pro_zoom_{pro_step}_{i}.png"
+                    zoom_crop = image_processor.process_zoom_request(zr, output_path=zoom_output_path)
+                    
+                    if zoom_crop:
+                        zoom_crops.append(zoom_crop)
+                        self._append_app_log(f"  ✅ Zoom #{i+1} выполнен: {zoom_crop.description[:100]}")
+                
+                if zoom_crops:
+                    # Загружаем в Google Files API
+                    self._upload_images_to_google_files(zoom_crops, llm_client)
+                    # Fallback на S3
+                    self._upload_images_to_s3(zoom_crops)
+                    all_images.extend(zoom_crops)
+                    
+                    # Добавляем zoom результаты в историю Pro
+                    content_with_zooms = [{"type": "text", "text": "Zoom результаты:"}]
+                    for vc in zoom_crops:
+                        img_url = getattr(vc, 'google_file_uri', None) or vc.s3_url
+                        if img_url:
+                            content_with_zooms.append({
+                                "type": "image_url",
+                                "image_url": {"url": img_url}
+                            })
+                    pro_messages.append({"role": "user", "content": content_with_zooms})
+            
+            # Повторный вызов Pro
+            try:
+                pro_response = llm_client.call_pro_model(pro_messages)
+                self._log_full(f"PRO #{pro_step}: Ответ", pro_response)
+            except Exception as e:
+                err = f"Ошибка Pro модели на шаге {pro_step}: {e}"
+                self.sig_log.emit(f"❌ {err}")
+                self._log_full(f"PRO #{pro_step}: Ошибка", str(e))
+                break
+            
+            pro_step += 1
+        
+        if pro_step > max_pro_steps:
+            self.sig_log.emit(f"⚠️ Достигнут лимит шагов Pro: {max_pro_steps}")
+        
+        # Отправляем финальный ответ пользователю
         self.sig_message.emit("assistant", pro_response, "gemini-3-pro-preview")
         self.save_message("assistant", pro_response, images=all_images)
         
