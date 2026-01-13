@@ -45,6 +45,8 @@ class MarkdownParser:
         current_section_stack: List[str] = []
         
         header_pattern = re.compile(r"^(#+)\s+(.+)$")
+        # Паттерн для страницы: ## СТРАНИЦА X
+        page_pattern = re.compile(r"^##\s+СТРАНИЦА\s+(\d+)", re.IGNORECASE)
         # Старый формат: <!-- BLOCK_ID: xxx -->
         block_id_start = re.compile(r"<!--\s*BLOCK_ID:\s*([a-f0-9-]+)\s*-->")
         block_id_end = re.compile(r"<!--\s*END_BLOCK\s*-->")
@@ -57,6 +59,7 @@ class MarkdownParser:
         current_block_id = None
         current_block_type = None  # 'TEXT' или 'IMAGE'
         current_linked_ids = []  # Связанные блоки (→ID)
+        current_page = None  # Текущая страница
         
         for line in lines:
             line_stripped = line.strip()
@@ -66,7 +69,7 @@ class MarkdownParser:
             if new_block_match:
                 # Сохраняем предыдущий блок
                 if current_text:
-                    self._add_block(blocks, current_text, current_block_id, current_section_stack, link_pattern, current_block_type, current_linked_ids)
+                    self._add_block(blocks, current_text, current_block_id, current_section_stack, link_pattern, current_block_type, current_linked_ids, current_page)
                     current_text = []
                     current_linked_ids = []
                 
@@ -82,17 +85,29 @@ class MarkdownParser:
                     current_linked_ids.append(linked_id)
                 continue  # Не добавляем в текст блока
             
+            # Проверяем заголовок страницы: ## СТРАНИЦА X
+            page_match = page_pattern.match(line_stripped)
+            if page_match:
+                # Сохраняем предыдущий блок перед сменой страницы
+                if current_text:
+                    self._add_block(blocks, current_text, current_block_id, current_section_stack, link_pattern, current_block_type, current_linked_ids, current_page)
+                    current_text = []
+                    current_block_id = None
+                    current_block_type = None
+                    current_linked_ids = []
+                
+                current_page = int(page_match.group(1))
+                continue
+            
             header_match = header_pattern.match(line_stripped)
             if header_match:
-                # Не сохраняем блок при встрече заголовка страницы (## СТРАНИЦА X)
-                # чтобы не разрывать контекст
                 level = len(header_match.group(1))
                 title = header_match.group(2).strip()
                 
-                # Если это заголовок уровня 2 (## СТРАНИЦА) или выше - сохраняем блок
+                # Если это заголовок уровня 2 или выше - сохраняем блок
                 if level <= 2:
                     if current_text:
-                        self._add_block(blocks, current_text, current_block_id, current_section_stack, link_pattern, current_block_type, current_linked_ids)
+                        self._add_block(blocks, current_text, current_block_id, current_section_stack, link_pattern, current_block_type, current_linked_ids, current_page)
                         current_text = []
                         current_block_id = None
                         current_block_type = None
@@ -108,7 +123,7 @@ class MarkdownParser:
             id_match = block_id_start.match(line_stripped)
             if id_match:
                 if current_text:
-                    self._add_block(blocks, current_text, current_block_id, current_section_stack, link_pattern, current_block_type, current_linked_ids)
+                    self._add_block(blocks, current_text, current_block_id, current_section_stack, link_pattern, current_block_type, current_linked_ids, current_page)
                     current_text = []
                     current_linked_ids = []
                 current_block_id = id_match.group(1)
@@ -117,7 +132,7 @@ class MarkdownParser:
                 
             if block_id_end.match(line_stripped):
                 if current_text:
-                    self._add_block(blocks, current_text, current_block_id, current_section_stack, link_pattern, current_block_type, current_linked_ids)
+                    self._add_block(blocks, current_text, current_block_id, current_section_stack, link_pattern, current_block_type, current_linked_ids, current_page)
                     current_text = []
                     current_block_id = None
                     current_block_type = None
@@ -128,12 +143,12 @@ class MarkdownParser:
                 current_text.append(line_stripped)
         
         if current_text:
-            self._add_block(blocks, current_text, current_block_id, current_section_stack, link_pattern, current_block_type, current_linked_ids)
+            self._add_block(blocks, current_text, current_block_id, current_section_stack, link_pattern, current_block_type, current_linked_ids, current_page)
             
         self._blocks_cache = blocks
         return blocks
 
-    def _add_block(self, blocks, text_lines, block_id, sections, link_pattern, block_type=None, linked_ids=None):
+    def _add_block(self, blocks, text_lines, block_id, sections, link_pattern, block_type=None, linked_ids=None, page=None):
         full_text = "\n".join(text_lines)
         links = []
         
@@ -183,6 +198,7 @@ class MarkdownParser:
             text=full_text,
             block_id=block_id,
             section_context=list(sections),
+            page_hint=page,
             external_links=links,
             linked_block_ids=linked_ids or []
         ))

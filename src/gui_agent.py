@@ -1610,12 +1610,13 @@ class AgentWorker(QThread):
         if extracted_context and extracted_context.relevant_blocks:
             for block_ref in extracted_context.relevant_blocks:
                 block_id = block_ref.get("block_id")
-                page = block_ref.get("page", "?")
                 reason = block_ref.get("reason", "")
                 
                 # Ищем блок по ID
                 if block_id and block_id in blocks_by_id and block_id not in added_block_ids:
                     block = blocks_by_id[block_id]
+                    # Используем page_hint из блока (парсится из MD)
+                    page = block.page_hint if block.page_hint else "?"
                     text_blocks_str += f"\n### БЛОК [{block_id}] (Стр. {page})\n"
                     if reason:
                         text_blocks_str += f"*Причина выбора: {reason}*\n"
@@ -1627,7 +1628,8 @@ class AgentWorker(QThread):
                     for linked_id in block.linked_block_ids:
                         if linked_id in blocks_by_id and linked_id not in added_block_ids:
                             linked_block = blocks_by_id[linked_id]
-                            text_blocks_str += f"\n### БЛОК [{linked_id}] (связан с {block_id})\n"
+                            linked_page = linked_block.page_hint if linked_block.page_hint else "?"
+                            text_blocks_str += f"\n### БЛОК [{linked_id}] (Стр. {linked_page}, связан с {block_id})\n"
                             text_blocks_str += f"{linked_block.text}\n"
                             blocks_found += 1
                             added_block_ids.add(linked_id)
@@ -1635,6 +1637,7 @@ class AgentWorker(QThread):
                 elif block_id and block_id not in added_block_ids:
                     # Блок не найден, но есть content из старого формата
                     content = block_ref.get("content", "")
+                    page = block_ref.get("page", "?")
                     if content:
                         text_blocks_str += f"\n### БЛОК [{block_id}] (Стр. {page})\n{content}\n"
                         blocks_found += 1
