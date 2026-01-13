@@ -11,6 +11,9 @@ from .models import MarkdownBlock, ExternalLink
 
 logger = logging.getLogger(__name__)
 
+# Паттерн для связанных блоков: →ID (Unicode стрелка U+2192)
+LINKED_BLOCK_PATTERN = re.compile(r'^\u2192([A-Z0-9\-]+)$')
+
 
 class MarkdownParser:
     """Парсер Markdown файлов с результатами OCR."""
@@ -42,26 +45,58 @@ class MarkdownParser:
         current_section_stack: List[str] = []
         
         header_pattern = re.compile(r"^(#+)\s+(.+)$")
+        # Старый формат: <!-- BLOCK_ID: xxx -->
         block_id_start = re.compile(r"<!--\s*BLOCK_ID:\s*([a-f0-9-]+)\s*-->")
         block_id_end = re.compile(r"<!--\s*END_BLOCK\s*-->")
+        # Новый формат: ### BLOCK [TEXT]: ID или ### BLOCK [IMAGE]: ID
+        new_block_pattern = re.compile(r"^###\s+BLOCK\s+\[(TEXT|IMAGE)\]:\s*([A-Z0-9\-]+)")
         link_pattern = re.compile(r"(!?)\[([^\]]*)\]\((https?://[^)]+)\)") 
         
         lines = content.split("\n")
         current_text = []
         current_block_id = None
+        current_block_type = None  # 'TEXT' или 'IMAGE'
+        current_linked_ids = []  # Связанные блоки (→ID)
         
         for line in lines:
-            line = line.strip()
+            line_stripped = line.strip()
             
-            header_match = header_pattern.match(line)
-            if header_match:
+            # Проверяем новый формат блоков: ### BLOCK [TEXT/IMAGE]: ID
+            new_block_match = new_block_pattern.match(line_stripped)
+            if new_block_match:
+                # Сохраняем предыдущий блок
                 if current_text:
-                    self._add_block(blocks, current_text, current_block_id, current_section_stack, link_pattern)
+                    self._add_block(blocks, current_text, current_block_id, current_section_stack, link_pattern, current_block_type, current_linked_ids)
                     current_text = []
-                    current_block_id = None
+                    current_linked_ids = []
                 
+                current_block_type = new_block_match.group(1)  # TEXT или IMAGE
+                current_block_id = new_block_match.group(2)
+                continue
+            
+            # Проверяем связанный блок: →ID
+            linked_match = LINKED_BLOCK_PATTERN.match(line_stripped)
+            if linked_match:
+                linked_id = linked_match.group(1)
+                if linked_id not in current_linked_ids:
+                    current_linked_ids.append(linked_id)
+                continue  # Не добавляем в текст блока
+            
+            header_match = header_pattern.match(line_stripped)
+            if header_match:
+                # Не сохраняем блок при встрече заголовка страницы (## СТРАНИЦА X)
+                # чтобы не разрывать контекст
                 level = len(header_match.group(1))
                 title = header_match.group(2).strip()
+                
+                # Если это заголовок уровня 2 (## СТРАНИЦА) или выше - сохраняем блок
+                if level <= 2:
+                    if current_text:
+                        self._add_block(blocks, current_text, current_block_id, current_section_stack, link_pattern, current_block_type, current_linked_ids)
+                        current_text = []
+                        current_block_id = None
+                        current_block_type = None
+                        current_linked_ids = []
                 
                 if len(current_section_stack) >= level:
                     current_section_stack = current_section_stack[:level-1]
@@ -70,31 +105,35 @@ class MarkdownParser:
                 current_section_stack.append(title)
                 continue
                 
-            id_match = block_id_start.match(line)
+            id_match = block_id_start.match(line_stripped)
             if id_match:
                 if current_text:
-                    self._add_block(blocks, current_text, current_block_id, current_section_stack, link_pattern)
+                    self._add_block(blocks, current_text, current_block_id, current_section_stack, link_pattern, current_block_type, current_linked_ids)
                     current_text = []
+                    current_linked_ids = []
                 current_block_id = id_match.group(1)
+                current_block_type = None
                 continue
                 
-            if block_id_end.match(line):
+            if block_id_end.match(line_stripped):
                 if current_text:
-                    self._add_block(blocks, current_text, current_block_id, current_section_stack, link_pattern)
+                    self._add_block(blocks, current_text, current_block_id, current_section_stack, link_pattern, current_block_type, current_linked_ids)
                     current_text = []
                     current_block_id = None
+                    current_block_type = None
+                    current_linked_ids = []
                 continue
             
-            if line:
-                current_text.append(line)
+            if line_stripped:
+                current_text.append(line_stripped)
         
         if current_text:
-            self._add_block(blocks, current_text, current_block_id, current_section_stack, link_pattern)
+            self._add_block(blocks, current_text, current_block_id, current_section_stack, link_pattern, current_block_type, current_linked_ids)
             
         self._blocks_cache = blocks
         return blocks
 
-    def _add_block(self, blocks, text_lines, block_id, sections, link_pattern):
+    def _add_block(self, blocks, text_lines, block_id, sections, link_pattern, block_type=None, linked_ids=None):
         full_text = "\n".join(text_lines)
         links = []
         
@@ -144,7 +183,8 @@ class MarkdownParser:
             text=full_text,
             block_id=block_id,
             section_context=list(sections),
-            external_links=links
+            external_links=links,
+            linked_block_ids=linked_ids or []
         ))
 
     def get_blocks_by_keyword(self, keyword: str) -> List[MarkdownBlock]:

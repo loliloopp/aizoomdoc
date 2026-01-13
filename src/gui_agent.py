@@ -290,6 +290,27 @@ class AgentWorker(QThread):
         except Exception as e:
             logger.error(f"Ошибка массовой загрузки в S3: {e}")
 
+    def _upload_images_to_google_files(self, images: List, llm_client) -> None:
+        """
+        Загружает изображения в Google Files API для использования в Gemini.
+        Устанавливает google_file_uri в каждом изображении.
+        """
+        for img in images:
+            if not img.image_path or not Path(img.image_path).exists():
+                continue
+            
+            if getattr(img, 'google_file_uri', None):
+                continue  # Уже загружено
+            
+            try:
+                display_name = Path(img.image_path).name
+                uri = llm_client.upload_to_google_files(img.image_path, display_name)
+                if uri:
+                    img.google_file_uri = uri
+                    self.sig_log.emit(f"→ Google Files: {display_name}")
+            except Exception as e:
+                logger.error(f"Ошибка загрузки {img.image_path} в Google Files: {e}")
+
     def _save_to_disk(self):
         history_path = self.chat_dir / "history.json"
         with open(history_path, "w", encoding="utf-8") as f:
@@ -478,14 +499,12 @@ class AgentWorker(QThread):
             # Если указаны конкретные md файлы через GUI - используем их
             full_text = ""
             all_blocks = []
+            attached_images = []  # Инициализируем до if/else
             
             # ВАЖНО: Если мы продолжаем чат, нам все равно нужен текст документа в контексте.
             # Для варианта A мы просто заново читаем файлы.
             if self.md_files:
                 self.sig_log.emit(f"Используются выбранные файлы: {len(self.md_files)}")
-                
-                # Список для изображений, которые нужно передать в LLM
-                attached_images = []
                 
                 for file_path_str in self.md_files:
                     try:
@@ -510,6 +529,9 @@ class AgentWorker(QThread):
 
                         # Обрабатываем файл в зависимости от типа
                         text, blocks, image = FileProcessor.process_file(file_path, self.db_chat_id)
+                        
+                        # Отладка
+                        self.sig_log.emit(f"  → Получено текста: {len(text)} символов")
                         
                         # Добавляем текст в контекст
                         full_text += text
@@ -582,7 +604,16 @@ class AgentWorker(QThread):
                             except: pass
             
             if not full_text.strip() and not attached_images:
-                raise ValueError("В чате нет прикрепленных документов для анализа. Прикрепите файлы (md, jpg, png, html, json) или изображения.")
+                # Отладка
+                self.sig_log.emit(f"❌ Ошибка проверки:")
+                self.sig_log.emit(f"  full_text length: {len(full_text)}")
+                self.sig_log.emit(f"  attached_images count: {len(attached_images)}")
+                self.sig_log.emit(f"  md_files: {self.md_files}")
+                self.sig_log.emit(f"  files_to_process будут: {files_to_process if 'files_to_process' in locals() else 'НЕ ОПРЕДЕЛЕНЫ'}")
+                
+                # Для flash+pro режима проверка не нужна - файлы читаются позже
+                if self.model != "flash+pro":
+                    raise ValueError("В чате нет прикрепленных документов для анализа. Прикрепите файлы (md, jpg, png, html, json) или изображения.")
             
             # Если есть только изображения без текста — это допустимо (например, кроп PDF)
             if not full_text.strip() and attached_images:
@@ -718,12 +749,35 @@ class AgentWorker(QThread):
                                     content_summary=img_block.content_summary or "",
                                     detailed_description=img_block.detailed_description or "",
                                     clean_ocr_text=img_block.ocr_text or "",
-                                    key_entities=img_block.key_entities or []
+                                    key_entities=img_block.key_entities or [],
+                                    sheet_name=img_block.sheet_name or ""
                                 )
                                 doc_index.images[img_block.block_id] = entry
                             self.sig_log.emit(f"Добавлено {len(document.image_blocks)} изображений из HTML в каталог")
                     except Exception as e:
                         logger.error(f"Ошибка добавления изображений из HTML {md_path}: {e}")
+                
+                elif suffix == '.md':
+                    # Парсинг нового MD формата (_document.md)
+                    try:
+                        from .file_processor import FileProcessor
+                        md_image_blocks = FileProcessor.parse_md_image_blocks(md_path)
+                        for img_block in md_image_blocks:
+                            entry = ImageCatalogEntry(
+                                image_id=img_block.block_id,
+                                page=img_block.page_number,
+                                uri=img_block.crop_url or "",
+                                content_summary=img_block.content_summary or "",
+                                detailed_description=img_block.detailed_description or "",
+                                clean_ocr_text=img_block.ocr_text or "",
+                                key_entities=img_block.key_entities or [],
+                                sheet_name=img_block.sheet_name or ""
+                            )
+                            doc_index.images[img_block.block_id] = entry
+                        if md_image_blocks:
+                            self.sig_log.emit(f"Добавлено {len(md_image_blocks)} изображений из MD в каталог")
+                    except Exception as e:
+                        logger.error(f"Ошибка добавления изображений из MD {md_path}: {e}")
             
             tail_n = 12 # Начальный размер истории
             context = ""
@@ -1295,6 +1349,26 @@ class AgentWorker(QThread):
                             doc_index.images[img_block.block_id] = entry
                 except Exception as e:
                     logger.error(f"Ошибка добавления изображений из HTML: {e}")
+            
+            elif suffix == '.md':
+                # Парсинг нового MD формата (_document.md)
+                try:
+                    from .file_processor import FileProcessor
+                    md_image_blocks = FileProcessor.parse_md_image_blocks(md_path)
+                    for img_block in md_image_blocks:
+                        entry = ImageCatalogEntry(
+                            image_id=img_block.block_id,
+                            page=img_block.page_number,
+                            uri=img_block.crop_url or "",
+                            content_summary=img_block.content_summary or "",
+                            detailed_description=img_block.detailed_description or "",
+                            clean_ocr_text=img_block.ocr_text or "",
+                            key_entities=img_block.key_entities or [],
+                            sheet_name=img_block.sheet_name or ""
+                        )
+                        doc_index.images[img_block.block_id] = entry
+                except Exception as e:
+                    logger.error(f"Ошибка добавления изображений из MD: {e}")
         
         # ===== ЭТАП 1: FLASH ЭКСТРАКТОР =====
         self.sig_log.emit("📋 Этап 1: Flash анализирует документ...")
@@ -1317,7 +1391,7 @@ class AgentWorker(QThread):
         catalog_text = "\n".join(catalog_lines)
         
         flash_context = f"""ДОКУМЕНТ:
-{doc_text[:50000]}
+{doc_text}
 
 КАТАЛОГ ИЗОБРАЖЕНИЙ:
 {catalog_text}
@@ -1396,6 +1470,9 @@ class AgentWorker(QThread):
                                     self.sig_image.emit(c.image_path, f"Flash: {rid}")
                 
                 if downloaded_imgs:
+                    # Загружаем в Google Files API для Gemini
+                    self._upload_images_to_google_files(downloaded_imgs, llm_client)
+                    # Fallback на S3 если Google Files не сработал
                     self._upload_images_to_s3(downloaded_imgs)
                     collected_images.extend(downloaded_imgs)
                     self._log_full(f"FLASH #{flash_step}: Загружено изображений", len(downloaded_imgs))
@@ -1403,10 +1480,12 @@ class AgentWorker(QThread):
                     # Добавляем изображения в контекст Flash
                     img_content = [{"type": "text", "text": "Загружены изображения:"}]
                     for img in downloaded_imgs:
-                        if img.s3_url:
+                        # Приоритет: Google Files URI, потом S3 URL
+                        img_url = getattr(img, 'google_file_uri', None) or img.s3_url
+                        if img_url:
                             img_content.append({
                                 "type": "image_url",
-                                "image_url": {"url": img.s3_url}
+                                "image_url": {"url": img_url}
                             })
                     flash_messages.append({"role": "user", "content": img_content})
                     continue
@@ -1449,6 +1528,9 @@ class AgentWorker(QThread):
                         self._append_app_log(f"    ❌ ZOOM не удался")
                 
                 if zoom_crops:
+                    # Загружаем в Google Files API для Gemini
+                    self._upload_images_to_google_files(zoom_crops, llm_client)
+                    # Fallback на S3
                     self._upload_images_to_s3(zoom_crops)
                     collected_zooms.extend(zoom_crops)
                     self._log_full(f"FLASH #{flash_step}: Выполнено ZOOM", len(zoom_crops))
@@ -1456,10 +1538,12 @@ class AgentWorker(QThread):
                     # Добавляем зумы в контекст Flash
                     zoom_content = [{"type": "text", "text": "Результаты ZOOM:"}]
                     for zc in zoom_crops:
-                        if zc.s3_url:
+                        # Приоритет: Google Files URI, потом S3 URL
+                        img_url = getattr(zc, 'google_file_uri', None) or zc.s3_url
+                        if img_url:
                             zoom_content.append({
                                 "type": "image_url",
-                                "image_url": {"url": zc.s3_url}
+                                "image_url": {"url": img_url}
                             })
                     flash_messages.append({"role": "user", "content": zoom_content})
                     continue
@@ -1512,13 +1596,51 @@ class AgentWorker(QThread):
         # Формируем контекст для Pro
         analysis_prompt = load_analysis_prompt(self.data_root)
         
-        # Собираем текстовые фрагменты от Flash
-        text_chunks_str = ""
-        if extracted_context and extracted_context.relevant_text_chunks:
-            for chunk in extracted_context.relevant_text_chunks:
-                page = chunk.get("page", "?")
-                content = chunk.get("content", "")
-                text_chunks_str += f"\n[Стр. {page}]\n{content}\n"
+        # Создаём индекс блоков по ID для быстрого поиска
+        blocks_by_id = {}
+        for block in all_blocks:
+            if block.block_id:
+                blocks_by_id[block.block_id] = block
+        
+        # Собираем ПОЛНЫЕ тексты блоков по block_id от Flash
+        text_blocks_str = ""
+        blocks_found = 0
+        added_block_ids = set()  # Чтобы не добавлять дубликаты
+        
+        if extracted_context and extracted_context.relevant_blocks:
+            for block_ref in extracted_context.relevant_blocks:
+                block_id = block_ref.get("block_id")
+                page = block_ref.get("page", "?")
+                reason = block_ref.get("reason", "")
+                
+                # Ищем блок по ID
+                if block_id and block_id in blocks_by_id and block_id not in added_block_ids:
+                    block = blocks_by_id[block_id]
+                    text_blocks_str += f"\n### БЛОК [{block_id}] (Стр. {page})\n"
+                    if reason:
+                        text_blocks_str += f"*Причина выбора: {reason}*\n"
+                    text_blocks_str += f"{block.text}\n"
+                    blocks_found += 1
+                    added_block_ids.add(block_id)
+                    
+                    # Добавляем связанные блоки (→ID)
+                    for linked_id in block.linked_block_ids:
+                        if linked_id in blocks_by_id and linked_id not in added_block_ids:
+                            linked_block = blocks_by_id[linked_id]
+                            text_blocks_str += f"\n### БЛОК [{linked_id}] (связан с {block_id})\n"
+                            text_blocks_str += f"{linked_block.text}\n"
+                            blocks_found += 1
+                            added_block_ids.add(linked_id)
+                            
+                elif block_id and block_id not in added_block_ids:
+                    # Блок не найден, но есть content из старого формата
+                    content = block_ref.get("content", "")
+                    if content:
+                        text_blocks_str += f"\n### БЛОК [{block_id}] (Стр. {page})\n{content}\n"
+                        blocks_found += 1
+                        added_block_ids.add(block_id)
+        
+        self.sig_log.emit(f"Pro получит {blocks_found} текстовых блоков")
         
         flash_reasoning = ""
         if extracted_context and extracted_context.flash_reasoning:
@@ -1527,8 +1649,8 @@ class AgentWorker(QThread):
         pro_context = f"""КОНТЕКСТ ДЛЯ АНАЛИЗА (собран Flash-моделью):
 {flash_reasoning}
 
-РЕЛЕВАНТНЫЕ ТЕКСТОВЫЕ ФРАГМЕНТЫ:
-{text_chunks_str if text_chunks_str else 'Текстовые фрагменты не найдены.'}
+РЕЛЕВАНТНЫЕ ТЕКСТОВЫЕ БЛОКИ ({blocks_found} шт.):
+{text_blocks_str if text_blocks_str else 'Текстовые блоки не найдены.'}
 
 ЗАПРОС ПОЛЬЗОВАТЕЛЯ:
 {self.query}
@@ -1542,15 +1664,21 @@ class AgentWorker(QThread):
         # Добавляем контекст и изображения
         all_images = collected_images + collected_zooms + (attached_images or [])
         
+        # Загружаем attached_images в Google Files API если ещё не загружены
+        if attached_images:
+            self._upload_images_to_google_files(attached_images, llm_client)
+        
         if all_images:
             pro_content = [{"type": "text", "text": pro_context}]
             for img in all_images:
-                if img.s3_url:
+                # Приоритет: Google Files URI, потом S3 URL
+                img_url = getattr(img, 'google_file_uri', None) or getattr(img, 's3_url', None)
+                if img_url:
                     desc = img.description[:100] if img.description else "Изображение"
                     pro_content.append({"type": "text", "text": f"[{desc}]"})
                     pro_content.append({
                         "type": "image_url",
-                        "image_url": {"url": img.s3_url}
+                        "image_url": {"url": img_url}
                     })
             pro_messages.append({"role": "user", "content": pro_content})
         else:

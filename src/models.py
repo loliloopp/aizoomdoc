@@ -117,6 +117,7 @@ class MarkdownBlock:
     section_context: List[str] = field(default_factory=list)
     page_hint: Optional[int] = None
     external_links: List[ExternalLink] = field(default_factory=list)
+    linked_block_ids: List[str] = field(default_factory=list)  # Связанные блоки (→ID)
 
 @dataclass
 class ViewportCrop:
@@ -154,7 +155,12 @@ class ComparisonContext:
 @dataclass
 class FlashExtractedContext:
     """Контекст, извлечённый Flash-моделью для передачи в Pro."""
-    relevant_text_chunks: List[Dict[str, Any]] = field(default_factory=list)  # {page, content}
-    relevant_images: List[Dict[str, Any]] = field(default_factory=list)       # {image_id, reason, s3_url}
-    zoom_crops: List[ViewportCrop] = field(default_factory=list)              # Выполненные зумы
+    relevant_blocks: List[Dict[str, Any]] = field(default_factory=list)  # {block_id, page, reason}
+    relevant_images: List[Dict[str, Any]] = field(default_factory=list)  # {image_id, reason}
+    zoom_crops: List[ViewportCrop] = field(default_factory=list)         # Выполненные зумы
     flash_reasoning: str = ""  # Рассуждения Flash о выборе контекста
+    
+    # Для обратной совместимости
+    @property
+    def relevant_text_chunks(self) -> List[Dict[str, Any]]:
+        return self.relevant_blocks

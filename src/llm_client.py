@@ -330,6 +330,61 @@ class LLMClient:
         """Проверяет, является ли модель прямой моделью Google."""
         return self.model in ["gemini-3-flash-preview", "gemini-3-pro-preview"]
 
+    def upload_to_google_files(self, file_path: str, display_name: str = None) -> Optional[str]:
+        """
+        Загружает файл в Google Files API.
+        Возвращает URI файла для использования в запросах к Gemini.
+        
+        Args:
+            file_path: Путь к локальному файлу
+            display_name: Отображаемое имя файла (опционально)
+            
+        Returns:
+            URI файла в Google Files API или None при ошибке
+        """
+        if not self.google_client:
+            logger.error("Google GenAI SDK не инициализирован")
+            return None
+        
+        try:
+            path = Path(file_path)
+            if not path.exists():
+                logger.error(f"Файл не найден: {file_path}")
+                return None
+            
+            # Определяем MIME тип
+            suffix = path.suffix.lower()
+            mime_types = {
+                '.jpg': 'image/jpeg',
+                '.jpeg': 'image/jpeg',
+                '.png': 'image/png',
+                '.gif': 'image/gif',
+                '.webp': 'image/webp',
+                '.pdf': 'application/pdf',
+            }
+            mime_type = mime_types.get(suffix, 'application/octet-stream')
+            
+            # Загружаем файл через Google Files API
+            with open(path, 'rb') as f:
+                file_data = f.read()
+            
+            uploaded_file = self.google_client.files.upload(
+                file=file_data,
+                config={
+                    "display_name": display_name or path.name,
+                    "mime_type": mime_type
+                }
+            )
+            
+            # Возвращаем URI файла
+            file_uri = uploaded_file.uri if hasattr(uploaded_file, 'uri') else str(uploaded_file.name)
+            logger.info(f"Загружен в Google Files: {path.name} → {file_uri}")
+            return file_uri
+            
+        except Exception as e:
+            logger.error(f"Ошибка загрузки в Google Files API: {e}")
+            return None
+
     def _call_google_direct(self, messages: List[Dict[str, Any]], temperature: float = 0.2, max_tokens: int = config.MAX_TOKENS, response_json: bool = False) -> str:
         """Вызов Google API напрямую через новый SDK."""
         if not self.google_client:
@@ -997,12 +1052,13 @@ class LLMClient:
             
             # Ищем объект со status="ready"
             if item.get("status") == "ready":
-                text_chunks = item.get("relevant_text_chunks") or []
+                # Поддерживаем оба формата: relevant_blocks (новый) и relevant_text_chunks (старый)
+                blocks = item.get("relevant_blocks") or item.get("relevant_text_chunks") or []
                 images = item.get("relevant_images") or []
                 reasoning = item.get("reasoning") or ""
                 
                 return FlashExtractedContext(
-                    relevant_text_chunks=text_chunks,
+                    relevant_blocks=blocks,
                     relevant_images=images,
                     zoom_crops=[],  # Зумы заполняются отдельно
                     flash_reasoning=reasoning

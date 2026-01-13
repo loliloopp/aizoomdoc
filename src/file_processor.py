@@ -5,8 +5,10 @@
 import json
 import logging
 import base64
+import re
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict, Any
+from dataclasses import dataclass, field
 from bs4 import BeautifulSoup
 
 from .models import MarkdownBlock, ViewportCrop
@@ -15,6 +17,20 @@ from .json_annotation_processor import JsonAnnotationProcessor
 from .html_ocr_processor import HtmlOcrProcessor
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class MdImageBlock:
+    """Блок изображения из нового MD формата (_document.md)."""
+    block_id: str
+    page_number: int
+    block_type: str = "image"
+    content_summary: str = ""
+    detailed_description: str = ""
+    ocr_text: str = ""
+    key_entities: List[str] = field(default_factory=list)
+    sheet_name: str = ""  # Наименование листа (берется с уровня страницы)
+    crop_url: str = ""
 
 
 class FileProcessor:
@@ -61,6 +77,15 @@ class FileProcessor:
         full_text = ""
         for block in blocks:
             full_text += block.text + "\n\n"
+        
+        # Если парсер не извлек текст (новый формат _document.md), читаем файл напрямую
+        if not full_text.strip():
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    full_text = f.read()
+                logger.info(f"MD файл {file_path.name} прочитан напрямую ({len(full_text)} символов)")
+            except Exception as e:
+                logger.error(f"Ошибка чтения MD файла {file_path}: {e}")
         
         return full_text, blocks, None
     
@@ -168,4 +193,97 @@ class FileProcessor:
         except Exception as e:
             logger.error(f"Ошибка чтения текстового файла {file_path}: {e}")
             return f"[Ошибка загрузки файла: {file_path.name}]\n", [], None
+
+    @staticmethod
+    def parse_md_image_blocks(file_path: Path) -> List[MdImageBlock]:
+        """
+        Парсит изображения из нового MD формата (_document.md).
+        
+        Формат:
+        ## СТРАНИЦА X
+        **Наименование листа:** ...
+        
+        ### BLOCK [IMAGE]: ID
+        **[ИЗОБРАЖЕНИЕ]** | Тип: ...
+        **Краткое описание:** ...
+        **Описание:** ...
+        **Текст на чертеже:** ...
+        **Сущности:** ...
+        """
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+        except Exception as e:
+            logger.error(f"Ошибка чтения MD файла {file_path}: {e}")
+            return []
+        
+        image_blocks: List[MdImageBlock] = []
+        
+        # Регулярки
+        page_pattern = re.compile(r'^## СТРАНИЦА (\d+)', re.MULTILINE)
+        sheet_name_pattern = re.compile(r'\*\*Наименование листа:\*\*\s*(.+?)$', re.MULTILINE)
+        block_image_pattern = re.compile(r'^### BLOCK \[IMAGE\]: ([A-Z0-9\-]+)', re.MULTILINE)
+        
+        # Парсим по страницам
+        pages = list(page_pattern.finditer(content))
+        
+        for i, page_match in enumerate(pages):
+            page_num = int(page_match.group(1))
+            page_start = page_match.end()
+            page_end = pages[i + 1].start() if i + 1 < len(pages) else len(content)
+            page_content = content[page_start:page_end]
+            
+            # Ищем Наименование листа для этой страницы
+            sheet_match = sheet_name_pattern.search(page_content)
+            sheet_name = sheet_match.group(1).strip() if sheet_match else ""
+            
+            # Ищем блоки изображений на странице
+            image_matches = list(block_image_pattern.finditer(page_content))
+            
+            for j, img_match in enumerate(image_matches):
+                block_id = img_match.group(1)
+                block_start = img_match.end()
+                # Конец блока - начало следующего блока или следующая страница
+                block_end = image_matches[j + 1].start() if j + 1 < len(image_matches) else len(page_content)
+                block_content = page_content[block_start:block_end]
+                
+                # Извлекаем поля
+                content_summary = ""
+                detailed_description = ""
+                ocr_text = ""
+                key_entities = []
+                
+                # Краткое описание
+                summary_match = re.search(r'\*\*Краткое описание:\*\*\s*(.+?)(?:\n\n|\n\*\*|$)', block_content, re.DOTALL)
+                if summary_match:
+                    content_summary = summary_match.group(1).strip()
+                
+                # Описание
+                desc_match = re.search(r'\*\*Описание:\*\*\s*(.+?)(?:\n\n|\n\*\*|$)', block_content, re.DOTALL)
+                if desc_match:
+                    detailed_description = desc_match.group(1).strip()
+                
+                # Текст на чертеже
+                ocr_match = re.search(r'\*\*Текст на чертеже:\*\*\s*(.+?)(?:\n\n|\n\*\*|$)', block_content, re.DOTALL)
+                if ocr_match:
+                    ocr_text = ocr_match.group(1).strip()
+                
+                # Сущности
+                entities_match = re.search(r'\*\*Сущности:\*\*\s*(.+?)(?:\n\n|\n\*\*|$)', block_content, re.DOTALL)
+                if entities_match:
+                    entities_str = entities_match.group(1).strip()
+                    key_entities = [e.strip() for e in entities_str.split(',') if e.strip()]
+                
+                image_blocks.append(MdImageBlock(
+                    block_id=block_id,
+                    page_number=page_num,
+                    content_summary=content_summary,
+                    detailed_description=detailed_description,
+                    ocr_text=ocr_text,
+                    key_entities=key_entities,
+                    sheet_name=sheet_name
+                ))
+        
+        logger.info(f"Извлечено {len(image_blocks)} изображений из MD файла {file_path.name}")
+        return image_blocks
 
