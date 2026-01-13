@@ -707,6 +707,7 @@ class LLMClient:
             "low": "MEDIA_RESOLUTION_LOW",
             "medium": "MEDIA_RESOLUTION_MEDIUM",
             "high": "MEDIA_RESOLUTION_HIGH",
+            "ultra_high": "MEDIA_RESOLUTION_ULTRA_HIGH",
         }
         media_res = media_res_map.get(config.MEDIA_RESOLUTION.lower(), "MEDIA_RESOLUTION_HIGH")
         config_args["media_resolution"] = media_res
@@ -1116,6 +1117,7 @@ class LLMClient:
             "low": "MEDIA_RESOLUTION_LOW",
             "medium": "MEDIA_RESOLUTION_MEDIUM",
             "high": "MEDIA_RESOLUTION_HIGH",
+            "ultra_high": "MEDIA_RESOLUTION_ULTRA_HIGH",
         }
         media_res = media_res_map.get(config.MEDIA_RESOLUTION.lower(), "MEDIA_RESOLUTION_HIGH")
         
@@ -1201,6 +1203,7 @@ class LLMClient:
             "low": "MEDIA_RESOLUTION_LOW",
             "medium": "MEDIA_RESOLUTION_MEDIUM",
             "high": "MEDIA_RESOLUTION_HIGH",
+            "ultra_high": "MEDIA_RESOLUTION_ULTRA_HIGH",
         }
         media_res = media_res_map.get(config.MEDIA_RESOLUTION.lower(), "MEDIA_RESOLUTION_HIGH")
         

@@ -159,6 +159,7 @@ class SettingsDialog(QDialog):
         self.combo_media_resolution.addItem("Low (быстро, дёшево)", "low")
         self.combo_media_resolution.addItem("Medium (баланс)", "medium")
         self.combo_media_resolution.addItem("High (детали чертежей)", "high")
+        self.combo_media_resolution.addItem("Ultra High (макс. детализация)", "ultra_high")
         # Устанавливаем текущее значение
         current_res = config.MEDIA_RESOLUTION.lower()
         idx = self.combo_media_resolution.findData(current_res)
@@ -2237,12 +2238,19 @@ class MainWindow(QMainWindow):
                 self.current_db_chat_id = data_id
                 self.log(f"Загрузка чата {data_id} из облака...")
                 
-                # Загружаем инфо о чате для получения метаданных (local_chat_id)
+                # Загружаем инфо о чате для получения метаданных (local_chat_id, токены)
                 chat_info = self.run_async(supabase_client.get_chat(data_id))
                 if chat_info and "metadata" in chat_info:
                     self.current_chat_id = chat_info["metadata"].get("local_chat_id")
                     self.selected_md_files = chat_info["metadata"].get("md_files", [])
                     self.update_file_indicator()
+                    
+                    # Загружаем счетчик токенов
+                    total_tokens = chat_info["metadata"].get("total_tokens", 0)
+                    if total_tokens > 0:
+                        ctx_limit = 1_000_000  # 1M токенов
+                        remaining = max(0, ctx_limit - total_tokens)
+                        self.update_usage(total_tokens, remaining)
 
                 messages = self.run_async(supabase_client.get_chat_messages(data_id))
                 for msg in messages:

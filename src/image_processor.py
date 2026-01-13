@@ -4,6 +4,7 @@
 
 import logging
 import io
+import os
 import tempfile
 import uuid
 from pathlib import Path
@@ -71,22 +72,35 @@ class ImageProcessor:
                 if img_bgr is None:
                     logger.warning(f"Файл в кэше поврежден: {cache_path}")
             
-            # 2. Если нет в кэше — скачиваем
+            # 2. Если нет в кэше — скачиваем или читаем локально
             if img_bgr is None:
-                logger.info(f"Скачивание PDF: {url}")
-                response = requests.get(url, timeout=30)
-                response.raise_for_status()
+                # Проверяем, локальный ли это путь
+                is_local = os.path.exists(url) or (len(url) > 2 and url[1] == ':')  # Windows путь
                 
-                with fitz.open(stream=response.content, filetype="pdf") as doc:
-                    if doc.page_count == 0:
-                        return []
-                    page = doc[0]
-                    pix = page.get_pixmap(dpi=200) 
-                    img_array = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
-                    img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR) if pix.n >= 3 else cv2.cvtColor(img_array, cv2.COLOR_GRAY2BGR)
+                if is_local:
+                    logger.info(f"Чтение локального PDF: {url}")
+                    with fitz.open(url) as doc:
+                        if doc.page_count == 0:
+                            return []
+                        page = doc[0]
+                        pix = page.get_pixmap(dpi=200) 
+                        img_array = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+                        img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR) if pix.n >= 3 else cv2.cvtColor(img_array, cv2.COLOR_GRAY2BGR)
+                else:
+                    logger.info(f"Скачивание PDF: {url}")
+                    response = requests.get(url, timeout=30)
+                    response.raise_for_status()
                     
-                    # Сохраняем оригинал
-                    cv2.imwrite(str(cache_path), img_bgr)
+                    with fitz.open(stream=response.content, filetype="pdf") as doc:
+                        if doc.page_count == 0:
+                            return []
+                        page = doc[0]
+                        pix = page.get_pixmap(dpi=200) 
+                        img_array = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+                        img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR) if pix.n >= 3 else cv2.cvtColor(img_array, cv2.COLOR_GRAY2BGR)
+                
+                # Сохраняем оригинал
+                cv2.imwrite(str(cache_path), img_bgr)
 
             h, w = img_bgr.shape[:2]
             self._image_cache[img_id] = cache_path

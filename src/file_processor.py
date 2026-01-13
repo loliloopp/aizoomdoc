@@ -31,6 +31,7 @@ class MdImageBlock:
     key_entities: List[str] = field(default_factory=list)
     sheet_name: str = ""  # Наименование листа (берется с уровня страницы)
     crop_url: str = ""
+    local_path: str = ""  # Локальный путь к файлу изображения (crops/ID.pdf)
 
 
 class FileProcessor:
@@ -274,6 +275,17 @@ class FileProcessor:
                     entities_str = entities_match.group(1).strip()
                     key_entities = [e.strip() for e in entities_str.split(',') if e.strip()]
                 
+                # Ищем локальный файл в папке crops
+                local_path = ""
+                crops_dir = file_path.parent / "crops"
+                if crops_dir.exists():
+                    # Проверяем разные расширения
+                    for ext in ['.pdf', '.png', '.jpg', '.jpeg']:
+                        candidate = crops_dir / f"{block_id}{ext}"
+                        if candidate.exists():
+                            local_path = str(candidate)
+                            break
+                
                 image_blocks.append(MdImageBlock(
                     block_id=block_id,
                     page_number=page_num,
@@ -281,7 +293,8 @@ class FileProcessor:
                     detailed_description=detailed_description,
                     ocr_text=ocr_text,
                     key_entities=key_entities,
-                    sheet_name=sheet_name
+                    sheet_name=sheet_name,
+                    local_path=local_path
                 ))
         
         logger.info(f"Извлечено {len(image_blocks)} изображений из MD файла {file_path.name}")

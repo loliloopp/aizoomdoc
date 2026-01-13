@@ -45,6 +45,9 @@ class AgentWorker(QThread):
         self.user_prompt = user_prompt
         self.is_running = True
         
+        # Счетчик токенов для текущего чата
+        self.total_tokens_used = 0
+        
         if existing_chat_id:
             self.chat_id = existing_chat_id
             self.is_new_chat = False
@@ -65,6 +68,16 @@ class AgentWorker(QThread):
         self.full_log_path = self.chat_dir / f"full_log_{log_idx}.txt"
         
         self.db_chat_id = existing_db_chat_id
+        
+        # Загружаем токены из БД для существующего чата
+        if not self.is_new_chat and self.db_chat_id and supabase_client.is_connected():
+            try:
+                chat_data = asyncio.run(supabase_client.get_chat(self.db_chat_id))
+                if chat_data and chat_data.get("metadata"):
+                    metadata = chat_data["metadata"]
+                    self.total_tokens_used = metadata.get("total_tokens", 0)
+            except Exception as e:
+                logger.error(f"Ошибка загрузки токенов из БД: {e}")
         
         if self.is_new_chat:
             self.chat_history_data = {
@@ -310,6 +323,26 @@ class AgentWorker(QThread):
                     self.sig_log.emit(f"→ Google Files: {display_name}")
             except Exception as e:
                 logger.error(f"Ошибка загрузки {img.image_path} в Google Files: {e}")
+
+    def _update_tokens(self, tokens_to_add: int):
+        """Добавляет токены к общему счетчику и обновляет БД."""
+        self.total_tokens_used += tokens_to_add
+        
+        # Обновляем счетчик в UI
+        # Используем фиксированный лимит контекста для отображения
+        ctx_limit = 1_000_000  # 1M токенов для Gemini
+        remaining = max(0, ctx_limit - self.total_tokens_used)
+        self.sig_usage.emit(self.total_tokens_used, remaining)
+        
+        # Сохраняем в БД
+        if self.db_chat_id and supabase_client.is_connected():
+            try:
+                asyncio.run(supabase_client.update_chat(
+                    self.db_chat_id,
+                    {"metadata": {"total_tokens": self.total_tokens_used}}
+                ))
+            except Exception as e:
+                logger.error(f"Ошибка обновления токенов в БД: {e}")
 
     def _save_to_disk(self):
         history_path = self.chat_dir / "history.json"
@@ -947,8 +980,8 @@ class AgentWorker(QThread):
                             f"[Контекст/факт][анализ] prompt={pt}, completion={ct}, total={tt}, "
                             f"лимит={ctx if ctx is not None else 'неизв.'}, остаток={rem if rem is not None else 'неизв.'}"
                         )
-                        if isinstance(pt, int) and isinstance(rem, int):
-                            self.sig_usage.emit(pt, rem)
+                        if isinstance(tt, int) and tt > 0:
+                            self._update_tokens(tt)
                 except Exception:
                     pass
                 
@@ -1364,7 +1397,8 @@ class AgentWorker(QThread):
                             detailed_description=img_block.detailed_description or "",
                             clean_ocr_text=img_block.ocr_text or "",
                             key_entities=img_block.key_entities or [],
-                            sheet_name=img_block.sheet_name or ""
+                            sheet_name=img_block.sheet_name or "",
+                            local_path=img_block.local_path or ""
                         )
                         doc_index.images[img_block.block_id] = entry
                 except Exception as e:
@@ -1433,6 +1467,16 @@ class AgentWorker(QThread):
                 self._log_full(f"FLASH #{flash_step}: Ошибка", str(e))
                 break
             
+            # Обновляем счетчик токенов после вызова Flash
+            try:
+                usage = llm_client.last_usage
+                if isinstance(usage, dict) and usage.get("total_tokens"):
+                    tt = usage.get("total_tokens")
+                    self._update_tokens(tt)
+                    self.sig_log.emit(f"Flash шаг {flash_step}: использовано {tt} токенов")
+            except Exception as e:
+                logger.debug(f"Не удалось обновить токены Flash: {e}")
+            
             # Логируем ответ Flash
             self._log_full(f"FLASH #{flash_step}: Ответ", flash_response)
             
@@ -1461,7 +1505,13 @@ class AgentWorker(QThread):
                             continue
                         self.sig_log.emit(f"Flash запросила изображение: {rid}")
                         self._append_app_log(f"  📥 Загрузка изображения: {rid}")
-                        crops = image_processor.download_and_process_pdf(entry.uri, image_id=rid)
+                        
+                        # Используем локальный путь если нет URI
+                        image_source = entry.uri if entry.uri else entry.local_path
+                        if not image_source:
+                            self._append_app_log(f"  ⚠️ Нет источника изображения: {rid}")
+                            continue
+                        crops = image_processor.download_and_process_pdf(image_source, image_id=rid)
                         if crops:
                             downloaded_imgs.extend(crops)
                             sent_image_ids.add(rid)
@@ -1512,7 +1562,10 @@ class AgentWorker(QThread):
                         if img_id not in getattr(image_processor, "_image_cache", {}):
                             entry = doc_index.images.get(img_id)
                             if entry:
-                                image_processor.download_and_process_pdf(entry.uri, image_id=img_id)
+                                # Используем локальный путь если нет URI
+                                image_source = entry.uri if entry.uri else entry.local_path
+                                if image_source:
+                                    image_processor.download_and_process_pdf(image_source, image_id=img_id)
                     
                     zoom_crop = image_processor.process_zoom_request(
                         zr,
@@ -1586,13 +1639,6 @@ class AgentWorker(QThread):
         except Exception as e:
             logger.error(f"Ошибка сохранения flash_context.json: {e}")
         
-        # ===== ЭТАП 2: PRO АНАЛИЗ =====
-        self.sig_log.emit("🧠 Этап 2: Pro анализирует собранный контекст...")
-        self.sig_message.emit("system", "🧠 Этап 2: Pro анализирует собранный контекст и формирует ответ...", None)
-        
-        # Сохраняем сообщение пользователя
-        self.save_message("user", self.query, images=None)
-        
         # Формируем контекст для Pro
         analysis_prompt = load_analysis_prompt(self.data_root)
         
@@ -1644,6 +1690,54 @@ class AgentWorker(QThread):
                         added_block_ids.add(block_id)
         
         self.sig_log.emit(f"Pro получит {blocks_found} текстовых блоков")
+        
+        # Выводим собранный контекст в чат (Этап 1 завершён)
+        flash_summary_parts = []
+        flash_summary_parts.append("📋 **Контекст для Pro (собран Flash):**\n")
+        
+        # Рассуждения Flash
+        if extracted_context and extracted_context.flash_reasoning:
+            reasoning_preview = extracted_context.flash_reasoning[:300]
+            if len(extracted_context.flash_reasoning) > 300:
+                reasoning_preview += "..."
+            flash_summary_parts.append(f"**Анализ Flash:**\n_{reasoning_preview}_\n")
+        
+        # Блоки
+        if added_block_ids:
+            flash_summary_parts.append(f"**Текстовые блоки ({len(added_block_ids)}):**")
+            for bid in list(added_block_ids)[:10]:  # Показываем первые 10
+                block = blocks_by_id.get(bid)
+                if block:
+                    page = block.page_hint if block.page_hint else "?"
+                    preview = block.text[:100].replace('\n', ' ') + "..." if len(block.text) > 100 else block.text.replace('\n', ' ')
+                    flash_summary_parts.append(f"• `{bid}` (стр. {page}): {preview}")
+            if len(added_block_ids) > 10:
+                flash_summary_parts.append(f"  _...и ещё {len(added_block_ids) - 10} блоков_")
+        
+        # Изображения
+        all_images_for_pro = collected_images + collected_zooms + (attached_images or [])
+        if all_images_for_pro:
+            flash_summary_parts.append(f"\n**Изображения ({len(all_images_for_pro)}):**")
+            for img in all_images_for_pro[:5]:  # Показываем первые 5
+                desc = img.description[:80] if img.description else "Без описания"
+                flash_summary_parts.append(f"• {desc}")
+            if len(all_images_for_pro) > 5:
+                flash_summary_parts.append(f"  _...и ещё {len(all_images_for_pro) - 5} изображений_")
+        
+        flash_summary = "\n".join(flash_summary_parts)
+        self.sig_message.emit("system", flash_summary, None)
+        
+        # Показываем изображения в чате
+        for img in all_images_for_pro:
+            if hasattr(img, 'image_path') and img.image_path:
+                self.sig_image.emit(img.image_path, f"Для Pro: {img.description[:50] if img.description else 'Изображение'}")
+        
+        # ===== ЭТАП 2: PRO АНАЛИЗ =====
+        self.sig_log.emit("🧠 Этап 2: Pro анализирует собранный контекст...")
+        self.sig_message.emit("system", "🧠 Этап 2: Pro анализирует собранный контекст и формирует ответ...", None)
+        
+        # Сохраняем сообщение пользователя
+        self.save_message("user", self.query, images=None)
         
         flash_reasoning = ""
         if extracted_context and extracted_context.flash_reasoning:
@@ -1705,6 +1799,16 @@ class AgentWorker(QThread):
             self.save_message("assistant", f"⚠️ {err}")
             self.sig_finished.emit()
             return
+        
+        # Обновляем счетчик токенов после вызова Pro
+        try:
+            usage = llm_client.last_usage
+            if isinstance(usage, dict) and usage.get("total_tokens"):
+                tt = usage.get("total_tokens")
+                self._update_tokens(tt)
+                self.sig_log.emit(f"Pro: использовано {tt} токенов")
+        except Exception as e:
+            logger.debug(f"Не удалось обновить токены Pro: {e}")
         
         # Логируем ответ Pro
         self._log_full("PRO: Ответ", pro_response)
