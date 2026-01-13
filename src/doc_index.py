@@ -26,6 +26,7 @@ class ImageCatalogEntry:
     detailed_description: str = ""
     clean_ocr_text: str = ""
     key_entities: List[str] = field(default_factory=list)
+    sheet_name: str = ""  # Наименование листа из штампа чертежа
 
     def searchable_text(self) -> str:
         parts = [

@@ -314,6 +314,42 @@ class AgentWorker(QThread):
                 f.write(f"{text}\n")
         except: pass
 
+    def _sanitize_messages_for_log(self, messages: list) -> list:
+        """Очищает сообщения от длинных base64 данных для логирования."""
+        import copy
+        sanitized = []
+        for msg in messages:
+            msg_copy = copy.deepcopy(msg)
+            content = msg_copy.get("content", "")
+            
+            if isinstance(content, str):
+                if len(content) > 5000:
+                    msg_copy["content"] = f"<{len(content)} chars, truncated...>\n{content[:2000]}..."
+            elif isinstance(content, list):
+                new_content = []
+                for part in content:
+                    if isinstance(part, dict):
+                        if part.get("type") == "text":
+                            txt = part.get("text", "")
+                            if len(txt) > 3000:
+                                new_content.append({"type": "text", "text": f"<{len(txt)} chars truncated...>\n{txt[:1500]}..."})
+                            else:
+                                new_content.append(part)
+                        elif part.get("type") == "image_url":
+                            url = part.get("image_url", {}).get("url", "")
+                            if url.startswith("data:"):
+                                new_content.append({"type": "image_url", "image_url": {"url": f"<base64 image, {len(url)} chars>"}})
+                            else:
+                                new_content.append({"type": "image_url", "image_url": {"url": url[:200]}})
+                        else:
+                            new_content.append(part)
+                    else:
+                        new_content.append(part)
+                msg_copy["content"] = new_content
+            
+            sanitized.append(msg_copy)
+        return sanitized
+
     def run(self):
         try:
             # 0. Инициализация (лог файлов)
@@ -626,6 +662,17 @@ class AgentWorker(QThread):
                 self.save_message("assistant", response, images=None)
                 
                 self.sig_finished.emit()
+                return
+
+            # ===== РЕЖИМ FLASH + PRO =====
+            if self.model == "flash+pro":
+                self.sig_log.emit("🔄 Режим: Flash + Pro (двухэтапная обработка)")
+                self._run_flash_pro_mode(
+                    full_md_text=full_md_text,
+                    files_to_process=files_to_process,
+                    attached_images=attached_images if 'attached_images' in locals() else [],
+                    all_blocks=all_blocks
+                )
                 return
 
             # ===== ПОДГОТОВКА КОНТЕКСТА =====
@@ -1180,3 +1227,361 @@ class AgentWorker(QThread):
 
     def stop(self):
         self.is_running = False
+
+    def _run_flash_pro_mode(self, full_md_text: str, files_to_process: list, 
+                            attached_images: list, all_blocks: list):
+        """
+        Двухэтапная обработка: Flash собирает контекст, Pro анализирует.
+        """
+        from .doc_index import build_index, strip_json_blocks, ImageCatalogEntry
+        from .json_annotation_processor import JsonAnnotationProcessor
+        from .llm_client import LLMClient, load_flash_extractor_prompt, load_analysis_prompt
+        from .image_processor import ImageProcessor
+        
+        # Логирование начала Flash+Pro режима
+        self._log_full("РЕЖИМ FLASH+PRO", {
+            "query": self.query,
+            "files": [str(f) for f in files_to_process],
+            "attached_images_count": len(attached_images) if attached_images else 0
+        })
+        
+        # Инициализация
+        image_processor = ImageProcessor(self.data_root)
+        image_processor.temp_dir = self.images_dir
+        
+        llm_client = LLMClient(model="gemini-3-flash-preview", data_root=self.data_root)
+        
+        # Строим индекс документа
+        doc_index = build_index(full_md_text)
+        
+        # Добавляем изображения из JSON и HTML файлов
+        for md_path_str in files_to_process:
+            md_path = Path(md_path_str)
+            suffix = md_path.suffix.lower()
+            
+            if suffix == '.json':
+                try:
+                    _, annotation = JsonAnnotationProcessor.process(md_path)
+                    if annotation:
+                        for img_block in annotation.image_blocks:
+                            entry = ImageCatalogEntry(
+                                image_id=img_block.block_id,
+                                page=img_block.page_number,
+                                uri=img_block.crop_url or "",
+                                content_summary=img_block.content_summary or "",
+                                detailed_description=img_block.detailed_description or "",
+                                clean_ocr_text=img_block.ocr_text or "",
+                                key_entities=img_block.key_entities or []
+                            )
+                            doc_index.images[img_block.block_id] = entry
+                except Exception as e:
+                    logger.error(f"Ошибка добавления изображений из JSON: {e}")
+            
+            elif suffix == '.html':
+                try:
+                    _, document = HtmlOcrProcessor.process(md_path)
+                    if document:
+                        for img_block in document.image_blocks:
+                            entry = ImageCatalogEntry(
+                                image_id=img_block.block_id,
+                                page=img_block.page_number,
+                                uri=img_block.crop_url or "",
+                                content_summary=img_block.content_summary or "",
+                                detailed_description=img_block.detailed_description or "",
+                                clean_ocr_text=img_block.ocr_text or "",
+                                key_entities=img_block.key_entities or [],
+                                sheet_name=img_block.sheet_name or ""
+                            )
+                            doc_index.images[img_block.block_id] = entry
+                except Exception as e:
+                    logger.error(f"Ошибка добавления изображений из HTML: {e}")
+        
+        # ===== ЭТАП 1: FLASH ЭКСТРАКТОР =====
+        self.sig_log.emit("📋 Этап 1: Flash анализирует документ...")
+        self.sig_message.emit("system", "🔍 Этап 1: Flash анализирует документацию и собирает контекст...", None)
+        
+        flash_prompt = load_flash_extractor_prompt(self.data_root)
+        doc_text = strip_json_blocks(full_md_text)
+        
+        # Формируем ОБОГАЩЁННЫЙ каталог изображений для Flash
+        img_entries = sorted(doc_index.images.values(), key=lambda e: ((e.page or 0), e.image_id))
+        catalog_lines = []
+        for e in img_entries:
+            # Приоритет: sheet_name (наименование листа) > content_summary
+            description = e.sheet_name if e.sheet_name else e.content_summary
+            # Добавляем ключевые сущности если есть
+            entities_str = ""
+            if e.key_entities:
+                entities_str = f" | Сущности: {', '.join(e.key_entities[:8])}"
+            catalog_lines.append(f"- {e.image_id} (стр. {e.page}): {description[:200]}{entities_str}")
+        catalog_text = "\n".join(catalog_lines)
+        
+        flash_context = f"""ДОКУМЕНТ:
+{doc_text[:50000]}
+
+КАТАЛОГ ИЗОБРАЖЕНИЙ:
+{catalog_text}
+
+ЗАПРОС ПОЛЬЗОВАТЕЛЯ:
+{self.query}
+
+Извлеки ВСЕ релевантные данные для ответа на этот запрос."""
+        
+        flash_messages = [
+            {"role": "system", "content": flash_prompt},
+            {"role": "user", "content": flash_context}
+        ]
+        
+        # Логируем начальный запрос Flash
+        self._log_full("FLASH: Системный промпт", flash_prompt)
+        self._log_full("FLASH: Начальный контекст (усечено)", flash_context[:10000] + "..." if len(flash_context) > 10000 else flash_context)
+        
+        # Собираем контекст итеративно
+        collected_images = []  # ViewportCrop
+        collected_zooms = []   # ViewportCrop
+        sent_image_ids = set()
+        max_flash_steps = 5
+        flash_step = 0
+        extracted_context = None
+        
+        while flash_step < max_flash_steps and self.is_running:
+            flash_step += 1
+            self.sig_log.emit(f"Flash шаг {flash_step}/{max_flash_steps}...")
+            self._append_app_log(f"\n{'='*20} FLASH ШАГ {flash_step} {'='*20}")
+            
+            # Логируем запрос к Flash
+            self._log_full(f"FLASH #{flash_step}: Запрос", self._sanitize_messages_for_log(flash_messages))
+            
+            try:
+                flash_response = llm_client.call_flash_model(flash_messages)
+            except Exception as e:
+                self.sig_log.emit(f"Ошибка Flash: {e}")
+                self._log_full(f"FLASH #{flash_step}: Ошибка", str(e))
+                break
+            
+            # Логируем ответ Flash
+            self._log_full(f"FLASH #{flash_step}: Ответ", flash_response)
+            
+            # Добавляем ответ Flash в историю
+            flash_messages.append({"role": "model", "content": flash_response})
+            
+            # Проверяем, готов ли контекст
+            extracted_context = llm_client.parse_flash_context(flash_response)
+            if extracted_context:
+                self.sig_log.emit("✅ Flash собрал контекст")
+                break
+            
+            # Обрабатываем запросы изображений
+            img_reqs = llm_client.parse_image_requests(flash_response)
+            if img_reqs:
+                self._log_full(f"FLASH #{flash_step}: Запрос изображений", [{"image_ids": r.image_ids, "reason": r.reason} for r in img_reqs])
+                
+                downloaded_imgs = []
+                for r in img_reqs:
+                    for rid in r.image_ids:
+                        if rid in sent_image_ids:
+                            continue
+                        entry = doc_index.images.get(rid)
+                        if not entry:
+                            self._append_app_log(f"  ⚠️ Изображение не найдено: {rid}")
+                            continue
+                        self.sig_log.emit(f"Flash запросила изображение: {rid}")
+                        self._append_app_log(f"  📥 Загрузка изображения: {rid}")
+                        crops = image_processor.download_and_process_pdf(entry.uri, image_id=rid)
+                        if crops:
+                            downloaded_imgs.extend(crops)
+                            sent_image_ids.add(rid)
+                            for c in crops:
+                                if c.image_path:
+                                    self.sig_image.emit(c.image_path, f"Flash: {rid}")
+                
+                if downloaded_imgs:
+                    self._upload_images_to_s3(downloaded_imgs)
+                    collected_images.extend(downloaded_imgs)
+                    self._log_full(f"FLASH #{flash_step}: Загружено изображений", len(downloaded_imgs))
+                    
+                    # Добавляем изображения в контекст Flash
+                    img_content = [{"type": "text", "text": "Загружены изображения:"}]
+                    for img in downloaded_imgs:
+                        if img.s3_url:
+                            img_content.append({
+                                "type": "image_url",
+                                "image_url": {"url": img.s3_url}
+                            })
+                    flash_messages.append({"role": "user", "content": img_content})
+                    continue
+            
+            # Обрабатываем запросы зумов
+            zoom_reqs = llm_client.parse_zoom_request(flash_response)
+            if zoom_reqs:
+                self._log_full(f"FLASH #{flash_step}: Запросы ZOOM", [
+                    {"image_id": zr.image_id, "coords_norm": zr.coords_norm, "coords_px": zr.coords_px, "reason": zr.reason} 
+                    for zr in zoom_reqs
+                ])
+                
+                zoom_crops = []
+                for i, zr in enumerate(zoom_reqs):
+                    self.sig_log.emit(f"Flash запросила zoom: {zr.reason[:50]}")
+                    self._append_app_log(f"  🔍 ZOOM #{i+1}: {zr.image_id}, coords_norm={zr.coords_norm}, reason={zr.reason[:80]}")
+                    
+                    # Подготавливаем изображение если нужно
+                    img_id = getattr(zr, "image_id", None)
+                    if isinstance(img_id, str) and img_id:
+                        if img_id.endswith(".pdf"):
+                            img_id = img_id[:-4]
+                            zr.image_id = img_id
+                        if img_id not in getattr(image_processor, "_image_cache", {}):
+                            entry = doc_index.images.get(img_id)
+                            if entry:
+                                image_processor.download_and_process_pdf(entry.uri, image_id=img_id)
+                    
+                    zoom_crop = image_processor.process_zoom_request(
+                        zr,
+                        output_path=self.images_dir / f"flash_zoom_{flash_step}_{i}.png"
+                    )
+                    
+                    if zoom_crop:
+                        zoom_crops.append(zoom_crop)
+                        self._append_app_log(f"    ✅ ZOOM сохранен: {zoom_crop.image_path}")
+                        if zoom_crop.image_path:
+                            self.sig_image.emit(zoom_crop.image_path, f"Flash zoom {i+1}")
+                    else:
+                        self._append_app_log(f"    ❌ ZOOM не удался")
+                
+                if zoom_crops:
+                    self._upload_images_to_s3(zoom_crops)
+                    collected_zooms.extend(zoom_crops)
+                    self._log_full(f"FLASH #{flash_step}: Выполнено ZOOM", len(zoom_crops))
+                    
+                    # Добавляем зумы в контекст Flash
+                    zoom_content = [{"type": "text", "text": "Результаты ZOOM:"}]
+                    for zc in zoom_crops:
+                        if zc.s3_url:
+                            zoom_content.append({
+                                "type": "image_url",
+                                "image_url": {"url": zc.s3_url}
+                            })
+                    flash_messages.append({"role": "user", "content": zoom_content})
+                    continue
+            
+            # Если нет запросов инструментов, просим Flash завершить
+            flash_messages.append({
+                "role": "user", 
+                "content": "Если ты собрал достаточно контекста, верни JSON со status: 'ready'. Иначе запроси нужные изображения или зумы."
+            })
+        
+        # Сохраняем промежуточный контекст для отладки
+        flash_context_data = {
+            "flash_steps": flash_step,
+            "extracted_context": {
+                "relevant_text_chunks": extracted_context.relevant_text_chunks if extracted_context else [],
+                "relevant_images": extracted_context.relevant_images if extracted_context else [],
+                "flash_reasoning": extracted_context.flash_reasoning if extracted_context else ""
+            },
+            "collected_images": [img.image_path for img in collected_images if img.image_path],
+            "collected_zooms": [z.image_path for z in collected_zooms if z.image_path],
+            "flash_messages_history": self._sanitize_messages_for_log(flash_messages)
+        }
+        
+        # Логируем итоги Flash
+        self._append_app_log(f"\n{'='*20} FLASH ИТОГИ {'='*20}")
+        self._log_full("FLASH: Итоговая статистика", {
+            "steps": flash_step,
+            "collected_images": len(collected_images),
+            "collected_zooms": len(collected_zooms),
+            "text_chunks": len(extracted_context.relevant_text_chunks) if extracted_context else 0,
+            "reasoning": extracted_context.flash_reasoning[:500] if extracted_context and extracted_context.flash_reasoning else ""
+        })
+        
+        flash_context_path = self.chat_dir / "flash_context.json"
+        try:
+            with open(flash_context_path, "w", encoding="utf-8") as f:
+                json.dump(flash_context_data, f, indent=2, ensure_ascii=False)
+            self.sig_log.emit(f"Сохранен контекст Flash: {flash_context_path.name}")
+            self._append_app_log(f"📄 Сохранен: {flash_context_path}")
+        except Exception as e:
+            logger.error(f"Ошибка сохранения flash_context.json: {e}")
+        
+        # ===== ЭТАП 2: PRO АНАЛИЗ =====
+        self.sig_log.emit("🧠 Этап 2: Pro анализирует собранный контекст...")
+        self.sig_message.emit("system", "🧠 Этап 2: Pro анализирует собранный контекст и формирует ответ...", None)
+        
+        # Сохраняем сообщение пользователя
+        self.save_message("user", self.query, images=None)
+        
+        # Формируем контекст для Pro
+        analysis_prompt = load_analysis_prompt(self.data_root)
+        
+        # Собираем текстовые фрагменты от Flash
+        text_chunks_str = ""
+        if extracted_context and extracted_context.relevant_text_chunks:
+            for chunk in extracted_context.relevant_text_chunks:
+                page = chunk.get("page", "?")
+                content = chunk.get("content", "")
+                text_chunks_str += f"\n[Стр. {page}]\n{content}\n"
+        
+        flash_reasoning = ""
+        if extracted_context and extracted_context.flash_reasoning:
+            flash_reasoning = f"\nАНАЛИЗ FLASH:\n{extracted_context.flash_reasoning}\n"
+        
+        pro_context = f"""КОНТЕКСТ ДЛЯ АНАЛИЗА (собран Flash-моделью):
+{flash_reasoning}
+
+РЕЛЕВАНТНЫЕ ТЕКСТОВЫЕ ФРАГМЕНТЫ:
+{text_chunks_str if text_chunks_str else 'Текстовые фрагменты не найдены.'}
+
+ЗАПРОС ПОЛЬЗОВАТЕЛЯ:
+{self.query}
+
+Изображения и зумы прикреплены ниже. Проанализируй данные и ответь на вопрос."""
+        
+        pro_messages = [
+            {"role": "system", "content": analysis_prompt}
+        ]
+        
+        # Добавляем контекст и изображения
+        all_images = collected_images + collected_zooms + (attached_images or [])
+        
+        if all_images:
+            pro_content = [{"type": "text", "text": pro_context}]
+            for img in all_images:
+                if img.s3_url:
+                    desc = img.description[:100] if img.description else "Изображение"
+                    pro_content.append({"type": "text", "text": f"[{desc}]"})
+                    pro_content.append({
+                        "type": "image_url",
+                        "image_url": {"url": img.s3_url}
+                    })
+            pro_messages.append({"role": "user", "content": pro_content})
+        else:
+            pro_messages.append({"role": "user", "content": pro_context})
+        
+        # Логируем запрос к Pro
+        self._append_app_log(f"\n{'='*20} PRO ЗАПРОС {'='*20}")
+        self._log_full("PRO: Системный промпт", analysis_prompt)
+        self._log_full("PRO: Контекст", pro_context)
+        self._log_full("PRO: Запрос (полный)", self._sanitize_messages_for_log(pro_messages))
+        self._log_full("PRO: Изображений в запросе", len(all_images))
+        
+        # Вызываем Pro
+        try:
+            pro_response = llm_client.call_pro_model(pro_messages)
+        except Exception as e:
+            err = f"Ошибка Pro модели: {e}"
+            self.sig_log.emit(f"❌ {err}")
+            self._log_full("PRO: Ошибка", str(e))
+            self.sig_message.emit("assistant", f"⚠️ {err}", "gemini-3-pro-preview")
+            self.save_message("assistant", f"⚠️ {err}")
+            self.sig_finished.emit()
+            return
+        
+        # Логируем ответ Pro
+        self._log_full("PRO: Ответ", pro_response)
+        
+        # Отправляем ответ пользователю
+        self.sig_message.emit("assistant", pro_response, "gemini-3-pro-preview")
+        self.save_message("assistant", pro_response, images=all_images)
+        
+        self._append_app_log(f"\n{'='*20} FLASH+PRO ЗАВЕРШЕНО {'='*20}")
+        self.sig_log.emit("✅ Flash + Pro обработка завершена")
+        self.sig_finished.emit()

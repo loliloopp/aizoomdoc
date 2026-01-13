@@ -19,7 +19,8 @@ from PyQt6.QtWidgets import (
     QListWidget, QListWidgetItem, QFrame, QScrollArea, QProgressBar,
     QFileDialog, QMenuBar, QMenu, QDialog, QDialogButtonBox, QMessageBox,
     QGroupBox, QSizePolicy, QTreeView, QButtonGroup, QInputDialog,
-    QHeaderView, QTabWidget, QTextBrowser, QStackedWidget, QProxyStyle, QStyle
+    QHeaderView, QTabWidget, QTextBrowser, QStackedWidget, QProxyStyle, QStyle,
+    QDoubleSpinBox
 )
 from PyQt6.QtCore import Qt, QUrl, QSize, QTimer, QBuffer, QPoint, QRect
 from PyQt6.QtGui import (
@@ -40,7 +41,8 @@ MODELS = {
     "Gemini 3 Flash (openrouter)": "google/gemini-3-flash-preview",
     "Gemini 3 Pro (openrouter)": "google/gemini-3-pro-preview",
     "Gemini 3 Flash": "gemini-3-flash-preview",
-    "Gemini 3 Pro": "gemini-3-pro-preview"
+    "Gemini 3 Pro": "gemini-3-pro-preview",
+    "Gemini 3 Flash + Pro": "flash+pro"
 }
 
 CONFIG_PATH = Path.home() / ".aizoomdoc_config.json"
@@ -119,6 +121,55 @@ class SettingsDialog(QDialog):
         
         model_layout.addWidget(self.combo_default_model)
         general_layout.addWidget(gb_model)
+        
+        # 1.2. Параметры генерации LLM
+        gb_llm_params = QGroupBox("Параметры генерации LLM")
+        llm_params_layout = QVBoxLayout(gb_llm_params)
+        
+        # Temperature
+        temp_layout = QHBoxLayout()
+        temp_layout.addWidget(QLabel("Temperature:"))
+        self.spin_temperature = QDoubleSpinBox()
+        self.spin_temperature.setRange(0.0, 2.0)
+        self.spin_temperature.setSingleStep(0.1)
+        self.spin_temperature.setDecimals(2)
+        self.spin_temperature.setValue(config.LLM_TEMPERATURE)
+        self.spin_temperature.setToolTip("Степень случайности ответов. Рекомендуется 1.0 для Gemini 3.")
+        temp_layout.addWidget(self.spin_temperature)
+        temp_layout.addStretch()
+        llm_params_layout.addLayout(temp_layout)
+        
+        # Top P
+        top_p_layout = QHBoxLayout()
+        top_p_layout.addWidget(QLabel("Top P:"))
+        self.spin_top_p = QDoubleSpinBox()
+        self.spin_top_p.setRange(0.0, 1.0)
+        self.spin_top_p.setSingleStep(0.05)
+        self.spin_top_p.setDecimals(2)
+        self.spin_top_p.setValue(config.LLM_TOP_P)
+        self.spin_top_p.setToolTip("Nucleus sampling. По умолчанию 0.95.")
+        top_p_layout.addWidget(self.spin_top_p)
+        top_p_layout.addStretch()
+        llm_params_layout.addLayout(top_p_layout)
+        
+        # Media Resolution
+        media_res_layout = QHBoxLayout()
+        media_res_layout.addWidget(QLabel("Media Resolution:"))
+        self.combo_media_resolution = QComboBox()
+        self.combo_media_resolution.addItem("Low (быстро, дёшево)", "low")
+        self.combo_media_resolution.addItem("Medium (баланс)", "medium")
+        self.combo_media_resolution.addItem("High (детали чертежей)", "high")
+        # Устанавливаем текущее значение
+        current_res = config.MEDIA_RESOLUTION.lower()
+        idx = self.combo_media_resolution.findData(current_res)
+        if idx >= 0:
+            self.combo_media_resolution.setCurrentIndex(idx)
+        self.combo_media_resolution.setToolTip("Разрешение обработки изображений. High для технических чертежей.")
+        media_res_layout.addWidget(self.combo_media_resolution)
+        media_res_layout.addStretch()
+        llm_params_layout.addLayout(media_res_layout)
+        
+        general_layout.addWidget(gb_llm_params)
         
         # 2. Группа "Системные Промты AI"
         gb_prompts = QGroupBox("AI Ассистент - Системные Промты")
@@ -371,6 +422,25 @@ class SettingsDialog(QDialog):
 
     def get_default_model(self):
         return self.combo_default_model.currentData()
+
+    def get_llm_params(self):
+        """Возвращает параметры LLM из диалога."""
+        return {
+            "temperature": self.spin_temperature.value(),
+            "top_p": self.spin_top_p.value(),
+            "media_resolution": self.combo_media_resolution.currentData()
+        }
+
+    def accept(self):
+        """Сохраняет настройки LLM в config и вызывает стандартный accept."""
+        # Обновляем глобальные настройки config
+        config.LLM_TEMPERATURE = self.spin_temperature.value()
+        config.LLM_TOP_P = self.spin_top_p.value()
+        config.MEDIA_RESOLUTION = self.combo_media_resolution.currentData()
+        
+        print(f"[Settings] LLM params saved: temp={config.LLM_TEMPERATURE}, top_p={config.LLM_TOP_P}, media_res={config.MEDIA_RESOLUTION}")
+        
+        super().accept()
 
 
 class PromptEditDialog(QDialog):

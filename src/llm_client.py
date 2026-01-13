@@ -23,7 +23,7 @@ except ImportError:
 genai = genai_new
 
 from .config import config
-from .models import ViewportCrop, ZoomRequest, ImageRequest, ImageSelection, DocumentRequest
+from .models import ViewportCrop, ZoomRequest, ImageRequest, ImageSelection, DocumentRequest, FlashExtractedContext
 
 logger = logging.getLogger(__name__)
 
@@ -228,6 +228,33 @@ def load_zoom_prompt(data_root: Optional[Path] = None) -> str:
                     return content
         except Exception as e:
             logger.warning(f"Ошибка чтения файла промта ZOOM: {e}. Используется промт по умолчанию.")
+    
+    return default_prompt
+
+
+def load_flash_extractor_prompt(data_root: Optional[Path] = None) -> str:
+    """
+    Загружает промт для Flash-экстрактора из файла.
+    Если файл не найден, возвращает промт по умолчанию.
+    """
+    default_prompt = """Ты — экстрактор контекста. НЕ ОТВЕЧАЙ на вопрос. 
+Извлеки ВСЕ релевантные текстовые фрагменты и укажи нужные изображения.
+Верни JSON со status: "ready" когда всё собрано."""
+    
+    if data_root is None:
+        data_root = Path.cwd() / "data"
+    
+    prompt_file = Path(data_root) / "flash_extractor_prompt.txt"
+    
+    if prompt_file.exists():
+        try:
+            with open(prompt_file, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+                if content:
+                    logger.info(f"Загружен промт Flash-экстрактора из {prompt_file}")
+                    return content
+        except Exception as e:
+            logger.warning(f"Ошибка чтения файла промта Flash-экстрактора: {e}. Используется промт по умолчанию.")
     
     return default_prompt
 
@@ -617,7 +644,17 @@ class LLMClient:
         config_args = {
             "temperature": temperature,
             "max_output_tokens": max_tokens,
+            "top_p": config.LLM_TOP_P,
         }
+        
+        # Добавляем media_resolution для обработки изображений
+        media_res_map = {
+            "low": "MEDIA_RESOLUTION_LOW",
+            "medium": "MEDIA_RESOLUTION_MEDIUM",
+            "high": "MEDIA_RESOLUTION_HIGH",
+        }
+        media_res = media_res_map.get(config.MEDIA_RESOLUTION.lower(), "MEDIA_RESOLUTION_HIGH")
+        config_args["media_resolution"] = media_res
         
         # Нельзя использовать system_instruction вместе с cached_content
         if self.current_cache:
@@ -942,3 +979,206 @@ class LLMClient:
             requests_out.append(DocumentRequest(documents=docs, reason=str(item.get("reason") or "")))
 
         return requests_out
+
+    def parse_flash_context(self, response_text: str) -> Optional[FlashExtractedContext]:
+        """
+        Парсит ответ Flash-модели и извлекает готовый контекст.
+        Возвращает FlashExtractedContext если status="ready", иначе None.
+        """
+        response_text = (response_text or "").strip()
+        if not response_text:
+            return None
+
+        data_list = extract_json_objects(response_text)
+        
+        for item in data_list:
+            if not isinstance(item, dict):
+                continue
+            
+            # Ищем объект со status="ready"
+            if item.get("status") == "ready":
+                text_chunks = item.get("relevant_text_chunks") or []
+                images = item.get("relevant_images") or []
+                reasoning = item.get("reasoning") or ""
+                
+                return FlashExtractedContext(
+                    relevant_text_chunks=text_chunks,
+                    relevant_images=images,
+                    zoom_crops=[],  # Зумы заполняются отдельно
+                    flash_reasoning=reasoning
+                )
+        
+        return None
+
+    def call_flash_model(self, messages: List[Dict[str, Any]], temperature: float = 0.1) -> str:
+        """
+        Вызывает Flash-модель напрямую через Google SDK.
+        Используется для этапа экстракции контекста.
+        """
+        if not self.google_client:
+            raise RuntimeError("Google GenAI SDK не инициализирован. Проверьте GOOGLE_API_KEY.")
+        
+        flash_model = "gemini-3-flash-preview"
+        
+        # Конвертируем сообщения в формат SDK
+        contents = []
+        system_instruction = None
+        
+        for msg in messages:
+            if msg["role"] == "system":
+                system_instruction = msg["content"]
+                continue
+            
+            role = "user" if msg["role"] == "user" else "model"
+            parts = []
+            content = msg["content"]
+            
+            if isinstance(content, str):
+                parts.append(genai_types.Part(text=content))
+            elif isinstance(content, list):
+                for p in content:
+                    if p["type"] == "text":
+                        parts.append(genai_types.Part(text=p["text"]))
+                    elif p["type"] == "image_url":
+                        url = p["image_url"]["url"]
+                        if url.startswith("data:image"):
+                            b64_data = url.split(",")[1]
+                            image_data = base64.b64decode(b64_data)
+                            parts.append(genai_types.Part(inline_data={"mime_type": "image/jpeg", "data": image_data}))
+                        else:
+                            try:
+                                r = requests.get(url, timeout=10)
+                                if r.status_code == 200:
+                                    parts.append(genai_types.Part(inline_data={"mime_type": "image/jpeg", "data": r.content}))
+                            except Exception as e:
+                                logger.warning(f"Не удалось скачать картинку для Flash: {e}")
+            
+            contents.append(genai_types.Content(role=role, parts=parts))
+        
+        # Маппинг media_resolution
+        media_res_map = {
+            "low": "MEDIA_RESOLUTION_LOW",
+            "medium": "MEDIA_RESOLUTION_MEDIUM",
+            "high": "MEDIA_RESOLUTION_HIGH",
+        }
+        media_res = media_res_map.get(config.MEDIA_RESOLUTION.lower(), "MEDIA_RESOLUTION_HIGH")
+        
+        config_args = {
+            "temperature": temperature,
+            "max_output_tokens": 4096,
+            "top_p": config.LLM_TOP_P,
+            "media_resolution": media_res,
+        }
+        if system_instruction:
+            config_args["system_instruction"] = system_instruction
+        
+        response = self.google_client.models.generate_content(
+            model=flash_model,
+            contents=contents,
+            config=genai_types.GenerateContentConfig(**config_args)
+        )
+        
+        # Извлекаем текст
+        text = None
+        if hasattr(response, 'text') and response.text:
+            text = response.text
+        elif response.candidates:
+            candidate = response.candidates[0]
+            if hasattr(candidate, 'content') and candidate.content:
+                parts = candidate.content.parts
+                if parts:
+                    text_parts = [part.text for part in parts if hasattr(part, 'text') and part.text]
+                    text = "".join(text_parts)
+        
+        if not text:
+            raise ValueError("Получен пустой ответ от Flash модели")
+        
+        return text
+
+    def call_pro_model(self, messages: List[Dict[str, Any]], temperature: float = None) -> str:
+        """
+        Вызывает Pro-модель напрямую через Google SDK.
+        Используется для финального анализа.
+        """
+        if not self.google_client:
+            raise RuntimeError("Google GenAI SDK не инициализирован. Проверьте GOOGLE_API_KEY.")
+        
+        pro_model = "gemini-3-pro-preview"
+        
+        # Конвертируем сообщения в формат SDK
+        contents = []
+        system_instruction = None
+        
+        for msg in messages:
+            if msg["role"] == "system":
+                system_instruction = msg["content"]
+                continue
+            
+            role = "user" if msg["role"] == "user" else "model"
+            parts = []
+            content = msg["content"]
+            
+            if isinstance(content, str):
+                parts.append(genai_types.Part(text=content))
+            elif isinstance(content, list):
+                for p in content:
+                    if p["type"] == "text":
+                        parts.append(genai_types.Part(text=p["text"]))
+                    elif p["type"] == "image_url":
+                        url = p["image_url"]["url"]
+                        if url.startswith("data:image"):
+                            b64_data = url.split(",")[1]
+                            image_data = base64.b64decode(b64_data)
+                            parts.append(genai_types.Part(inline_data={"mime_type": "image/jpeg", "data": image_data}))
+                        else:
+                            try:
+                                r = requests.get(url, timeout=10)
+                                if r.status_code == 200:
+                                    parts.append(genai_types.Part(inline_data={"mime_type": "image/jpeg", "data": r.content}))
+                            except Exception as e:
+                                logger.warning(f"Не удалось скачать картинку для Pro: {e}")
+            
+            contents.append(genai_types.Content(role=role, parts=parts))
+        
+        # Маппинг media_resolution
+        media_res_map = {
+            "low": "MEDIA_RESOLUTION_LOW",
+            "medium": "MEDIA_RESOLUTION_MEDIUM",
+            "high": "MEDIA_RESOLUTION_HIGH",
+        }
+        media_res = media_res_map.get(config.MEDIA_RESOLUTION.lower(), "MEDIA_RESOLUTION_HIGH")
+        
+        # Используем temperature из config если не передан явно
+        temp = temperature if temperature is not None else config.LLM_TEMPERATURE
+        
+        config_args = {
+            "temperature": temp,
+            "max_output_tokens": config.MAX_TOKENS,
+            "top_p": config.LLM_TOP_P,
+            "media_resolution": media_res,
+        }
+        if system_instruction:
+            config_args["system_instruction"] = system_instruction
+        
+        response = self.google_client.models.generate_content(
+            model=pro_model,
+            contents=contents,
+            config=genai_types.GenerateContentConfig(**config_args)
+        )
+        
+        # Извлекаем текст
+        text = None
+        if hasattr(response, 'text') and response.text:
+            text = response.text
+        elif response.candidates:
+            candidate = response.candidates[0]
+            if hasattr(candidate, 'content') and candidate.content:
+                parts = candidate.content.parts
+                if parts:
+                    text_parts = [part.text for part in parts if hasattr(part, 'text') and part.text]
+                    text = "".join(text_parts)
+        
+        if not text:
+            raise ValueError("Получен пустой ответ от Pro модели")
+        
+        return text

@@ -150,3 +150,11 @@ class ComparisonContext:
     stage_p_results: SearchResult
     stage_r_results: SearchResult
     comparison_query: str
+
+@dataclass
+class FlashExtractedContext:
+    """Контекст, извлечённый Flash-моделью для передачи в Pro."""
+    relevant_text_chunks: List[Dict[str, Any]] = field(default_factory=list)  # {page, content}
+    relevant_images: List[Dict[str, Any]] = field(default_factory=list)       # {image_id, reason, s3_url}
+    zoom_crops: List[ViewportCrop] = field(default_factory=list)              # Выполненные зумы
+    flash_reasoning: str = ""  # Рассуждения Flash о выборе контекста

@@ -29,8 +29,16 @@ class Config:
         "google/gemini-3-flash-preview"
     )
 
-    # Параметры генерации
+    # Параметры генерации LLM
     MAX_TOKENS: int = int(os.getenv("MAX_TOKENS", "8192"))
+    LLM_TEMPERATURE: float = float(os.getenv("LLM_TEMPERATURE", "1.0"))
+    LLM_TOP_P: float = float(os.getenv("LLM_TOP_P", "0.95"))
+    
+    # Разрешение медиа для Gemini: low, medium, high
+    # high - для технических чертежей с мелкими деталями
+    # medium - баланс качества и скорости
+    # low - быстро и дешево
+    MEDIA_RESOLUTION: str = os.getenv("MEDIA_RESOLUTION", "high")
 
     # Ранее в коде использовался флаг USE_DATABASE. БД для чатов считается основной всегда,
     # поэтому этот флаг не должен влиять на отправку запросов в модель. Оставляем для совместимости.

@@ -30,6 +30,9 @@ class HtmlBlock:
     detailed_description: Optional[str] = None
     ocr_text: Optional[str] = None
     key_entities: List[str] = field(default_factory=list)
+    
+    # Метаданные из штампа чертежа
+    sheet_name: Optional[str] = None  # Наименование листа из stamp_info
 
 
 @dataclass
@@ -191,6 +194,19 @@ class HtmlOcrProcessor:
             return None
     
     @staticmethod
+    def _extract_sheet_name(content_div) -> Optional[str]:
+        """Извлекает Наименование листа из stamp_info."""
+        stamp_div = content_div.find('div', class_='stamp-info')
+        if not stamp_div:
+            return None
+        stamp_text = stamp_div.get_text()
+        # Ищем "Наименование:" в тексте
+        match = re.search(r'Наименование:\s*([^|]+)', stamp_text)
+        if match:
+            return match.group(1).strip()
+        return None
+
+    @staticmethod
     def _parse_image_block(
         content_div,
         block_id: str,
@@ -199,6 +215,9 @@ class HtmlOcrProcessor:
     ) -> Optional[HtmlBlock]:
         """Парсит блок изображения."""
         try:
+            # Извлекаем Наименование листа из штампа
+            sheet_name = HtmlOcrProcessor._extract_sheet_name(content_div)
+            
             # Извлекаем JSON с анализом изображения
             pre_elem = content_div.find('pre')
             if not pre_elem:
@@ -229,7 +248,8 @@ class HtmlOcrProcessor:
                     block_type='image',
                     content=text_content,
                     crop_url=crop_url,
-                    content_summary=f"Изображение на странице {page_number}"
+                    content_summary=f"Изображение на странице {page_number}",
+                    sheet_name=sheet_name
                 )
             
             # Декодируем HTML entities
@@ -383,7 +403,8 @@ class HtmlOcrProcessor:
                 content_summary=analysis.get('content_summary'),
                 detailed_description=analysis.get('detailed_description'),
                 ocr_text=analysis.get('ocr_text') or analysis.get('clean_ocr_text'),
-                key_entities=analysis.get('key_entities', [])
+                key_entities=analysis.get('key_entities', []),
+                sheet_name=sheet_name
             )
         
         except Exception as e:
