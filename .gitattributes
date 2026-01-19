@@ -1,0 +1,15 @@
+# Нормализация окончаний строк
+* text=auto eol=lf
+
+# Windows batch файлы должны быть CRLF
+*.bat text eol=crlf
+
+# Бинарные файлы
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.docx binary
+
